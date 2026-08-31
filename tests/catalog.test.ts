@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { canonicalName, reaches } from "../src/catalog.js";
+import { canonicalName } from "../src/catalog.js";
 
 const none = new Set<string>();
 
@@ -35,11 +35,4 @@ test("two tool names that sanitize alike are still distinguishable", () => {
   assert.equal(first, "s__a_b");
   assert.notEqual(second, first);
   assert.match(second, /^s__a_b_[0-9a-f]{7}$/);
-});
-
-test("profile server membership", () => {
-  const profile = { servers: ["github"], deny: [], rename: {}, limits: { rpm: 1, concurrent: 1 } };
-  assert.equal(reaches(profile, "github"), true);
-  assert.equal(reaches(profile, "fs"), false);
-  assert.equal(reaches({ ...profile, servers: ["*"] }, "fs"), true);
 });

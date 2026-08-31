@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
 import { ConfigError, loadConfig, type Config } from "./config.js";
+import { Pipeline } from "./pipeline.js";
 import { Pool } from "./pool.js";
 import { startGateway } from "./server.js";
 
@@ -9,6 +10,7 @@ const USAGE = `mcpgw — MCP gateway
 Usage:
   mcpgw start    [--config PATH] [--port N]   run the daemon
   mcpgw validate [--config PATH]              check config.yaml, exit non-zero on any problem
+  mcpgw list     [--config PATH] [--profile P]  effective tools per profile, and why
 
 Config is resolved as: --config PATH, then $MCPGW_CONFIG, then ./config.yaml.`;
 
@@ -33,6 +35,37 @@ async function start(config: Config, port?: number): Promise<void> {
   await pool.start();
 }
 
+/**
+ * Answers "why can't the model see this tool" by printing every catalog entry with the rule
+ * that decided it. Connects the backends, prints, exits — it never binds the port.
+ */
+async function list(config: Config, only?: string): Promise<number> {
+  const profiles = only ? [only] : Object.keys(config.profiles);
+  if (only && !(only in config.profiles)) {
+    console.error(`no such profile: ${only}`);
+    return 1;
+  }
+
+  const pool = new Pool(config);
+  await pool.start();
+  const pipeline = new Pipeline(config, pool);
+
+  for (const profile of profiles) {
+    const rows = pipeline.explain(profile).sort((a, b) => a.exposed.localeCompare(b.exposed));
+    const allowed = rows.filter((r) => r.decision.allow).length;
+    console.log(`
+profile ${profile}  (${allowed} of ${rows.length} tools exposed)`);
+    for (const row of rows) {
+      const renamed = row.exposed === row.entry.canonical ? "" : `  [${row.entry.canonical}]`;
+      const verdict = row.decision.allow ? "allow" : row.decision.reason;
+      console.log(`  ${verdict.padEnd(21)} ${row.exposed.padEnd(40)} ${row.decision.rule}${renamed}`);
+    }
+  }
+
+  await pool.close();
+  return 0;
+}
+
 async function main(argv: string[]): Promise<number> {
   const { values, positionals } = parseArgs({
     args: argv,
@@ -40,6 +73,7 @@ async function main(argv: string[]): Promise<number> {
     options: {
       config: { type: "string", short: "c" },
       port: { type: "string", short: "p" },
+      profile: { type: "string" },
       help: { type: "boolean", short: "h" },
     },
   });
@@ -50,7 +84,7 @@ async function main(argv: string[]): Promise<number> {
     console.log(USAGE);
     return values.help ? 0 : 1;
   }
-  if (command !== "start" && command !== "validate") {
+  if (command !== "start" && command !== "validate" && command !== "list") {
     console.error(`mcpgw: "${command}" is not available yet\n\n${USAGE}`);
     return 1;
   }
@@ -72,6 +106,8 @@ async function main(argv: string[]): Promise<number> {
     console.log(`ok  ${path}  (${servers} servers, ${profiles} profiles)`);
     return 0;
   }
+
+  if (command === "list") return list(config, values.profile);
 
   await start(config, values.port === undefined ? undefined : Number(values.port));
   return 0; // the process stays alive on the listener

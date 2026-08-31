@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server as HttpServer, type Ser
 import type { AddressInfo } from "node:net";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { isLoopback, type Config } from "./config.js";
+import { Pipeline } from "./pipeline.js";
 import type { Pool } from "./pool.js";
 import { SessionManager } from "./session.js";
 
@@ -68,7 +69,7 @@ export async function startGateway(
     throw new Error(`refusing to bind ${host} without listen.token (NFR-2)`);
   }
 
-  const sessions = new SessionManager(config, pool);
+  const sessions = new SessionManager(config, new Pipeline(config, pool));
   pool.onCatalogChange = () => sessions.notifyCatalogChanged();
 
   const http = createServer((req, res) => {

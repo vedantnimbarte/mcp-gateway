@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { Backend } from "./backend.js";
-import type { ProfileConfig } from "./config.js";
 
 /** SPEC §2. */
 const MAX_NAME = 128;
@@ -29,11 +28,6 @@ export function canonicalName(server: string, tool: string, taken: ReadonlySet<s
   const raw = `${sanitize(server)}__${sanitize(tool)}`;
   const name = raw.length > MAX_NAME ? `${raw.slice(0, TRUNCATE_TO)}_${hash7(full)}` : raw;
   return taken.has(name) ? `${name.slice(0, TRUNCATE_TO)}_${hash7(full)}` : name;
-}
-
-/** Which servers a profile can reach (SPEC §3.1 step 2). */
-export function reaches(profile: ProfileConfig, server: string): boolean {
-  return profile.servers.includes("*") || profile.servers.includes(server);
 }
 
 /** The merged, namespaced view of every UP backend. Rebuilt on connect, loss and list_changed. */
@@ -65,8 +59,8 @@ export class Catalog {
     return this.entries.get(canonical);
   }
 
-  /** Phase 2 filters by server membership only; allow/deny and renames arrive in Phase 3. */
-  forProfile(profile: ProfileConfig): CatalogEntry[] {
-    return [...this.entries.values()].filter((e) => reaches(profile, e.server));
+  /** Unfiltered. Which of these a profile may see is policy's decision, not the catalog's. */
+  all(): CatalogEntry[] {
+    return [...this.entries.values()];
   }
 }
