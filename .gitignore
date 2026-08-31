@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.*
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Secrets — credentials are read from the environment, never committed
+.env
+.env.*
+!.env.example
+
+# Runtime output
+audit/
+*.log
+logs/
+mcpgw.pid
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Editors
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local config overrides — config.yaml itself is committed
+config.local.yaml
