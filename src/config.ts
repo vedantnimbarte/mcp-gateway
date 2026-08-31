@@ -124,7 +124,9 @@ function interpolate(node: unknown, missing: Set<string>): unknown {
   return node;
 }
 
-function isLoopback(host: string): boolean {
+export const GATEWAY_INFO = { name: "mcp-gateway", version: "0.0.0" };
+
+export function isLoopback(host: string): boolean {
   return host === "localhost" || host === "::1" || host === "[::1]" || /^127\./.test(host);
 }
 
