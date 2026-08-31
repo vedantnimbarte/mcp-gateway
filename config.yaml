@@ -1,0 +1,76 @@
+version: 1
+
+listen:
+  host: 127.0.0.1        # non-loopback requires `token`
+  port: 8420
+  # token: ${MCPGW_TOKEN}   # sent as `Authorization: Bearer <token>`
+
+defaults:
+  call_timeout_ms: 30000
+  connect_timeout_ms: 10000
+
+servers:
+  github:
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN}
+    cwd: ~/
+    restart:
+      max_retries: 5
+      backoff_ms: 1000      # doubles per attempt, capped at 30000
+
+  fs:
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/Users/vedant/code"]
+
+  linear:
+    transport: http          # Streamable HTTP
+    url: https://mcp.linear.app/mcp
+    headers:
+      Authorization: Bearer ${LINEAR_KEY}
+
+  legacy:
+    transport: sse           # deprecated MCP transport, passthrough support only
+    url: https://example.com/sse
+
+profiles:
+  default:
+    servers: ["*"]
+
+  readonly:
+    servers: [github, linear]
+    allow:
+      - "github__get_*"
+      - "github__list_*"
+      - "github__search_*"
+      - "linear__list_*"
+
+  coding:
+    servers: [github, fs]
+    deny:
+      - "github__delete_*"
+      - "github__merge_pull_request"
+      - "fs__move_file"
+    rename:
+      github__create_issue: file_bug
+      fs__read_text_file: read_file
+    limits:
+      rpm: 60
+      concurrent: 4
+
+guard:
+  pin_tools: true
+  on_drift: block            # block | warn
+  max_result_bytes: 262144
+  redact:
+    - "gh[pousr]_[A-Za-z0-9]{16,}"
+    - "sk-[A-Za-z0-9]{20,}"
+    - "(?i)bearer\\s+[A-Za-z0-9._~+/-]{20,}"
+
+audit:
+  dir: ./audit
+  log_args: hashed           # full | hashed | none
+  log_results: none          # full | truncated | none
