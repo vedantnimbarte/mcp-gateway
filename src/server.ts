@@ -2,9 +2,11 @@ import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { AuditLog } from "./audit.js";
 import { isLoopback, type Config } from "./config.js";
+import { Guard } from "./guard.js";
 import { Pipeline } from "./pipeline.js";
-import type { Pool } from "./pool.js";
+import { Pool } from "./pool.js";
 import { SessionManager } from "./session.js";
 
 /** SPEC §10.1. */
@@ -15,6 +17,30 @@ export interface Gateway {
   url: string;
   sessions: SessionManager;
   close(): Promise<void>;
+}
+
+/** The daemon's object graph. One place, so the CLI and the tests wire it identically. */
+export interface Parts {
+  guard: Guard;
+  audit: AuditLog;
+  pool: Pool;
+  pipeline: Pipeline;
+}
+
+export function assemble(
+  config: Config,
+  configPath: string,
+  log: (event: string, fields: Record<string, unknown>) => void = () => {},
+): Parts {
+  const guard = Guard.load(config, configPath);
+  const audit = new AuditLog(config.audit, guard);
+  // backend_up / backend_down / drift / pinned are audited as well as logged (SPEC §7).
+  const record = (event: string, fields: Record<string, unknown>) => {
+    log(event, fields);
+    audit.write({ method: event, ...fields });
+  };
+  const pool = new Pool(config, record, guard);
+  return { guard, audit, pool, pipeline: new Pipeline(config, pool, guard, audit) };
 }
 
 function send(res: ServerResponse, status: number, body: unknown): void {
@@ -58,9 +84,10 @@ function originOk(origin: string | undefined): boolean {
 
 export async function startGateway(
   config: Config,
-  pool: Pool,
+  parts: Parts,
   opts: { port?: number } = {},
 ): Promise<Gateway> {
+  const { pool, pipeline, audit } = parts;
   const { host, token } = config.listen;
 
   // NFR-2. Config validation already refuses this, but the interlock belongs at bind time too:
@@ -69,7 +96,7 @@ export async function startGateway(
     throw new Error(`refusing to bind ${host} without listen.token (NFR-2)`);
   }
 
-  const sessions = new SessionManager(config, new Pipeline(config, pool));
+  const sessions = new SessionManager(config, pipeline, audit);
   pool.onCatalogChange = () => sessions.notifyCatalogChanged();
 
   const http = createServer((req, res) => {
@@ -152,12 +179,13 @@ export async function startGateway(
     port,
     url: `http://${host}:${port}`,
     sessions,
-    close: () => closeAll(http, sessions, pool),
+    close: () => closeAll(http, sessions, parts),
   };
 }
 
-async function closeAll(http: HttpServer, sessions: SessionManager, pool: Pool): Promise<void> {
+async function closeAll(http: HttpServer, sessions: SessionManager, parts: Parts): Promise<void> {
   await sessions.closeAll();
-  await pool.close();
+  await parts.pool.close();
   await new Promise<void>((done) => http.close(() => done()));
+  await parts.audit.close();
 }

@@ -1,6 +1,7 @@
 import { Backend } from "./backend.js";
 import { Catalog } from "./catalog.js";
 import type { Config } from "./config.js";
+import type { Guard } from "./guard.js";
 
 /**
  * Every backend, connected once and shared by every session (PRD G2). Owns the merged catalog
@@ -15,6 +16,7 @@ export class Pool {
   constructor(
     config: Config,
     private readonly log: (event: string, fields: Record<string, unknown>) => void = () => {},
+    private readonly guard?: Guard,
   ) {
     for (const [name, cfg] of Object.entries(config.servers)) {
       const backend = new Backend(name, cfg, config.defaults);
@@ -30,6 +32,14 @@ export class Pool {
   }
 
   #rebuild(): void {
+    // Re-hash before the catalog is published, so a drifted tool is already blocked by the time
+    // any session is told the listing changed.
+    for (const backend of this.backends.values()) {
+      if (backend.state !== "up") continue;
+      for (const change of this.guard?.review(backend.name, backend.tools) ?? []) {
+        this.log(change.kind, { ...change, kind: undefined });
+      }
+    }
     this.catalog = Catalog.build(this.backends.values());
     this.onCatalogChange?.();
   }

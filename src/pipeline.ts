@@ -1,9 +1,11 @@
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { AuditInput, AuditLine, AuditLog } from "./audit.js";
 import type { ReverseTarget } from "./backend.js";
 import type { CatalogEntry } from "./catalog.js";
 import type { Config } from "./config.js";
 import { ERR, gwError } from "./errors.js";
+import type { Guard } from "./guard.js";
 import { decide, type Decision } from "./policy.js";
 import type { Pool } from "./pool.js";
 import { limitersFor, type Limiter } from "./ratelimit.js";
@@ -18,10 +20,22 @@ export interface Explanation extends ExposedTool {
   decision: Decision;
 }
 
+/** Who is calling. Everything here ends up in the audit line. */
+export interface CallContext {
+  profile: string;
+  session?: string;
+  client?: { name: string; version: string };
+  /** The session, as something a backend can send a reverse request to. */
+  caller?: ReverseTarget;
+}
+
+/** SPEC §3.3: under `on_drift: warn` a changed tool is still listed, but flagged. */
+const WARN_PREFIX = "⚠ [unverified change] ";
+
 /**
- * SPEC §5: resolve → policy → limit → dispatch. Guard and audit are inserted in Phase 4;
- * the order of what is here is already the final one — a denied call must not consume
- * rate-limit budget, so policy is checked before the limiter.
+ * SPEC §5, in order: resolve → policy → limit → guard-in → dispatch → guard-out → audit →
+ * release. Policy runs before the limiter so a denied call burns no budget, and the release is
+ * in a `finally` so a throwing backend cannot leak a slot.
  */
 export class Pipeline {
   readonly #limiters: Map<string, Limiter>;
@@ -31,6 +45,8 @@ export class Pipeline {
   constructor(
     private readonly config: Config,
     private readonly pool: Pool,
+    private readonly guard: Guard,
+    private readonly audit: AuditLog,
     now?: () => number,
   ) {
     this.#limiters = limitersFor(config, now);
@@ -55,7 +71,16 @@ export class Pipeline {
   visibleTools(profileName: string): Tool[] {
     return this.explain(profileName)
       .filter((row) => row.decision.allow)
-      .map((row) => ({ ...row.entry.def, name: row.exposed }));
+      .map((row) => {
+        const drifted = this.guard.isDrifted(row.entry.server, row.entry.tool);
+        return {
+          ...row.entry.def,
+          name: row.exposed,
+          description: drifted
+            ? WARN_PREFIX + (row.entry.def.description ?? "")
+            : row.entry.def.description,
+        };
+      });
   }
 
   /** A stable fingerprint of a profile's visible set, for suppressing no-op notifications. */
@@ -67,52 +92,120 @@ export class Pipeline {
   }
 
   async callTool(
-    profileName: string,
+    ctx: CallContext,
     exposed: string,
     args: Record<string, unknown> | undefined,
-    caller?: ReverseTarget,
   ): Promise<CallToolResult> {
+    const started = Date.now();
+    const line: AuditInput = {
+      method: "tools/call",
+      session: ctx.session,
+      profile: ctx.profile,
+      client: ctx.client,
+      exposed_as: exposed,
+      ...this.audit.argFields(args),
+    };
+    const fail = (e: Error & { code?: number }, decision: AuditLine["decision"]): never => {
+      this.audit.write({
+        ...line,
+        decision,
+        status: decision === "allow" ? "error" : "denied",
+        dur_ms: Date.now() - started,
+        error: { code: e.code ?? -32603, message: this.guard.redactText(e.message) },
+      });
+      throw e;
+    };
+
     // 1. resolve. An alias resolves to its canonical name; the canonical name always resolves
     //    to itself, and policy is evaluated on it either way, so a rename is never a bypass.
-    const canonical = this.#aliases.get(profileName)?.get(exposed) ?? exposed;
+    const canonical = this.#aliases.get(ctx.profile)?.get(exposed) ?? exposed;
     const entry = this.pool.catalog.get(canonical);
     if (!entry) {
-      throw new McpError(ErrorCode.MethodNotFound, `unknown tool "${exposed}"`);
+      return fail(new McpError(ErrorCode.MethodNotFound, `unknown tool "${exposed}"`), undefined);
     }
+    line.server = entry.server;
+    line.tool = entry.tool;
 
     // 2. policy
-    const decision = this.#decide(profileName, entry);
+    const decision = this.#decide(ctx.profile, entry);
     if (!decision.allow) {
       const code = decision.reason === "server_unavailable" ? ERR.BACKEND_DOWN : ERR.POLICY;
-      throw gwError(code, `"${exposed}" is not available: ${decision.reason}`, {
-        reason: decision.reason,
-        profile: profileName,
-        server: entry.server,
-        tool: entry.tool,
-      });
+      return fail(
+        gwError(code, `"${exposed}" is not available: ${decision.reason}`, {
+          reason: decision.reason,
+          profile: ctx.profile,
+          server: entry.server,
+          tool: entry.tool,
+        }),
+        decision.reason,
+      );
     }
 
     // 3. limit
-    const limiter = this.#limiters.get(profileName);
+    const limiter = this.#limiters.get(ctx.profile);
     const grant = limiter?.acquire() ?? { ok: true as const };
     if (!grant.ok) {
-      throw gwError(ERR.RATE_LIMITED, `profile "${profileName}" is over its limit`, {
-        reason: "rate_limited",
-        profile: profileName,
-        retry_after_ms: grant.retryAfterMs,
-      });
+      return fail(
+        gwError(ERR.RATE_LIMITED, `profile "${ctx.profile}" is over its limit`, {
+          reason: "rate_limited",
+          profile: ctx.profile,
+          retry_after_ms: grant.retryAfterMs,
+        }),
+        "rate_limited",
+      );
     }
 
-    // 5. dispatch (4 guard-in and 6-7 guard-out/audit arrive in Phase 4)
     try {
+      // 4. guard-in: the arguments must fit the schema the backend published.
+      const invalid = this.guard.validateArgs(canonical, entry.def, args);
+      if (invalid) {
+        return fail(
+          new McpError(ErrorCode.InvalidParams, `invalid arguments for "${exposed}": ${invalid}`),
+          "allow",
+        );
+      }
+
+      // 5. dispatch
       const backend = this.pool.backends.get(entry.server);
       if (!backend) {
-        throw gwError(ERR.BACKEND_DOWN, `backend "${entry.server}" is gone`, {
-          reason: "server_unavailable",
-          server: entry.server,
-        });
+        return fail(
+          gwError(ERR.BACKEND_DOWN, `backend "${entry.server}" is gone`, {
+            reason: "server_unavailable",
+            server: entry.server,
+          }),
+          "server_unavailable",
+        );
       }
-      return await backend.callTool(entry.tool, args, caller);
+
+      let raw: CallToolResult;
+      try {
+        raw = await backend.callTool(entry.tool, args, ctx.caller);
+      } catch (e) {
+        const error = e as Error & { code?: number };
+        this.audit.write({
+          ...line,
+          decision: "allow",
+          status: error.code === ERR.TIMEOUT ? "timeout" : "error",
+          dur_ms: Date.now() - started,
+          error: { code: error.code ?? -32603, message: this.guard.redactText(error.message) },
+        });
+        throw error;
+      }
+
+      // 6. guard-out: redact, then cap.
+      const { result, bytes, truncated } = this.guard.capResult(this.guard.redact(raw));
+
+      // 7. audit — exactly one line, whatever happened.
+      this.audit.write({
+        ...line,
+        decision: "allow",
+        status: "ok",
+        dur_ms: Date.now() - started,
+        result_bytes: bytes,
+        truncated,
+        ...this.audit.resultFields(result),
+      });
+      return result;
     } finally {
       // 8. release, always.
       limiter?.release();
@@ -123,7 +216,7 @@ export class Pipeline {
     return decide(entry.canonical, {
       profile: this.config.profiles[profileName],
       serverState: this.pool.backends.get(entry.server)?.state,
-      drifted: false, // Phase 4 supplies this from the lockfile
+      drifted: this.guard.isDrifted(entry.server, entry.tool),
       onDrift: this.config.guard.on_drift,
     });
   }

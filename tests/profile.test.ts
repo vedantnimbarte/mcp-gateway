@@ -1,14 +1,13 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "../src/config.js";
-import { Pool } from "../src/pool.js";
-import { startGateway, type Gateway } from "../src/server.js";
+import { assemble, startGateway, type Gateway } from "../src/server.js";
 
 const fixture = fileURLToPath(new URL("./fixture-server.js", import.meta.url));
 const backend = (name: string) => `  ${name}:
@@ -21,6 +20,8 @@ const configPath = join(mkdtempSync(join(tmpdir(), "mcpgw-")), "config.yaml");
 writeFileSync(
   configPath,
   `version: 1
+audit:
+  dir: ${JSON.stringify(join(dirname(configPath), "audit"))}
 servers:
 ${backend("alpha")}
 ${backend("bravo")}
@@ -64,8 +65,9 @@ const names = async (client: Client) =>
 
 before(async () => {
   const { config } = loadConfig(configPath);
-  const pool = new Pool(config);
-  gateway = await startGateway(config, pool, { port: 0 });
+  const parts = assemble(config, configPath);
+  gateway = await startGateway(config, parts, { port: 0 });
+  const pool = parts.pool;
   await pool.start();
 });
 
