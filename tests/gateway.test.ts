@@ -6,11 +6,20 @@ import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { createBackends, startBackends } from "../src/backend.js";
+import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { loadConfig } from "../src/config.js";
+import { Pool } from "../src/pool.js";
 import { startGateway, type Gateway } from "../src/server.js";
 
 const fixture = fileURLToPath(new URL("./fixture-server.js", import.meta.url));
+
+async function until(what: string, ok: () => boolean, ms = 10_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!ok()) {
+    if (Date.now() > deadline) assert.fail(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
 
 const configPath = join(mkdtempSync(join(tmpdir(), "mcpgw-")), "config.yaml");
 writeFileSync(
@@ -29,15 +38,24 @@ profiles:
 
 let gateway: Gateway;
 let client: Client;
+let announced = 0;
+let toolsBeforeBackendsWereUp = -1;
 
 before(async () => {
   const { config } = loadConfig(configPath);
-  const backends = createBackends(config);
-  gateway = await startGateway(config, backends, { port: 0 });
-  await startBackends(backends.values(), (name, e) => assert.fail(`${name}: ${e.message}`));
+  const pool = new Pool(config);
+  gateway = await startGateway(config, pool, { port: 0 });
 
+  // Connect a client while the backends are still cold: the port must already serve (NFR-6).
   client = new Client({ name: "gateway-test", version: "0.0.0" });
+  client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+    announced++;
+  });
   await client.connect(new StreamableHTTPClientTransport(new URL(`${gateway.url}/mcp/default`)));
+  toolsBeforeBackendsWereUp = (await client.listTools()).tools.length;
+
+  await pool.start();
+  assert.equal(pool.backends.get("fixture")?.state, "up");
 });
 
 after(async () => {
@@ -45,11 +63,16 @@ after(async () => {
   await gateway?.close();
 });
 
+test("serves before the backends are ready, then announces them", async () => {
+  assert.equal(toolsBeforeBackendsWereUp, 0, "the listener must bind before backends connect");
+  await until("the arriving backend to be announced", () => announced > 0);
+});
+
 test("lists the backend's tools, namespaced", async () => {
   const { tools } = await client.listTools();
   assert.deepEqual(
     tools.map((t) => t.name).sort(),
-    ["fixture__describe", "fixture__echo"],
+    ["fixture__ask", "fixture__ask_later", "fixture__crash", "fixture__describe", "fixture__echo"],
   );
   assert.equal(tools.find((t) => t.name === "fixture__echo")?.description, "Echoes the message back.");
 });

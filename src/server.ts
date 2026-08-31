@@ -2,8 +2,8 @@ import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import type { Backend } from "./backend.js";
 import { isLoopback, type Config } from "./config.js";
+import type { Pool } from "./pool.js";
 import { SessionManager } from "./session.js";
 
 /** SPEC §10.1. */
@@ -57,7 +57,7 @@ function originOk(origin: string | undefined): boolean {
 
 export async function startGateway(
   config: Config,
-  backends: Map<string, Backend>,
+  pool: Pool,
   opts: { port?: number } = {},
 ): Promise<Gateway> {
   const { host, token } = config.listen;
@@ -68,7 +68,8 @@ export async function startGateway(
     throw new Error(`refusing to bind ${host} without listen.token (NFR-2)`);
   }
 
-  const sessions = new SessionManager(config, backends);
+  const sessions = new SessionManager(config, pool);
+  pool.onCatalogChange = () => sessions.notifyCatalogChanged();
 
   const http = createServer((req, res) => {
     handle(req, res).catch((e: Error) => {
@@ -81,7 +82,7 @@ export async function startGateway(
     const path = new URL(req.url ?? "/", "http://localhost").pathname;
 
     if (path === "/healthz") {
-      const state = Object.fromEntries([...backends].map(([n, b]) => [n, b.state]));
+      const state = Object.fromEntries([...pool.backends].map(([n, b]) => [n, b.state]));
       send(res, 200, { status: "ok", sessions: sessions.size, backends: state });
       return;
     }
@@ -150,16 +151,12 @@ export async function startGateway(
     port,
     url: `http://${host}:${port}`,
     sessions,
-    close: () => closeAll(http, sessions, backends),
+    close: () => closeAll(http, sessions, pool),
   };
 }
 
-async function closeAll(
-  http: HttpServer,
-  sessions: SessionManager,
-  backends: Map<string, Backend>,
-): Promise<void> {
+async function closeAll(http: HttpServer, sessions: SessionManager, pool: Pool): Promise<void> {
   await sessions.closeAll();
-  await Promise.all([...backends.values()].map((b) => b.close()));
+  await pool.close();
   await new Promise<void>((done) => http.close(() => done()));
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
-import { createBackends, startBackends } from "./backend.js";
 import { ConfigError, loadConfig, type Config } from "./config.js";
+import { Pool } from "./pool.js";
 import { startGateway } from "./server.js";
 
 const USAGE = `mcpgw — MCP gateway
@@ -17,10 +17,10 @@ function log(event: string, fields: Record<string, unknown> = {}): void {
 }
 
 async function start(config: Config, port?: number): Promise<void> {
-  const backends = createBackends(config);
+  const pool = new Pool(config, log);
 
   // Bind before the backends connect: a slow `npx` cold start must never delay the port (NFR-6).
-  const gateway = await startGateway(config, backends, { port });
+  const gateway = await startGateway(config, pool, { port });
   log("listening", { url: gateway.url, profiles: Object.keys(config.profiles) });
 
   const shutdown = () => {
@@ -29,12 +29,8 @@ async function start(config: Config, port?: number): Promise<void> {
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 
-  await startBackends(backends.values(), (name, error) =>
-    log("backend_down", { server: name, error: error.message }),
-  );
-  for (const backend of backends.values()) {
-    if (backend.state === "up") log("backend_up", { server: backend.name, tools: backend.tools.length });
-  }
+  // Failures are logged and retried by the backend itself; nothing here blocks the listener.
+  await pool.start();
 }
 
 async function main(argv: string[]): Promise<number> {
