@@ -129,7 +129,8 @@ accommodates them.
 | Content scanning for injected instructions | Description pinning proves insufficient in practice |
 | Response cache for idempotent tools | Latency becomes annoying enough to measure |
 | Per-server concurrency limits | One backend starts starving the others |
-| Config hot-reload without SIGHUP | Restarting becomes a genuine irritation |
+| Config hot-reload without SIGHUP | Restarting becomes a genuine irritation — *done in Phase 5: Windows has no SIGHUP, so `POST /reload` and `mcpgw reload` exist* |
+| OAuth for `http`/`sse` backends | A remote server you actually use needs it. Confirmed blocker for `mcp.figma.com`, which 401s the gateway's static-header connection |
 
 ## Known ceilings accepted in v1
 

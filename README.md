@@ -225,6 +225,9 @@ Deliberate, and each one is marked in the code:
 - **Audit writes are best-effort.** A hard crash can lose the last few lines.
 - **`tools/list` pagination is collapsed** into a single page.
 - **Resources and prompts are not proxied yet.** Tools only.
+- **`http`/`sse` backends authenticate with static headers only.** A remote server that requires
+  an interactive OAuth flow (Figma's, for one) cannot sit behind the gateway yet — it answers
+  401, the backend is marked DOWN and retried. Point such clients at it directly for now.
 
 ## Security
 
