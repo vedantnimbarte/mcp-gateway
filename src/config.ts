@@ -26,6 +26,17 @@ const Server = z.discriminatedUnion("transport", [
     transport: z.enum(["http", "sse"]),
     url: z.string().url(),
     headers: z.record(z.string(), z.string()).default({}),
+    /** `oauth` runs the authorization-code flow once, via `mcpgw auth <server>`. */
+    auth: z.enum(["none", "oauth"]).default("none"),
+    /** Optional scope to request; most servers pick a sensible default without one. */
+    scope: z.string().optional(),
+    /**
+     * Set these when the server does not allow dynamic client registration and you had to
+     * create an OAuth app by hand. Use `${VAR}` for the secret — NFR-3 applies to it as much
+     * as to any other credential.
+     */
+    client_id: z.string().optional(),
+    client_secret: z.string().optional(),
     restart: Restart,
   }),
 ]);
@@ -147,9 +158,16 @@ function crossCheck(cfg: Config): string[] {
     );
   }
 
-  for (const key of Object.keys(cfg.servers)) {
+  for (const [key, server] of Object.entries(cfg.servers)) {
     if (!SERVER_KEY.test(key) || key.includes("__")) {
       problems.push(`servers.${key}: name must match ${SERVER_KEY.source} and contain no "__"`);
+    }
+    if (server.transport === "stdio") continue;
+    if (server.client_secret && !server.client_id) {
+      problems.push(`servers.${key}: client_secret without client_id`);
+    }
+    if (server.auth !== "oauth" && (server.client_id || server.scope)) {
+      problems.push(`servers.${key}: client_id/scope need \`auth: oauth\``);
     }
   }
 

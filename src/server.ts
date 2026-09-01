@@ -5,6 +5,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { AuditLog } from "./audit.js";
 import { ConfigError, isLoopback, loadConfig, type Config } from "./config.js";
 import { Guard } from "./guard.js";
+import { BackendAuth, TokenStore } from "./oauth.js";
 import { Pipeline } from "./pipeline.js";
 import { Pool } from "./pool.js";
 import { SessionManager } from "./session.js";
@@ -28,6 +29,7 @@ export interface Parts {
   audit: AuditLog;
   pool: Pool;
   pipeline: Pipeline;
+  tokens: TokenStore;
 }
 
 export function assemble(
@@ -42,8 +44,19 @@ export function assemble(
     log(event, fields);
     audit.write({ method: event, ...fields });
   };
-  const pool = new Pool(config, record, guard);
-  return { guard, audit, pool, pipeline: new Pipeline(config, pool, guard, audit) };
+  const tokens = new TokenStore(TokenStore.pathFor(configPath));
+  const authFor = (server: string) => {
+    const cfg = config.servers[server];
+    if (!cfg || cfg.transport === "stdio" || cfg.auth !== "oauth") return undefined;
+    return new BackendAuth(server, tokens, {
+      scope: cfg.scope,
+      clientId: cfg.client_id,
+      clientSecret: cfg.client_secret,
+    });
+  };
+
+  const pool = new Pool(config, record, guard, authFor);
+  return { guard, audit, pool, tokens, pipeline: new Pipeline(config, pool, guard, audit) };
 }
 
 function send(res: ServerResponse, status: number, body: unknown): void {

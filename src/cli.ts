@@ -1,11 +1,17 @@
 #!/usr/bin/env node
+import { spawn } from "node:child_process";
 import { createReadStream, existsSync, readdirSync } from "node:fs";
+import { createServer } from "node:http";
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { parseArgs } from "node:util";
+import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { AuditLine } from "./audit.js";
 import { ConfigError, loadConfig, type Config } from "./config.js";
+import { BackendAuth, CALLBACK_PATH, CALLBACK_PORT, REDIRECT_URI, TokenStore } from "./oauth.js";
 import { assemble, startGateway } from "./server.js";
 
 /** SPEC §11: drain in-flight calls up to 5 s, then kill children and exit 0. */
@@ -19,6 +25,8 @@ Usage:
   mcpgw list     [--config PATH] [--profile P]           effective tools per profile, and why
   mcpgw pin      [--config PATH] [--server NAME] [--yes] review and accept tool changes
   mcpgw status   [--config PATH] [--json]                backends, uptime, restarts, drift
+  mcpgw auth     SERVER [--config PATH] [--reset] [--print-url]
+                                                         authorize an oauth backend in a browser
   mcpgw reload   [--config PATH]                         re-read the config in the running daemon
   mcpgw tail     [--config PATH] [--profile P] [--denied-only] [--follow]
 
@@ -155,6 +163,187 @@ interface Health {
   >;
 }
 
+/** Best effort: the URL is always printed, so a failed opener costs nothing. */
+function openBrowser(url: URL): void {
+  const [command, args] =
+    process.platform === "win32"
+      ? ["cmd", ["/c", "start", "", url.href]]
+      : process.platform === "darwin"
+        ? ["open", [url.href]]
+        : ["xdg-open", [url.href]];
+  try {
+    spawn(command, args, { detached: true, stdio: "ignore" }).unref();
+  } catch {
+    // The printed URL is the fallback.
+  }
+}
+
+/** Catches the one redirect the authorization server sends back, then shuts itself down. */
+function awaitCallback(auth: BackendAuth): { code: Promise<string>; close: () => void } {
+  let settle: (code: string) => void;
+  let fail: (e: Error) => void;
+  const code = new Promise<string>((ok, no) => {
+    settle = ok;
+    fail = no;
+  });
+
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? "/", REDIRECT_URI);
+    if (url.pathname !== CALLBACK_PATH) {
+      res.writeHead(404).end();
+      return;
+    }
+    const reply = (text: string) => {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end(`${text}
+`);
+    };
+
+    const error = url.searchParams.get("error");
+    if (error) {
+      reply(`Authorization failed: ${error}. You can close this tab.`);
+      fail(new Error(`the authorization server said: ${error}`));
+      return;
+    }
+    // The state check is what makes this callback unforgeable by another page in the browser.
+    if (!auth.matchesState(url.searchParams.get("state"))) {
+      reply("Rejected: state mismatch. You can close this tab.");
+      fail(new Error("callback state did not match; authorization abandoned"));
+      return;
+    }
+    const granted = url.searchParams.get("code");
+    if (!granted) {
+      reply("Rejected: no code. You can close this tab.");
+      fail(new Error("callback carried no authorization code"));
+      return;
+    }
+    reply("Authorized. You can close this tab and return to the terminal.");
+    settle(granted);
+  });
+
+  server.listen(CALLBACK_PORT, "127.0.0.1");
+  server.on("error", (e) => fail(e));
+  return { code, close: () => server.close() };
+}
+
+/**
+ * The whole interactive part of OAuth, in one explicit command. The daemon never opens a
+ * browser on its own: an `auth: oauth` backend stays DOWN until this has been run once, after
+ * which the refresh token in tokens.json carries it across restarts.
+ */
+async function authorize(
+  config: Config,
+  configPath: string,
+  server: string | undefined,
+  opts: { reset?: boolean; printUrl?: boolean } = {},
+): Promise<number> {
+  if (!server) {
+    console.error("which server? usage: mcpgw auth SERVER");
+    return 1;
+  }
+  const cfg = config.servers[server];
+  if (!cfg) {
+    console.error(`no such server: ${server}`);
+    return 1;
+  }
+  if (cfg.transport === "stdio") {
+    console.error(`${server} is a stdio server; it has no OAuth flow`);
+    return 1;
+  }
+  if (cfg.auth !== "oauth") {
+    console.error(`${server} is not configured with \`auth: oauth\``);
+    return 1;
+  }
+
+  const store = new TokenStore(TokenStore.pathFor(configPath));
+  if (opts.reset) store.clear(server, "all");
+
+  const auth = new BackendAuth(server, store, {
+    scope: cfg.scope,
+    clientId: cfg.client_id,
+    clientSecret: cfg.client_secret,
+    onRedirect: (url) => {
+      console.log(`
+authorize ${server} here:
+  ${url.href}
+`);
+      if (!opts.printUrl) openBrowser(url);
+    },
+  });
+
+  const connect = async () => {
+    const client = new Client({ name: "mcpgw-auth", version: "0.0.0" });
+    const transport = new StreamableHTTPClientTransport(new URL(cfg.url), {
+      requestInit: { headers: cfg.headers },
+      authProvider: auth,
+    });
+    await client.connect(transport);
+    return { client, transport };
+  };
+
+  let listener: { code: Promise<string>; close: () => void } | undefined;
+  try {
+    try {
+      const { client } = await connect();
+      const { tools } = await client.listTools();
+      await client.close();
+      console.log(`${server} is already authorized (${tools.length} tools)`);
+      return 0;
+    } catch (e) {
+      if (!(e instanceof UnauthorizedError)) throw e;
+    }
+
+    // The redirect has been issued by now; catch the code it comes back with.
+    listener = awaitCallback(auth);
+    console.log("waiting for the redirect (Ctrl-C to abandon)…");
+    const code = await Promise.race([
+      listener.code,
+      new Promise<never>((_, no) =>
+        setTimeout(() => no(new Error("timed out after 5 minutes")), 300_000).unref(),
+      ),
+    ]);
+
+    const exchange = new StreamableHTTPClientTransport(new URL(cfg.url), {
+      requestInit: { headers: cfg.headers },
+      authProvider: auth,
+    });
+    await exchange.finishAuth(code);
+    await exchange.close();
+
+    const { client } = await connect();
+    const { tools } = await client.listTools();
+    await client.close();
+    console.log(`
+authorized ${server}: ${tools.length} tools reachable`);
+    console.log(`tokens saved to ${store.path} — restart the daemon, or run \`mcpgw reload\``);
+    return 0;
+  } catch (e) {
+    const message = (e as Error).message;
+    console.error(`authorization failed: ${message}`);
+    // The common case, and the SDK's error for it is unreadable: the server advertises dynamic
+    // registration and then refuses it, which means it wants an OAuth app you created by hand.
+    if (!cfg.client_id && /40[13]|Forbidden|registration/i.test(message)) {
+      console.error(
+        `
+${server} appears to refuse dynamic client registration. Create an OAuth app with` +
+          `
+redirect URI ${REDIRECT_URI}, then add its credentials to the server block:
+` +
+          `
+  ${server}:
+    auth: oauth
+    client_id: \${${server.toUpperCase()}_CLIENT_ID}` +
+          `
+    client_secret: \${${server.toUpperCase()}_CLIENT_SECRET}
+`,
+      );
+    }
+    return 1;
+  } finally {
+    listener?.close();
+  }
+}
+
 /** Same reload the daemon does on SIGHUP, reachable on platforms that have no such signal. */
 async function reload(config: Config): Promise<number> {
   const url = `http://${config.listen.host}:${config.listen.port}/reload`;
@@ -278,6 +467,8 @@ async function main(argv: string[]): Promise<number> {
       server: { type: "string" },
       yes: { type: "boolean" },
       json: { type: "boolean" },
+      reset: { type: "boolean" },
+      "print-url": { type: "boolean" },
       follow: { type: "boolean", short: "f" },
       "denied-only": { type: "boolean" },
       help: { type: "boolean", short: "h" },
@@ -285,7 +476,7 @@ async function main(argv: string[]): Promise<number> {
   });
 
   const command = positionals[0];
-  const known = ["start", "validate", "list", "pin", "tail", "status", "reload"];
+  const known = ["start", "validate", "list", "pin", "tail", "status", "reload", "auth"];
 
   if (values.help || !command) {
     console.log(USAGE);
@@ -322,6 +513,11 @@ async function main(argv: string[]): Promise<number> {
       return status(config, values.json);
     case "reload":
       return reload(config);
+    case "auth":
+      return authorize(config, path, positionals[1], {
+        reset: values.reset,
+        printUrl: values["print-url"],
+      });
     case "tail":
       return tail(config, {
         profile: values.profile,

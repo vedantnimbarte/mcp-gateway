@@ -13,6 +13,9 @@ build/
 .env.*
 !.env.example
 
+# OAuth refresh tokens for http/sse backends — never commit these
+tokens.json
+
 # Runtime output
 audit/
 *.log

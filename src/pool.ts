@@ -1,3 +1,4 @@
+import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import { Backend } from "./backend.js";
 import { Catalog } from "./catalog.js";
 import type { Config, ServerConfig } from "./config.js";
@@ -19,13 +20,14 @@ export class Pool {
     config: Config,
     private readonly log: (event: string, fields: Record<string, unknown>) => void = () => {},
     private readonly guard?: Guard,
+    private readonly authFor: (server: string) => OAuthClientProvider | undefined = () => undefined,
   ) {
     this.#config = config;
     for (const name of Object.keys(config.servers)) this.#add(name, config);
   }
 
   #add(name: string, config: Config): Backend {
-    const backend = new Backend(name, config.servers[name]!, config.defaults);
+    const backend = new Backend(name, config.servers[name]!, config.defaults, this.authFor(name));
     backend.onChange = () => this.#rebuild();
     backend.onEvent = this.log;
     this.backends.set(name, backend);

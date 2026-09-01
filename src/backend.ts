@@ -1,3 +1,4 @@
+import { UnauthorizedError, type OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -25,6 +26,7 @@ import type {
 } from "@modelcontextprotocol/sdk/types.js";
 import { GATEWAY_INFO, type Config, type ServerConfig } from "./config.js";
 import { ERR, gwError } from "./errors.js";
+import { NeedsAuthorization } from "./oauth.js";
 
 export type BackendState = "connecting" | "up" | "down";
 
@@ -41,7 +43,7 @@ export interface ReverseTarget {
   listRoots(params?: ListRootsRequest["params"], options?: RequestOptions): Promise<unknown>;
 }
 
-function makeTransport(cfg: ServerConfig): Transport {
+function makeTransport(cfg: ServerConfig, authProvider?: OAuthClientProvider): Transport {
   if (cfg.transport === "stdio") {
     return new StdioClientTransport({
       command: cfg.command,
@@ -53,7 +55,7 @@ function makeTransport(cfg: ServerConfig): Transport {
     });
   }
   const url = new URL(cfg.url);
-  const opts = { requestInit: { headers: cfg.headers } };
+  const opts = { requestInit: { headers: cfg.headers }, authProvider };
   return cfg.transport === "http"
     ? new StreamableHTTPClientTransport(url, opts)
     : new SSEClientTransport(url, opts);
@@ -80,10 +82,14 @@ export class Backend {
   #retry?: NodeJS.Timeout;
   #closing = false;
 
+  /** Set when the backend cannot come up without someone completing an OAuth flow. */
+  needsAuth = false;
+
   constructor(
     readonly name: string,
     readonly config: ServerConfig,
     private readonly defaults: Config["defaults"],
+    private readonly authProvider?: OAuthClientProvider,
   ) {}
 
   /** The child process, when this backend is stdio and running. */
@@ -93,7 +99,7 @@ export class Backend {
 
   async start(): Promise<void> {
     this.state = "connecting";
-    const transport = makeTransport(this.config);
+    const transport = makeTransport(this.config, this.authProvider);
     const client = new Client(
       { ...GATEWAY_INFO },
       // Advertised optimistically: whether the calling session can actually service one is
@@ -121,7 +127,7 @@ export class Backend {
       await client.connect(transport, { timeout: this.defaults.connect_timeout_ms });
     } catch (e) {
       await client.close().catch(() => {});
-      this.#failAndRetry((e as Error).message);
+      this.#failAndRetry(e);
       throw e;
     }
 
@@ -133,12 +139,13 @@ export class Backend {
       this.tools = await this.refreshTools();
     } catch (e) {
       await client.close().catch(() => {});
-      this.#failAndRetry((e as Error).message);
+      this.#failAndRetry(e);
       throw e;
     }
 
     if (this.#attempt > 0) this.restarts++;
     this.#attempt = 0;
+    this.needsAuth = false;
     this.state = "up";
     this.lastError = undefined;
     this.onEvent?.("backend_up", { server: this.name, tools: this.tools.length, pid: this.pid });
@@ -240,14 +247,24 @@ export class Backend {
    */
   #disconnected(reason: string): void {
     if (this.#closing || this.state === "down") return;
-    this.#failAndRetry(reason);
+    this.#failAndRetry(new Error(reason));
     this.onChange?.(this);
   }
 
-  /** Every failure path retries: a slow `npx` cold start is indistinguishable from a crash. */
-  #failAndRetry(reason: string): void {
-    this.#fail(reason);
-    this.#scheduleRestart();
+  /**
+   * Every failure path retries — a slow `npx` cold start is indistinguishable from a crash —
+   * except one: retrying an expired authorization just burns backoff until someone runs
+   * `mcpgw auth`. That one stops and says so.
+   */
+  #failAndRetry(error: unknown): void {
+    const needsAuth = error instanceof UnauthorizedError || error instanceof NeedsAuthorization;
+    this.needsAuth = needsAuth;
+    this.#fail(
+      needsAuth
+        ? `needs authorization: run \`mcpgw auth ${this.name}\``
+        : ((error as Error).message ?? String(error)),
+    );
+    if (!needsAuth) this.#scheduleRestart();
   }
 
   #fail(reason: string): void {

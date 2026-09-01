@@ -165,6 +165,8 @@ hanging on the first tool call.
 | `mcpgw status` | Backend health, uptime, restart counts, active sessions, pending drift |
 | `mcpgw list --profile coding` | Every tool the profile exposes, plus the rule behind each decision |
 | `mcpgw pin` | Show changed tool descriptions as diffs; `--yes` accepts them |
+| `mcpgw auth <server>` | Authorize an `auth: oauth` backend in a browser, once |
+| `mcpgw reload` | Re-read the config in the running daemon (what SIGHUP does) |
 | `mcpgw tail --denied-only` | Stream the audit log |
 
 `mcpgw list` is the one to reach for when a tool isn't showing up — it prints the decision and
@@ -174,6 +176,51 @@ the exact rule that produced it.
 live sessions keep working, and a new allow list applies to them without a reconnect. A bad edit
 is rejected and the previous config keeps serving. `SIGTERM`/`SIGINT` stop accepting new work,
 give in-flight calls up to 5 seconds to finish, then shut the backends down.
+
+## Remote servers that need OAuth
+
+A remote MCP server that answers `401` with a `WWW-Authenticate` header wants an OAuth token,
+not a static header. Mark it and authorize it once:
+
+```yaml
+servers:
+  figma:
+    transport: http
+    url: https://mcp.figma.com/mcp
+    auth: oauth
+    scope: "mcp:connect"
+```
+
+```bash
+mcpgw auth figma
+```
+
+That opens a browser, completes the authorization-code flow with PKCE, and writes the tokens to
+`tools.lock.json`'s neighbour `tokens.json` (mode 0600, gitignored). From then on the daemon
+connects on its own and refreshes the access token silently; you only run `mcpgw auth` again if
+the refresh token is revoked.
+
+The daemon never opens a browser by itself. A backend that needs authorizing stays DOWN with
+`needs authorization: run mcpgw auth <server>` and does **not** retry — retrying an expired
+authorization only burns backoff until a human acts.
+
+**Servers that refuse dynamic registration.** Many commercial servers advertise a registration
+endpoint and then reject it, because they expect an OAuth app you created by hand. Figma is one.
+Create the app with redirect URI `http://127.0.0.1:8419/callback`, then:
+
+```yaml
+servers:
+  figma:
+    transport: http
+    url: https://mcp.figma.com/mcp
+    auth: oauth
+    scope: "mcp:connect"
+    client_id: ${FIGMA_CLIENT_ID}
+    client_secret: ${FIGMA_CLIENT_SECRET}
+```
+
+The credentials come from the environment like every other secret. With `client_id` set, no
+registration is attempted at all.
 
 ## Policy
 
@@ -225,9 +272,8 @@ Deliberate, and each one is marked in the code:
 - **Audit writes are best-effort.** A hard crash can lose the last few lines.
 - **`tools/list` pagination is collapsed** into a single page.
 - **Resources and prompts are not proxied yet.** Tools only.
-- **`http`/`sse` backends authenticate with static headers only.** A remote server that requires
-  an interactive OAuth flow (Figma's, for one) cannot sit behind the gateway yet — it answers
-  401, the backend is marked DOWN and retried. Point such clients at it directly for now.
+- **OAuth is authorization-code only.** Client-credentials and device-code flows are not wired,
+  and the callback listens on a fixed `127.0.0.1:8419`.
 
 ## Security
 
