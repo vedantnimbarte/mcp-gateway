@@ -1,12 +1,22 @@
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
-import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
+import type {
+  CallToolResult,
+  CompleteRequest,
+  CompleteResult,
+  GetPromptResult,
+  Prompt,
+  ReadResourceResult,
+  Resource,
+  ResourceTemplate,
+  Tool,
+} from "@modelcontextprotocol/sdk/types.js";
 import type { AuditInput, AuditLine, AuditLog } from "./audit.js";
-import type { ReverseTarget } from "./backend.js";
-import type { CatalogEntry } from "./catalog.js";
+import type { Backend, ReverseTarget } from "./backend.js";
+import { parseUri, type CatalogEntry } from "./catalog.js";
 import type { Config } from "./config.js";
 import { ERR, gwError } from "./errors.js";
 import type { Guard } from "./guard.js";
-import { decide, type Decision } from "./policy.js";
+import { decide, reaches, type Decision } from "./policy.js";
 import type { Pool } from "./pool.js";
 import { limitersFor, type Limiter } from "./ratelimit.js";
 
@@ -41,6 +51,8 @@ export class Pipeline {
   #limiters: Map<string, Limiter>;
   /** alias → canonical, per profile. Renames are static between reloads, so this is built once. */
   #aliases = new Map<string, Map<string, string>>();
+  /** namespaced resource URI -> the sessions watching it, so a backend is subscribed once. */
+  readonly #watchers = new Map<string, Set<string>>();
 
   constructor(
     private config: Config,
@@ -102,10 +114,52 @@ export class Pipeline {
       });
   }
 
-  /** A stable fingerprint of a profile's visible set, for suppressing no-op notifications. */
+  /** Prompts are named like tools, so the same allow/deny decision applies to them. */
+  visiblePrompts(profileName: string): Prompt[] {
+    const profile = this.config.profiles[profileName];
+    return this.pool.catalog
+      .allPrompts()
+      .filter((entry) => this.#decideNamed(profileName, entry.canonical, entry.server).allow)
+      .map((entry) => ({ ...entry.def, name: profile?.rename[entry.canonical] ?? entry.canonical }));
+  }
+
+  /** Resources are filtered by server membership only (SPEC 4.1). */
+  visibleResources(profileName: string): Resource[] {
+    const profile = this.config.profiles[profileName];
+    return this.pool.catalog
+      .allResources()
+      .filter((entry) => reaches(profile, entry.server))
+      .map((entry) => entry.def as Resource);
+  }
+
+  visibleTemplates(profileName: string): ResourceTemplate[] {
+    const profile = this.config.profiles[profileName];
+    return this.pool.catalog
+      .allTemplates()
+      .filter((entry) => reaches(profile, entry.server))
+      .map((entry) => entry.def as ResourceTemplate);
+  }
+
+  /** Stable fingerprints of a profile's visible sets, for suppressing no-op notifications. */
   visibleFingerprint(profileName: string): string {
     return this.visibleTools(profileName)
       .map((t) => t.name)
+      .sort()
+      .join(" ");
+  }
+
+  promptFingerprint(profileName: string): string {
+    return this.visiblePrompts(profileName)
+      .map((p) => p.name)
+      .sort()
+      .join(" ");
+  }
+
+  resourceFingerprint(profileName: string): string {
+    return [
+      ...this.visibleResources(profileName).map((r) => r.uri),
+      ...this.visibleTemplates(profileName).map((t) => t.uriTemplate),
+    ]
       .sort()
       .join(" ");
   }
@@ -229,6 +283,169 @@ export class Pipeline {
       // 8. release, always.
       limiter?.release();
     }
+  }
+
+  async readResource(ctx: CallContext, uri: string): Promise<ReadResourceResult> {
+    const target = this.#resource(ctx, uri);
+    return this.#audited({ ...this.#line(ctx, "resources/read"), server: target.server, tool: uri }, () =>
+      target.backend.readResource(target.original),
+    );
+  }
+
+  async getPrompt(
+    ctx: CallContext,
+    exposed: string,
+    args: Record<string, string> | undefined,
+  ): Promise<GetPromptResult> {
+    const canonical = this.#aliases.get(ctx.profile)?.get(exposed) ?? exposed;
+    const entry = this.pool.catalog.getPrompt(canonical);
+    const line = { ...this.#line(ctx, "prompts/get"), exposed_as: exposed };
+    if (!entry) {
+      return this.#refuse(line, new McpError(ErrorCode.MethodNotFound, `unknown prompt "${exposed}"`));
+    }
+
+    const decision = this.#decideNamed(ctx.profile, entry.canonical, entry.server);
+    if (!decision.allow) {
+      const code = decision.reason === "server_unavailable" ? ERR.BACKEND_DOWN : ERR.POLICY;
+      return this.#refuse(
+        { ...line, server: entry.server, tool: entry.name, decision: decision.reason },
+        gwError(code, `"${exposed}" is not available: ${decision.reason}`, {
+          reason: decision.reason,
+          profile: ctx.profile,
+          server: entry.server,
+        }),
+      );
+    }
+
+    const backend = this.pool.backends.get(entry.server)!;
+    return this.#audited({ ...line, server: entry.server, tool: entry.name }, () =>
+      backend.getPrompt(entry.name, args),
+    );
+  }
+
+  /** Subscribes the backend once, however many sessions are watching the same resource. */
+  async subscribe(ctx: CallContext, uri: string): Promise<void> {
+    const target = this.#resource(ctx, uri);
+    const watchers = this.#watchers.get(uri) ?? new Set<string>();
+    const first = watchers.size === 0;
+    watchers.add(ctx.session ?? "");
+    this.#watchers.set(uri, watchers);
+
+    if (first) {
+      await this.#audited(
+        { ...this.#line(ctx, "resources/subscribe"), server: target.server, tool: uri },
+        () => target.backend.subscribe(target.original),
+      );
+    }
+  }
+
+  /** Unsubscribes the backend only once nobody is left watching. */
+  async unsubscribe(ctx: CallContext, uri: string): Promise<void> {
+    const watchers = this.#watchers.get(uri);
+    if (!watchers?.delete(ctx.session ?? "")) return;
+    if (watchers.size > 0) return;
+
+    this.#watchers.delete(uri);
+    const target = this.#resource(ctx, uri);
+    await this.#audited(
+      { ...this.#line(ctx, "resources/unsubscribe"), server: target.server, tool: uri },
+      () => target.backend.unsubscribe(target.original),
+    );
+  }
+
+  /** Which sessions asked to hear about this resource. */
+  watchersOf(uri: string): string[] {
+    return [...(this.#watchers.get(uri) ?? [])];
+  }
+
+  /** A closing session stops watching everything, releasing backend subscriptions with it. */
+  dropSession(sessionId: string, ctx: CallContext): void {
+    for (const [uri, watchers] of [...this.#watchers]) {
+      if (!watchers.has(sessionId)) continue;
+      void this.unsubscribe({ ...ctx, session: sessionId }, uri).catch(() => {});
+    }
+  }
+
+  async complete(ctx: CallContext, params: CompleteRequest["params"]): Promise<CompleteResult> {
+    const line = this.#line(ctx, "completion/complete");
+
+    if (params.ref.type === "ref/prompt") {
+      const entry = this.pool.catalog.getPrompt(
+        this.#aliases.get(ctx.profile)?.get(params.ref.name) ?? params.ref.name,
+      );
+      if (!entry || !this.#decideNamed(ctx.profile, entry.canonical, entry.server).allow) {
+        return this.#refuse(line, new McpError(ErrorCode.MethodNotFound, "unknown prompt"));
+      }
+      const backend = this.pool.backends.get(entry.server)!;
+      return this.#audited({ ...line, server: entry.server, tool: entry.name }, () =>
+        backend.complete({ ...params, ref: { type: "ref/prompt", name: entry.name } }),
+      );
+    }
+
+    const target = this.#resource(ctx, params.ref.uri);
+    return this.#audited({ ...line, server: target.server, tool: params.ref.uri }, () =>
+      target.backend.complete({ ...params, ref: { type: "ref/resource", uri: target.original } }),
+    );
+  }
+
+  /** Resolve a namespaced URI to its backend, refusing anything this profile cannot reach. */
+  #resource(ctx: CallContext, uri: string): { backend: Backend; server: string; original: string } {
+    const parsed = parseUri(uri);
+    const backend = parsed ? this.pool.backends.get(parsed.server) : undefined;
+    if (!parsed || !backend) {
+      throw new McpError(ErrorCode.InvalidParams, `not a gateway resource URI: "${uri}"`);
+    }
+    if (!reaches(this.config.profiles[ctx.profile], parsed.server)) {
+      throw gwError(ERR.POLICY, `"${uri}" is not available: server_not_in_profile`, {
+        reason: "server_not_in_profile",
+        profile: ctx.profile,
+        server: parsed.server,
+      });
+    }
+    return { backend, server: parsed.server, original: parsed.original };
+  }
+
+  #line(ctx: CallContext, method: string): AuditInput {
+    return { method, session: ctx.session, profile: ctx.profile, client: ctx.client };
+  }
+
+  /** One audit line per proxied request, whatever happened to it (SPEC 7). */
+  async #audited<T>(line: AuditInput, run: () => Promise<T>): Promise<T> {
+    const started = Date.now();
+    try {
+      const result = await run();
+      this.audit.write({ ...line, decision: "allow", status: "ok", dur_ms: Date.now() - started });
+      return result;
+    } catch (e) {
+      const error = e as Error & { code?: number };
+      this.audit.write({
+        ...line,
+        decision: line.decision ?? "allow",
+        status: error.code === ERR.TIMEOUT ? "timeout" : "error",
+        dur_ms: Date.now() - started,
+        error: { code: error.code ?? -32603, message: this.guard.redactText(error.message) },
+      });
+      throw error;
+    }
+  }
+
+  #refuse(line: AuditInput, error: Error & { code?: number }): never {
+    this.audit.write({
+      ...line,
+      status: "denied",
+      error: { code: error.code ?? -32603, message: this.guard.redactText(error.message) },
+    });
+    throw error;
+  }
+
+  /** The tool decision, for things that are named like tools but are not in the tool catalog. */
+  #decideNamed(profileName: string, canonical: string, server: string): Decision {
+    return decide(canonical, {
+      profile: this.config.profiles[profileName],
+      serverState: this.pool.backends.get(server)?.state,
+      drifted: false, // pinning covers tools; a prompt has no inputSchema to pin
+      onDrift: this.config.guard.on_drift,
+    });
   }
 
   #decide(profileName: string, entry: CatalogEntry): Decision {

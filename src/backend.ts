@@ -12,16 +12,26 @@ import {
   ErrorCode,
   ListRootsRequestSchema,
   McpError,
+  PromptListChangedNotificationSchema,
+  ResourceListChangedNotificationSchema,
+  ResourceUpdatedNotificationSchema,
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import type {
   CallToolResult,
+  CompleteRequest,
+  CompleteResult,
   CreateMessageRequest,
   CreateMessageResult,
   ElicitRequest,
   ElicitResult,
+  GetPromptResult,
   ListRootsRequest,
   ListRootsResult,
+  Prompt,
+  ReadResourceResult,
+  Resource,
+  ResourceTemplate,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { GATEWAY_INFO, type Config, type ServerConfig } from "./config.js";
@@ -68,6 +78,11 @@ function makeTransport(cfg: ServerConfig, authProvider?: OAuthClientProvider): T
 export class Backend {
   state: BackendState = "connecting";
   tools: Tool[] = [];
+  prompts: Prompt[] = [];
+  resources: Resource[] = [];
+  resourceTemplates: ResourceTemplate[] = [];
+  /** Called when this backend reports that one of its resources changed. */
+  onResourceUpdated?: (server: string, uri: string) => void;
   lastError?: string;
   restarts = 0;
   /** Called whenever this backend's contribution to the catalog changes. */
@@ -122,6 +137,15 @@ export class Backend {
     client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
       void this.#relist();
     });
+    client.setNotificationHandler(ResourceListChangedNotificationSchema, () => {
+      void this.#relist();
+    });
+    client.setNotificationHandler(PromptListChangedNotificationSchema, () => {
+      void this.#relist();
+    });
+    client.setNotificationHandler(ResourceUpdatedNotificationSchema, (notification) => {
+      this.onResourceUpdated?.(this.name, notification.params.uri);
+    });
 
     try {
       await client.connect(transport, { timeout: this.defaults.connect_timeout_ms });
@@ -136,7 +160,7 @@ export class Backend {
     client.onclose = () => this.#disconnected("connection closed");
 
     try {
-      this.tools = await this.refreshTools();
+      await this.refresh();
     } catch (e) {
       await client.close().catch(() => {});
       this.#failAndRetry(e);
@@ -152,21 +176,62 @@ export class Backend {
     this.onChange?.(this);
   }
 
-  /** Pagination is collapsed here — the gateway serves one merged page (SPEC §4.1). */
-  async refreshTools(): Promise<Tool[]> {
+  /**
+   * Everything this backend offers. Pagination is collapsed — the gateway serves one merged
+   * page (SPEC 4.1) — and a capability the server does not advertise is simply empty.
+   */
+  async refresh(): Promise<void> {
     const client = this.#client;
-    if (!client || !client.getServerCapabilities()?.tools) return [];
+    if (!client) return;
+    const capabilities = client.getServerCapabilities();
 
-    const tools: Tool[] = [];
+    this.tools = capabilities?.tools
+      ? await this.#pages(
+          (cursor) => client.listTools(cursor, this.#opts()),
+          (page) => page.tools,
+        )
+      : [];
+
+    this.prompts = capabilities?.prompts
+      ? await this.#pages(
+          (cursor) => client.listPrompts(cursor, this.#opts()),
+          (page) => page.prompts,
+        )
+      : [];
+
+    if (capabilities?.resources) {
+      this.resources = await this.#pages(
+        (cursor) => client.listResources(cursor, this.#opts()),
+        (page) => page.resources,
+      );
+      // Optional even when `resources` is advertised, so a refusal here is not a failure.
+      this.resourceTemplates = await this.#pages(
+        (cursor) => client.listResourceTemplates(cursor, this.#opts()),
+        (page) => page.resourceTemplates,
+      ).catch(() => []);
+    } else {
+      this.resources = [];
+      this.resourceTemplates = [];
+    }
+  }
+
+  #opts() {
+    return { timeout: this.defaults.call_timeout_ms };
+  }
+
+  /** Walks nextCursor to the end and returns everything as one list. */
+  async #pages<P extends { nextCursor?: string }, T>(
+    fetch: (cursor: Record<string, string>) => Promise<P>,
+    items: (page: P) => T[],
+  ): Promise<T[]> {
+    const all: T[] = [];
     let cursor: string | undefined;
     do {
-      const page = await client.listTools(cursor === undefined ? {} : { cursor }, {
-        timeout: this.defaults.call_timeout_ms,
-      });
-      tools.push(...page.tools);
+      const page = await fetch(cursor === undefined ? {} : { cursor });
+      all.push(...items(page));
       cursor = page.nextCursor;
     } while (cursor !== undefined);
-    return tools;
+    return all;
   }
 
   async callTool(
@@ -194,6 +259,53 @@ export class Backend {
     }
   }
 
+  async readResource(uri: string): Promise<ReadResourceResult> {
+    return this.#request("resources/read", uri, (client) =>
+      client.readResource({ uri }, this.#opts()),
+    );
+  }
+
+  async getPrompt(name: string, args: Record<string, string> | undefined): Promise<GetPromptResult> {
+    return this.#request("prompts/get", name, (client) =>
+      client.getPrompt({ name, arguments: args }, this.#opts()),
+    );
+  }
+
+  async subscribe(uri: string): Promise<void> {
+    await this.#request("resources/subscribe", uri, (client) =>
+      client.subscribeResource({ uri }, this.#opts()),
+    );
+  }
+
+  async unsubscribe(uri: string): Promise<void> {
+    await this.#request("resources/unsubscribe", uri, (client) =>
+      client.unsubscribeResource({ uri }, this.#opts()),
+    );
+  }
+
+  async complete(params: CompleteRequest["params"]): Promise<CompleteResult> {
+    return this.#request("completion/complete", params.ref.type, (client) =>
+      client.complete(params, this.#opts()),
+    );
+  }
+
+  /** The shared shape of every non-tool call: refuse when down, wrap what the backend throws. */
+  async #request<T>(method: string, what: string, run: (client: Client) => Promise<T>): Promise<T> {
+    const client = this.#client;
+    if (!client || this.state !== "up") {
+      throw gwError(ERR.BACKEND_DOWN, `backend "${this.name}" is ${this.state}`, {
+        reason: "server_unavailable",
+        server: this.name,
+        tool: `${method} ${what}`,
+      });
+    }
+    try {
+      return await run(client);
+    } catch (e) {
+      throw this.#wrap(e, `${method} ${what}`);
+    }
+  }
+
   /**
    * Routes a backend→client request to the session that owns the call it arrived during.
    *
@@ -217,7 +329,7 @@ export class Backend {
   async #relist(): Promise<void> {
     if (this.state !== "up") return;
     try {
-      this.tools = await this.refreshTools();
+      await this.refresh();
       this.onChange?.(this);
     } catch (e) {
       this.onEvent?.("relist_failed", { server: this.name, error: (e as Error).message });
@@ -275,6 +387,9 @@ export class Backend {
     this.state = "down";
     this.lastError = reason;
     this.tools = [];
+    this.prompts = [];
+    this.resources = [];
+    this.resourceTemplates = [];
     this.#client = undefined;
     this.#transport = undefined;
     this.#inflight.clear();
@@ -308,6 +423,9 @@ export class Backend {
     clearTimeout(this.#retry);
     this.state = "down";
     this.tools = [];
+    this.prompts = [];
+    this.resources = [];
+    this.resourceTemplates = [];
     const client = this.#client;
     this.#client = undefined;
     this.#transport = undefined;

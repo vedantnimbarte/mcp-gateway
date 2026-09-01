@@ -114,6 +114,7 @@ export async function startGateway(
 
   const sessions = new SessionManager(config, pipeline, audit);
   pool.onCatalogChange = () => sessions.notifyCatalogChanged();
+  pool.onResourceUpdated = (server, uri) => sessions.notifyResourceUpdated(server, uri);
 
   const http = createServer((req, res) => {
     handle(req, res).catch((e: Error) => {

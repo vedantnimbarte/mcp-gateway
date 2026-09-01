@@ -33,6 +33,15 @@ export function serverOf(canonical: string): string {
 const deny = (reason: DenyReason, rule: string): Decision => ({ allow: false, reason, rule });
 
 /**
+ * Step 2 on its own. Resources are addressed by URI, and the globs are written against tool
+ * names, so SPEC 4.1 filters them by server membership alone rather than by allow/deny.
+ */
+export function reaches(profile: ProfileConfig | undefined, server: string): boolean {
+  if (!profile || !server) return false;
+  return profile.servers.includes("*") || profile.servers.includes(server);
+}
+
+/**
  * SPEC §3.1, in that order. Pure, total, and identical for `tools/list` and `tools/call` — a
  * tool the model never saw is still refused if guessed (FR-10). Deny is checked before allow,
  * so an allow entry can never resurrect a denied tool, and any error inside is a DENY.

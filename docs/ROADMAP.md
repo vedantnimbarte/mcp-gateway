@@ -117,7 +117,7 @@ and silently useless.
 
 **Resources and prompts can slip.** Tools are 95% of the value. If Phase 2 runs long, ship
 tools-only and add `resources`/`prompts` after cutover — the catalog abstraction already
-accommodates them.
+accommodates them. *(Done after cutover, as planned: the catalog took them without a rewrite.)*
 
 ## Deferred, with triggers
 

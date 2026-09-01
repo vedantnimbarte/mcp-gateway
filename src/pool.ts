@@ -13,6 +13,8 @@ export class Pool {
   catalog = Catalog.empty();
   /** Set by the gateway so sessions can be told their view changed (ARCHITECTURE §3.3). */
   onCatalogChange?: () => void;
+  /** Set by the gateway so a resource update reaches the sessions watching it. */
+  onResourceUpdated?: (server: string, uri: string) => void;
 
   #config: Config;
 
@@ -30,6 +32,7 @@ export class Pool {
     const backend = new Backend(name, config.servers[name]!, config.defaults, this.authFor(name));
     backend.onChange = () => this.#rebuild();
     backend.onEvent = this.log;
+    backend.onResourceUpdated = (server, uri) => this.onResourceUpdated?.(server, uri);
     this.backends.set(name, backend);
     return backend;
   }

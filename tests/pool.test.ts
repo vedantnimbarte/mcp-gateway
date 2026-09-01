@@ -109,7 +109,7 @@ test("one process per configured backend, however many clients are connected", (
 test("a profile sees only its own servers", async () => {
   const { tools } = await narrow.listTools();
   assert.deepEqual([...new Set(tools.map((t) => t.name.split("__")[0]))], ["alpha"]);
-  assert.equal((await wide.listTools()).tools.length, SERVERS.length * 6);
+  assert.equal((await wide.listTools()).tools.length, SERVERS.length * 7);
 });
 
 test("a crashed backend fails its call, vanishes, and comes back", async () => {
@@ -144,7 +144,7 @@ test("a crashed backend fails its call, vanishes, and comes back", async () => {
   await until("the wide session to be told again", () => wideNotifications.length > 1);
 
   const after = await wide.listTools();
-  assert.equal(after.tools.filter((t) => t.name.startsWith("charlie__")).length, 6);
+  assert.equal(after.tools.filter((t) => t.name.startsWith("charlie__")).length, 7);
   assert.equal(alive(doomed), false, "the crashed child must not linger");
   assert.notEqual(charlie.pid, doomed);
   assert.equal(charlie.restarts, 1);

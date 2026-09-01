@@ -1,7 +1,8 @@
 // Test backend: a stdio MCP server the suite fully controls. `describe`'s description changes
 // when FIXTURE_DRIFT is set, which is how the Phase 4 drift block gets tested across a restart.
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 const server = new McpServer({ name: "fixture", version: "1.0.0" });
@@ -68,5 +69,42 @@ server.registerTool(
   { description: "Exits the process, to test supervision.", inputSchema: {} },
   () => process.exit(1),
 );
+
+server.registerResource(
+  "note",
+  "fixture://note",
+  { description: "A fixed resource.", mimeType: "text/plain" },
+  (uri) => ({ contents: [{ uri: uri.href, text: "the note says hello" }] }),
+);
+
+server.registerResource(
+  "page",
+  new ResourceTemplate("fixture://page/{id}", { list: undefined }),
+  { description: "A templated resource.", mimeType: "text/plain" },
+  (uri, { id }) => ({ contents: [{ uri: uri.href, text: `page ${String(id)}` }] }),
+);
+
+server.registerPrompt(
+  "review",
+  { description: "Asks for a review.", argsSchema: { subject: z.string() } },
+  ({ subject }) => ({
+    messages: [{ role: "user", content: { type: "text", text: `Please review ${subject}.` } }],
+  }),
+);
+
+// Lets a test make the server announce that `fixture://note` changed.
+server.registerTool(
+  "touch_note",
+  { description: "Marks the note as updated.", inputSchema: {} },
+  async () => {
+    await server.server.sendResourceUpdated({ uri: "fixture://note" });
+    return { content: [{ type: "text", text: "touched" }] };
+  },
+);
+
+// The high-level McpServer does not implement subscribe, so wire it on the low-level server.
+server.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
+server.server.setRequestHandler(SubscribeRequestSchema, () => ({}));
+server.server.setRequestHandler(UnsubscribeRequestSchema, () => ({}));
 
 await server.connect(new StdioServerTransport());

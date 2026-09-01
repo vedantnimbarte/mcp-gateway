@@ -15,7 +15,7 @@ const backend = (name: string) => `  ${name}:
     command: ${JSON.stringify(process.execPath)}
     args: [${JSON.stringify(fixture)}]`;
 
-// Each fixture exposes: ask, ask_later, crash, describe, echo, sleep.
+// Each fixture exposes: ask, ask_later, crash, describe, echo, sleep, touch_note.
 const configPath = join(mkdtempSync(join(tmpdir(), "mcpgw-")), "config.yaml");
 writeFileSync(
   configPath,
@@ -80,7 +80,7 @@ test("a curated profile lists a fraction of what the default one does", async ()
   const all = await names(await open("default"));
   const few = await names(await open("readonly"));
 
-  assert.equal(all.length, 12, "two fixtures, six tools each");
+  assert.equal(all.length, 14, "two fixtures, seven tools each");
   assert.deepEqual(few, ["alpha__describe", "alpha__echo"]);
 });
 
@@ -106,6 +106,7 @@ test("deny beats allow through the whole stack", async () => {
     "alpha__ask",
     "alpha__ask_later",
     "alpha__sleep",
+    "alpha__touch_note",
     "say",
   ]);
 

@@ -1,8 +1,20 @@
 import { randomUUID } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+  CallToolRequestSchema,
+  CompleteRequestSchema,
+  GetPromptRequestSchema,
+  ListPromptsRequestSchema,
+  ListResourcesRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ListToolsRequestSchema,
+  ReadResourceRequestSchema,
+  SubscribeRequestSchema,
+  UnsubscribeRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import type { AuditLog } from "./audit.js";
+import { namespaceUri } from "./catalog.js";
 import { GATEWAY_INFO, type Config } from "./config.js";
 import type { Pipeline } from "./pipeline.js";
 
@@ -15,8 +27,8 @@ export interface Session {
   transport: StreamableHTTPServerTransport;
   server: Server;
   lastSeen: number;
-  /** The tool names last shown to this client, to suppress no-op list_changed notifications. */
-  visible: string;
+  /** What was last shown to this client, to suppress no-op list_changed notifications. */
+  visible: { tools: string; prompts: string; resources: string };
 }
 
 /**
@@ -25,24 +37,68 @@ export interface Session {
  * a reply resolves through the promise that issued it (SPEC §4.3).
  */
 function buildServer(pipeline: Pipeline, profile: string, sessionId: () => string | undefined): Server {
-  const server = new Server({ ...GATEWAY_INFO }, { capabilities: { tools: { listChanged: true } } });
+  const server = new Server(
+    { ...GATEWAY_INFO },
+    {
+      // Advertised whether or not a backend currently offers them: sessions outlive backends,
+      // and a profile with no resources simply lists none (ARCHITECTURE 4.1).
+      capabilities: {
+        tools: { listChanged: true },
+        prompts: { listChanged: true },
+        resources: { subscribe: true, listChanged: true },
+        completions: {},
+      },
+    },
+  );
+
+  // `server` is this session: what a reverse request from the backend routes back to.
+  const ctx = () => ({
+    profile,
+    session: sessionId(),
+    client: server.getClientVersion(),
+    caller: server,
+  });
 
   server.setRequestHandler(ListToolsRequestSchema, () => ({
     tools: pipeline.visibleTools(profile),
   }));
 
   server.setRequestHandler(CallToolRequestSchema, (request) =>
-    pipeline.callTool(
-      {
-        profile,
-        session: sessionId(),
-        client: server.getClientVersion(),
-        // `server` is this session: what a reverse request from the backend routes back to.
-        caller: server,
-      },
-      request.params.name,
-      request.params.arguments,
-    ),
+    pipeline.callTool(ctx(), request.params.name, request.params.arguments),
+  );
+
+  server.setRequestHandler(ListPromptsRequestSchema, () => ({
+    prompts: pipeline.visiblePrompts(profile),
+  }));
+
+  server.setRequestHandler(GetPromptRequestSchema, (request) =>
+    pipeline.getPrompt(ctx(), request.params.name, request.params.arguments),
+  );
+
+  server.setRequestHandler(ListResourcesRequestSchema, () => ({
+    resources: pipeline.visibleResources(profile),
+  }));
+
+  server.setRequestHandler(ListResourceTemplatesRequestSchema, () => ({
+    resourceTemplates: pipeline.visibleTemplates(profile),
+  }));
+
+  server.setRequestHandler(ReadResourceRequestSchema, (request) =>
+    pipeline.readResource(ctx(), request.params.uri),
+  );
+
+  server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+    await pipeline.subscribe(ctx(), request.params.uri);
+    return {};
+  });
+
+  server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
+    await pipeline.unsubscribe(ctx(), request.params.uri);
+    return {};
+  });
+
+  server.setRequestHandler(CompleteRequestSchema, (request) =>
+    pipeline.complete(ctx(), request.params),
   );
 
   return server;
@@ -54,7 +110,7 @@ export class SessionManager {
 
   constructor(
     private config: Config,
-    private readonly pipeline: Pipeline,
+    readonly pipeline: Pipeline,
     private readonly audit: AuditLog,
   ) {
     this.#sweeper = setInterval(() => this.#sweep(), 60_000);
@@ -122,10 +178,28 @@ export class SessionManager {
    */
   notifyCatalogChanged(): void {
     for (const session of this.#sessions.values()) {
-      const visible = this.#visible(session.profile);
-      if (visible === session.visible) continue;
-      session.visible = visible;
-      session.server.sendToolListChanged().catch(() => {});
+      const now = this.#visible(session.profile);
+      const was = session.visible;
+      session.visible = now;
+
+      if (now.tools !== was.tools) session.server.sendToolListChanged().catch(() => {});
+      if (now.prompts !== was.prompts) session.server.sendPromptListChanged().catch(() => {});
+      if (now.resources !== was.resources) session.server.sendResourceListChanged().catch(() => {});
+    }
+  }
+
+  /**
+   * A backend says a resource changed; only the sessions that asked about it hear so
+   * (ARCHITECTURE 3.3).
+   */
+  notifyResourceUpdated(server: string, uri: string): void {
+    const namespaced = namespaceUri(server, uri);
+    for (const sessionId of this.pipeline.watchersOf(namespaced)) {
+      const session = this.#sessions.get(sessionId);
+      if (!session) continue;
+      session.server
+        .notification({ method: "notifications/resources/updated", params: { uri: namespaced } })
+        .catch(() => {});
     }
   }
 
@@ -133,11 +207,17 @@ export class SessionManager {
     const session = this.#sessions.get(id);
     if (!session) return;
     this.#sessions.delete(id);
+    // Releases any backend subscriptions this session was the last one holding.
+    this.pipeline.dropSession(id, { profile: session.profile, session: id });
     this.audit.write({ method: "session_close", session: id, profile: session.profile });
   }
 
-  #visible(profile: string): string {
-    return this.pipeline.visibleFingerprint(profile);
+  #visible(profile: string): Session["visible"] {
+    return {
+      tools: this.pipeline.visibleFingerprint(profile),
+      prompts: this.pipeline.promptFingerprint(profile),
+      resources: this.pipeline.resourceFingerprint(profile),
+    };
   }
 
   #sweep(): void {

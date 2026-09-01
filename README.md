@@ -232,6 +232,28 @@ Tools are namespaced `<server>__<tool>` so two servers can both have a `search` 
 colliding. Globs always match the canonical name, never the alias, so renaming can never be
 used to slip past a deny rule.
 
+## Resources and prompts
+
+Both are proxied alongside tools, namespaced the same way. Prompts become `<server>__<name>`;
+resources get a scheme, `mcpgw://<server>/<original-uri>`, so the backend's own URI survives
+whole and comes back intact on the way down.
+
+`resources/subscribe` is reference-counted: however many sessions watch the same resource, the
+backend is subscribed once, and `notifications/resources/updated` is delivered only to the
+sessions that asked — closing a session releases whatever it was the last one holding.
+
+The two are filtered differently, and the difference is deliberate:
+
+| | Filtered by |
+|---|---|
+| Tools, prompts | The full policy: server membership, then deny globs, then the allow list |
+| Resources, templates | Server membership only |
+
+Globs are written against names, and a resource is addressed by URI — matching `github__get_*`
+against `mcpgw://github/file:///x` would be guesswork. So a profile that can reach a server can
+read its resources. If that is too broad for a server you are exposing, keep it out of that
+profile's `servers` list rather than trying to express it as a glob.
+
 ## Audit log
 
 One JSON object per line, in `audit/YYYY-MM-DD.jsonl`:
@@ -271,7 +293,6 @@ Deliberate, and each one is marked in the code:
 - **Rate limits are in memory.** Restarting the daemon resets them.
 - **Audit writes are best-effort.** A hard crash can lose the last few lines.
 - **`tools/list` pagination is collapsed** into a single page.
-- **Resources and prompts are not proxied yet.** Tools only.
 - **OAuth is authorization-code only.** Client-credentials and device-code flows are not wired,
   and the callback listens on a fixed `127.0.0.1:8419`.
 
