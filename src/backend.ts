@@ -257,7 +257,11 @@ export class Backend {
    * `mcpgw auth`. That one stops and says so.
    */
   #failAndRetry(error: unknown): void {
-    const needsAuth = error instanceof UnauthorizedError || error instanceof NeedsAuthorization;
+    // An OAuth backend with nothing in the token store cannot be fixed by waiting: whatever
+    // went wrong — a 401, or a server that advertises dynamic registration and then 403s it —
+    // the next attempt does exactly the same thing.
+    const unauthorized = error instanceof UnauthorizedError || error instanceof NeedsAuthorization;
+    const needsAuth = unauthorized || (this.authProvider !== undefined && !this.#hasTokens());
     this.needsAuth = needsAuth;
     this.#fail(
       needsAuth
@@ -292,6 +296,11 @@ export class Backend {
     }, delay);
     this.#retry.unref();
     this.onEvent?.("backend_retry", { server: this.name, attempt: this.#attempt, in_ms: delay });
+  }
+
+  #hasTokens(): boolean {
+    const tokens = this.authProvider?.tokens();
+    return tokens !== undefined && !(tokens instanceof Promise) && Boolean(tokens.access_token);
   }
 
   async close(): Promise<void> {

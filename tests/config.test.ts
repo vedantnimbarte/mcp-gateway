@@ -31,10 +31,10 @@ servers:
     args: ["-y", "@modelcontextprotocol/server-github"]
 `;
 
-test("accepts the SPEC 1.2 sample config", () => {
+test("accepts the SPEC 1.2 sample config (config.example.yaml)", () => {
   process.env.GITHUB_TOKEN = "ghp_test";
   process.env.LINEAR_KEY = "lin_test";
-  const { config } = loadConfig(join(repoRoot, "config.yaml"));
+  const { config } = loadConfig(join(repoRoot, "config.example.yaml"));
 
   assert.equal(config.listen.port, 8420);
   assert.deepEqual(Object.keys(config.servers), ["github", "fs", "linear", "legacy"]);

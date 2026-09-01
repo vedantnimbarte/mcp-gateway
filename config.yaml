@@ -1,76 +1,46 @@
+# The live gateway config. Secrets never live here: ${VAR} reads them from the environment.
 version: 1
 
 listen:
-  host: 127.0.0.1        # non-loopback requires `token`
+  host: 127.0.0.1        # non-loopback would require `token` (NFR-2)
   port: 8420
-  # token: ${MCPGW_TOKEN}   # sent as `Authorization: Bearer <token>`
-
-defaults:
-  call_timeout_ms: 30000
-  connect_timeout_ms: 10000
 
 servers:
-  github:
-    transport: stdio
-    command: npx
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN}
-    cwd: ~/
-    restart:
-      max_retries: 5
-      backoff_ms: 1000      # doubles per attempt, capped at 30000
-
-  fs:
-    transport: stdio
-    command: npx
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "/Users/vedant/code"]
-
-  linear:
-    transport: http          # Streamable HTTP
-    url: https://mcp.linear.app/mcp
-    headers:
-      Authorization: Bearer ${LINEAR_KEY}
-
-  legacy:
-    transport: sse           # deprecated MCP transport, passthrough support only
-    url: https://example.com/sse
+  # Figma refuses dynamic client registration, so it needs an OAuth app you create by hand at
+  # https://www.figma.com/developers/apps with redirect URI http://127.0.0.1:8419/callback.
+  # Set FIGMA_CLIENT_ID and FIGMA_CLIENT_SECRET, then run: mcpgw auth figma
+  figma:
+    transport: http
+    url: https://mcp.figma.com/mcp
+    auth: oauth
+    scope: "mcp:connect"
+    # Uncomment once the app exists and the two variables are set, then: mcpgw auth figma
+    # client_id: ${FIGMA_CLIENT_ID}
+    # client_secret: ${FIGMA_CLIENT_SECRET}
 
 profiles:
+  # Everything, for the editor.
   default:
     servers: ["*"]
 
-  readonly:
-    servers: [github, linear]
-    allow:
-      - "github__get_*"
-      - "github__list_*"
-      - "github__search_*"
-      - "linear__list_*"
-
-  coding:
-    servers: [github, fs]
-    deny:
-      - "github__delete_*"
-      - "github__merge_pull_request"
-      - "fs__move_file"
-    rename:
-      github__create_issue: file_bug
-      fs__read_text_file: read_file
-    limits:
-      rpm: 60
-      concurrent: 4
+  # A narrower view for clients you want to keep out of trouble. Fill the allow list in once
+  # `mcpgw list` has shown you the real tool names:
+  #   readonly:
+  #     servers: [figma]
+  #     allow: ["figma__get_*"]
 
 guard:
   pin_tools: true
-  on_drift: block            # block | warn
+  on_drift: block
   max_result_bytes: 262144
   redact:
-    - "gh[pousr]_[A-Za-z0-9]{16,}"
-    - "sk-[A-Za-z0-9]{20,}"
-    - "(?i)bearer\\s+[A-Za-z0-9._~+/-]{20,}"
+    # Single-quoted, so YAML leaves the backslashes to the regex engine.
+    - 'gh[pousr]_[A-Za-z0-9]{16,}'
+    - 'sk-[A-Za-z0-9]{20,}'
+    - 'figd_[A-Za-z0-9_-]{20,}'
+    - '(?i)bearer\s+[A-Za-z0-9._~+/-]{20,}'
 
 audit:
   dir: ./audit
-  log_args: hashed           # full | hashed | none
-  log_results: none          # full | truncated | none
+  log_args: hashed
+  log_results: none
