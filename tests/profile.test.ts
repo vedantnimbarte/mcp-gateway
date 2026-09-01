@@ -80,7 +80,7 @@ test("a curated profile lists a fraction of what the default one does", async ()
   const all = await names(await open("default"));
   const few = await names(await open("readonly"));
 
-  assert.equal(all.length, 14, "two fixtures, seven tools each");
+  assert.equal(all.length, 18, "two fixtures, nine tools each");
   assert.deepEqual(few, ["alpha__describe", "alpha__echo"]);
 });
 
@@ -105,6 +105,8 @@ test("deny beats allow through the whole stack", async () => {
     "about",
     "alpha__ask",
     "alpha__ask_later",
+    "alpha__cancellations",
+    "alpha__emit_logs",
     "alpha__sleep",
     "alpha__touch_note",
     "say",

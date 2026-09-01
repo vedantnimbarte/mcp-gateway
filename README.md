@@ -254,6 +254,18 @@ against `mcpgw://github/file:///x` would be guesswork. So a profile that can rea
 read its resources. If that is too broad for a server you are exposing, keep it out of that
 profile's `servers` list rather than trying to express it as a glob.
 
+## Cancellation and logging
+
+A client that cancels a call cancels it all the way down: the abort is carried into the backend
+request, so the backend stops working rather than finishing into a discarded result. Other
+sessions sharing that backend are unaffected.
+
+`logging/setLevel` is recorded per session and never pushed down to the backends — they are
+shared, so one client asking for `debug` would turn it on for everyone. A backend's log messages
+are routed to the session whose call they arrived during and filtered by that session's own
+level (default `info`). A message that arrives with no call in flight is dropped rather than
+broadcast, for the same reason a reverse request in that state gets `-32006`.
+
 ## Audit log
 
 One JSON object per line, in `audit/YYYY-MM-DD.jsonl`:

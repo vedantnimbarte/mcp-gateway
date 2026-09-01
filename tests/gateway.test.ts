@@ -77,9 +77,11 @@ test("lists the backend's tools, namespaced", async () => {
     [
       "fixture__ask",
       "fixture__ask_later",
+      "fixture__cancellations",
       "fixture__crash",
       "fixture__describe",
       "fixture__echo",
+      "fixture__emit_logs",
       "fixture__sleep",
       "fixture__touch_note",
     ],
@@ -149,7 +151,7 @@ test("healthz reports what `mcpgw status` needs", async () => {
   assert.equal(health.pending_drift, 0);
   assert.ok(health.sessions >= 1);
   assert.equal(health.backends.fixture?.state, "up");
-  assert.equal(health.backends.fixture?.tools, 7);
+  assert.equal(health.backends.fixture?.tools, 9);
   assert.equal(health.backends.fixture?.restarts, 0);
   assert.ok(typeof health.backends.fixture?.pid === "number");
 });

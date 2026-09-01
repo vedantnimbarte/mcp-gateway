@@ -37,6 +37,8 @@ export interface CallContext {
   client?: { name: string; version: string };
   /** The session, as something a backend can send a reverse request to. */
   caller?: ReverseTarget;
+  /** Aborted when the client cancels; carried through to the backend (SPEC 4.3). */
+  signal?: AbortSignal;
 }
 
 /** SPEC §3.3: under `on_drift: warn` a changed tool is still listed, but flagged. */
@@ -252,13 +254,14 @@ export class Pipeline {
 
       let raw: CallToolResult;
       try {
-        raw = await backend.callTool(entry.tool, args, ctx.caller);
+        raw = await backend.callTool(entry.tool, args, ctx.caller, ctx.signal);
       } catch (e) {
         const error = e as Error & { code?: number };
         this.audit.write({
           ...line,
           decision: "allow",
           status: error.code === ERR.TIMEOUT ? "timeout" : "error",
+          cancelled: ctx.signal?.aborted === true ? true : undefined,
           dur_ms: Date.now() - started,
           error: { code: error.code ?? -32603, message: this.guard.redactText(error.message) },
         });
@@ -288,7 +291,7 @@ export class Pipeline {
   async readResource(ctx: CallContext, uri: string): Promise<ReadResourceResult> {
     const target = this.#resource(ctx, uri);
     return this.#audited({ ...this.#line(ctx, "resources/read"), server: target.server, tool: uri }, () =>
-      target.backend.readResource(target.original),
+      target.backend.readResource(target.original, ctx.signal),
     );
   }
 
@@ -319,7 +322,7 @@ export class Pipeline {
 
     const backend = this.pool.backends.get(entry.server)!;
     return this.#audited({ ...line, server: entry.server, tool: entry.name }, () =>
-      backend.getPrompt(entry.name, args),
+      backend.getPrompt(entry.name, args, ctx.signal),
     );
   }
 
@@ -378,13 +381,16 @@ export class Pipeline {
       }
       const backend = this.pool.backends.get(entry.server)!;
       return this.#audited({ ...line, server: entry.server, tool: entry.name }, () =>
-        backend.complete({ ...params, ref: { type: "ref/prompt", name: entry.name } }),
+        backend.complete({ ...params, ref: { type: "ref/prompt", name: entry.name } }, ctx.signal),
       );
     }
 
     const target = this.#resource(ctx, params.ref.uri);
     return this.#audited({ ...line, server: target.server, tool: params.ref.uri }, () =>
-      target.backend.complete({ ...params, ref: { type: "ref/resource", uri: target.original } }),
+      target.backend.complete(
+        { ...params, ref: { type: "ref/resource", uri: target.original } },
+        ctx.signal,
+      ),
     );
   }
 

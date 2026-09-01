@@ -11,6 +11,7 @@ import {
   ElicitRequestSchema,
   ErrorCode,
   ListRootsRequestSchema,
+  LoggingMessageNotificationSchema,
   McpError,
   PromptListChangedNotificationSchema,
   ResourceListChangedNotificationSchema,
@@ -20,6 +21,7 @@ import {
 import type {
   CallToolResult,
   CompleteRequest,
+  LoggingMessageNotification,
   CompleteResult,
   CreateMessageRequest,
   CreateMessageResult,
@@ -51,6 +53,8 @@ export interface ReverseTarget {
   createMessage(params: CreateMessageRequest["params"], options?: RequestOptions): Promise<unknown>;
   elicitInput(params: ElicitRequest["params"], options?: RequestOptions): Promise<unknown>;
   listRoots(params?: ListRootsRequest["params"], options?: RequestOptions): Promise<unknown>;
+  /** Backend log output, already filtered by the session's own level. */
+  log(params: LoggingMessageNotification["params"]): void;
 }
 
 function makeTransport(cfg: ServerConfig, authProvider?: OAuthClientProvider): Transport {
@@ -146,6 +150,13 @@ export class Backend {
     client.setNotificationHandler(ResourceUpdatedNotificationSchema, (notification) => {
       this.onResourceUpdated?.(this.name, notification.params.uri);
     });
+    client.setNotificationHandler(LoggingMessageNotificationSchema, (notification) => {
+      // A notification cannot be answered with an error, so an unroutable one is simply
+      // dropped rather than broadcast — the same rule as reverse requests, minus the -32006.
+      const target = this.#inflight.size === 1 ? [...this.#inflight][0] : undefined;
+      if (target) target.log({ ...notification.params, logger: notification.params.logger ?? this.name });
+      else this.onEvent?.("log_dropped", { server: this.name, level: notification.params.level });
+    });
 
     try {
       await client.connect(transport, { timeout: this.defaults.connect_timeout_ms });
@@ -215,8 +226,8 @@ export class Backend {
     }
   }
 
-  #opts() {
-    return { timeout: this.defaults.call_timeout_ms };
+  #opts(signal?: AbortSignal) {
+    return { timeout: this.defaults.call_timeout_ms, signal };
   }
 
   /** Walks nextCursor to the end and returns everything as one list. */
@@ -238,6 +249,7 @@ export class Backend {
     tool: string,
     args: Record<string, unknown> | undefined,
     caller?: ReverseTarget,
+    signal?: AbortSignal,
   ): Promise<CallToolResult> {
     const client = this.#client;
     if (!client || this.state !== "up") {
@@ -251,6 +263,8 @@ export class Backend {
     try {
       return (await client.callTool({ name: tool, arguments: args }, CallToolResultSchema, {
         timeout: this.defaults.call_timeout_ms,
+        // Aborting this makes the SDK send notifications/cancelled to the backend (SPEC 4.3).
+        signal,
       })) as CallToolResult;
     } catch (e) {
       throw this.#wrap(e, tool);
@@ -259,15 +273,19 @@ export class Backend {
     }
   }
 
-  async readResource(uri: string): Promise<ReadResourceResult> {
+  async readResource(uri: string, signal?: AbortSignal): Promise<ReadResourceResult> {
     return this.#request("resources/read", uri, (client) =>
-      client.readResource({ uri }, this.#opts()),
+      client.readResource({ uri }, this.#opts(signal)),
     );
   }
 
-  async getPrompt(name: string, args: Record<string, string> | undefined): Promise<GetPromptResult> {
+  async getPrompt(
+    name: string,
+    args: Record<string, string> | undefined,
+    signal?: AbortSignal,
+  ): Promise<GetPromptResult> {
     return this.#request("prompts/get", name, (client) =>
-      client.getPrompt({ name, arguments: args }, this.#opts()),
+      client.getPrompt({ name, arguments: args }, this.#opts(signal)),
     );
   }
 
@@ -283,9 +301,9 @@ export class Backend {
     );
   }
 
-  async complete(params: CompleteRequest["params"]): Promise<CompleteResult> {
+  async complete(params: CompleteRequest["params"], signal?: AbortSignal): Promise<CompleteResult> {
     return this.#request("completion/complete", params.ref.type, (client) =>
-      client.complete(params, this.#opts()),
+      client.complete(params, this.#opts(signal)),
     );
   }
 

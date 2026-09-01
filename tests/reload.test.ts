@@ -114,7 +114,7 @@ test("a profile added by a reload is reachable", async () => {
   const extra = new Client({ name: "extra", version: "0.0.0" });
   await extra.connect(new StreamableHTTPClientTransport(new URL(`${gateway.url}/mcp/extra`)));
   try {
-    assert.equal((await extra.listTools()).tools.length, 7);
+    assert.equal((await extra.listTools()).tools.length, 9);
   } finally {
     await extra.close();
   }

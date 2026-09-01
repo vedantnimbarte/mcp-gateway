@@ -4,6 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import {
   CallToolRequestSchema,
   CompleteRequestSchema,
+  SetLevelRequestSchema,
   GetPromptRequestSchema,
   ListPromptsRequestSchema,
   ListResourcesRequestSchema,
@@ -13,6 +14,8 @@ import {
   SubscribeRequestSchema,
   UnsubscribeRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import type { LoggingLevel, LoggingMessageNotification } from "@modelcontextprotocol/sdk/types.js";
+import type { ReverseTarget } from "./backend.js";
 import type { AuditLog } from "./audit.js";
 import { namespaceUri } from "./catalog.js";
 import { GATEWAY_INFO, type Config } from "./config.js";
@@ -20,6 +23,21 @@ import type { Pipeline } from "./pipeline.js";
 
 /** SPEC §10.1. */
 const IDLE_MS = 30 * 60 * 1000;
+
+/** Syslog order, least severe first: a level admits itself and everything after it. */
+const LEVELS: LoggingLevel[] = [
+  "debug",
+  "info",
+  "notice",
+  "warning",
+  "error",
+  "critical",
+  "alert",
+  "emergency",
+];
+
+/** Until a client says otherwise, debug is noise and everything else is worth forwarding. */
+const DEFAULT_LEVEL: LoggingLevel = "info";
 
 export interface Session {
   id: string;
@@ -47,32 +65,56 @@ function buildServer(pipeline: Pipeline, profile: string, sessionId: () => strin
         prompts: { listChanged: true },
         resources: { subscribe: true, listChanged: true },
         completions: {},
+        logging: {},
       },
     },
   );
 
-  // `server` is this session: what a reverse request from the backend routes back to.
-  const ctx = () => ({
+  // Per session, and deliberately not fanned out to the backends: their output is shared, so
+  // one client turning on debug would turn it on for everyone (SPEC 4.1).
+  let level: LoggingLevel = DEFAULT_LEVEL;
+
+  /**
+   * This session, as the thing a backend talks back to. Wrapping the server rather than passing
+   * it directly is what lets the level filter live next to the session that owns it.
+   */
+  const caller: ReverseTarget = {
+    createMessage: (params, options) => server.createMessage(params, options),
+    elicitInput: (params, options) => server.elicitInput(params, options),
+    listRoots: (params, options) => server.listRoots(params, options),
+    log: (params: LoggingMessageNotification["params"]) => {
+      if (LEVELS.indexOf(params.level) < LEVELS.indexOf(level)) return;
+      server.sendLoggingMessage(params).catch(() => {});
+    },
+  };
+
+  const ctx = (signal?: AbortSignal) => ({
     profile,
     session: sessionId(),
     client: server.getClientVersion(),
-    caller: server,
+    caller,
+    signal,
+  });
+
+  server.setRequestHandler(SetLevelRequestSchema, (request) => {
+    level = request.params.level;
+    return {};
   });
 
   server.setRequestHandler(ListToolsRequestSchema, () => ({
     tools: pipeline.visibleTools(profile),
   }));
 
-  server.setRequestHandler(CallToolRequestSchema, (request) =>
-    pipeline.callTool(ctx(), request.params.name, request.params.arguments),
+  server.setRequestHandler(CallToolRequestSchema, (request, extra) =>
+    pipeline.callTool(ctx(extra.signal), request.params.name, request.params.arguments),
   );
 
   server.setRequestHandler(ListPromptsRequestSchema, () => ({
     prompts: pipeline.visiblePrompts(profile),
   }));
 
-  server.setRequestHandler(GetPromptRequestSchema, (request) =>
-    pipeline.getPrompt(ctx(), request.params.name, request.params.arguments),
+  server.setRequestHandler(GetPromptRequestSchema, (request, extra) =>
+    pipeline.getPrompt(ctx(extra.signal), request.params.name, request.params.arguments),
   );
 
   server.setRequestHandler(ListResourcesRequestSchema, () => ({
@@ -83,8 +125,8 @@ function buildServer(pipeline: Pipeline, profile: string, sessionId: () => strin
     resourceTemplates: pipeline.visibleTemplates(profile),
   }));
 
-  server.setRequestHandler(ReadResourceRequestSchema, (request) =>
-    pipeline.readResource(ctx(), request.params.uri),
+  server.setRequestHandler(ReadResourceRequestSchema, (request, extra) =>
+    pipeline.readResource(ctx(extra.signal), request.params.uri),
   );
 
   server.setRequestHandler(SubscribeRequestSchema, async (request) => {
@@ -97,8 +139,8 @@ function buildServer(pipeline: Pipeline, profile: string, sessionId: () => strin
     return {};
   });
 
-  server.setRequestHandler(CompleteRequestSchema, (request) =>
-    pipeline.complete(ctx(), request.params),
+  server.setRequestHandler(CompleteRequestSchema, (request, extra) =>
+    pipeline.complete(ctx(extra.signal), request.params),
   );
 
   return server;

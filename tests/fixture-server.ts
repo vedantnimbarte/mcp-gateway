@@ -55,12 +55,40 @@ server.registerTool(
   },
 );
 
+// Aborts when the caller cancels, so a test can prove the cancellation actually arrived here
+// rather than stopping at the gateway.
+let cancellations = 0;
+
 server.registerTool(
   "sleep",
   { description: "Returns after a delay.", inputSchema: { ms: z.number() } },
-  async ({ ms }) => {
-    await new Promise((r) => setTimeout(r, Math.min(ms, 5000)));
+  async ({ ms }, extra) => {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, Math.min(ms, 5000));
+      extra.signal.addEventListener("abort", () => {
+        clearTimeout(timer);
+        cancellations++;
+        reject(new Error("cancelled"));
+      });
+    });
     return { content: [{ type: "text", text: `slept ${ms}ms` }] };
+  },
+);
+
+server.registerTool(
+  "cancellations",
+  { description: "How many calls were cancelled.", inputSchema: {} },
+  () => ({ content: [{ type: "text", text: String(cancellations) }] }),
+);
+
+server.registerTool(
+  "emit_logs",
+  { description: "Logs one message at each level.", inputSchema: {} },
+  async () => {
+    for (const level of ["debug", "info", "warning", "error"] as const) {
+      await server.server.sendLoggingMessage({ level, data: `${level} from the fixture` });
+    }
+    return { content: [{ type: "text", text: "logged" }] };
   },
 );
 
@@ -103,7 +131,10 @@ server.registerTool(
 );
 
 // The high-level McpServer does not implement subscribe, so wire it on the low-level server.
-server.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
+server.server.registerCapabilities({
+  resources: { subscribe: true, listChanged: true },
+  logging: {},
+});
 server.server.setRequestHandler(SubscribeRequestSchema, () => ({}));
 server.server.setRequestHandler(UnsubscribeRequestSchema, () => ({}));
 
