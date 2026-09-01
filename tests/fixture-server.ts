@@ -1,7 +1,8 @@
 // Test backend: a stdio MCP server the suite fully controls. `describe`'s description changes
 // when FIXTURE_DRIFT is set, which is how the Phase 4 drift block gets tested across a restart.
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 const server = new McpServer({ name: "fixture", version: "1.0.0" });
@@ -54,10 +55,87 @@ server.registerTool(
   },
 );
 
+// Aborts when the caller cancels, so a test can prove the cancellation actually arrived here
+// rather than stopping at the gateway.
+let cancellations = 0;
+
+server.registerTool(
+  "sleep",
+  { description: "Returns after a delay.", inputSchema: { ms: z.number() } },
+  async ({ ms }, extra) => {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, Math.min(ms, 5000));
+      extra.signal.addEventListener("abort", () => {
+        clearTimeout(timer);
+        cancellations++;
+        reject(new Error("cancelled"));
+      });
+    });
+    return { content: [{ type: "text", text: `slept ${ms}ms` }] };
+  },
+);
+
+server.registerTool(
+  "cancellations",
+  { description: "How many calls were cancelled.", inputSchema: {} },
+  () => ({ content: [{ type: "text", text: String(cancellations) }] }),
+);
+
+server.registerTool(
+  "emit_logs",
+  { description: "Logs one message at each level.", inputSchema: {} },
+  async () => {
+    for (const level of ["debug", "info", "warning", "error"] as const) {
+      await server.server.sendLoggingMessage({ level, data: `${level} from the fixture` });
+    }
+    return { content: [{ type: "text", text: "logged" }] };
+  },
+);
+
 server.registerTool(
   "crash",
   { description: "Exits the process, to test supervision.", inputSchema: {} },
   () => process.exit(1),
 );
+
+server.registerResource(
+  "note",
+  "fixture://note",
+  { description: "A fixed resource.", mimeType: "text/plain" },
+  (uri) => ({ contents: [{ uri: uri.href, text: "the note says hello" }] }),
+);
+
+server.registerResource(
+  "page",
+  new ResourceTemplate("fixture://page/{id}", { list: undefined }),
+  { description: "A templated resource.", mimeType: "text/plain" },
+  (uri, { id }) => ({ contents: [{ uri: uri.href, text: `page ${String(id)}` }] }),
+);
+
+server.registerPrompt(
+  "review",
+  { description: "Asks for a review.", argsSchema: { subject: z.string() } },
+  ({ subject }) => ({
+    messages: [{ role: "user", content: { type: "text", text: `Please review ${subject}.` } }],
+  }),
+);
+
+// Lets a test make the server announce that `fixture://note` changed.
+server.registerTool(
+  "touch_note",
+  { description: "Marks the note as updated.", inputSchema: {} },
+  async () => {
+    await server.server.sendResourceUpdated({ uri: "fixture://note" });
+    return { content: [{ type: "text", text: "touched" }] };
+  },
+);
+
+// The high-level McpServer does not implement subscribe, so wire it on the low-level server.
+server.server.registerCapabilities({
+  resources: { subscribe: true, listChanged: true },
+  logging: {},
+});
+server.server.setRequestHandler(SubscribeRequestSchema, () => ({}));
+server.server.setRequestHandler(UnsubscribeRequestSchema, () => ({}));
 
 await server.connect(new StdioServerTransport());

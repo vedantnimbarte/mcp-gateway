@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -11,8 +11,8 @@ import {
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { loadConfig } from "../src/config.js";
-import { Pool } from "../src/pool.js";
-import { startGateway, type Gateway } from "../src/server.js";
+import type { Pool } from "../src/pool.js";
+import { assemble, startGateway, type Gateway } from "../src/server.js";
 
 const fixture = fileURLToPath(new URL("./fixture-server.js", import.meta.url));
 const SERVERS = ["alpha", "bravo", "charlie", "delta"];
@@ -21,6 +21,8 @@ const configPath = join(mkdtempSync(join(tmpdir(), "mcpgw-")), "config.yaml");
 writeFileSync(
   configPath,
   `version: 1
+audit:
+  dir: ${JSON.stringify(join(dirname(configPath), "audit"))}
 servers:
 ${SERVERS.map(
   (name) => `  ${name}:
@@ -84,8 +86,9 @@ async function connect(profile: string, sink: string[]): Promise<Client> {
 
 before(async () => {
   const { config } = loadConfig(configPath);
-  pool = new Pool(config, (event, fields) => events.push({ event, fields }));
-  gateway = await startGateway(config, pool, { port: 0 });
+  const parts = assemble(config, configPath, (event, fields) => events.push({ event, fields }));
+  pool = parts.pool;
+  gateway = await startGateway(config, parts, { port: 0 });
   await pool.start();
   wide = await connect("all", wideNotifications);
   narrow = await connect("onlyAlpha", narrowNotifications);
@@ -106,7 +109,7 @@ test("one process per configured backend, however many clients are connected", (
 test("a profile sees only its own servers", async () => {
   const { tools } = await narrow.listTools();
   assert.deepEqual([...new Set(tools.map((t) => t.name.split("__")[0]))], ["alpha"]);
-  assert.equal((await wide.listTools()).tools.length, SERVERS.length * 5);
+  assert.equal((await wide.listTools()).tools.length, SERVERS.length * 9);
 });
 
 test("a crashed backend fails its call, vanishes, and comes back", async () => {
@@ -141,7 +144,7 @@ test("a crashed backend fails its call, vanishes, and comes back", async () => {
   await until("the wide session to be told again", () => wideNotifications.length > 1);
 
   const after = await wide.listTools();
-  assert.equal(after.tools.filter((t) => t.name.startsWith("charlie__")).length, 5);
+  assert.equal(after.tools.filter((t) => t.name.startsWith("charlie__")).length, 9);
   assert.equal(alive(doomed), false, "the crashed child must not linger");
   assert.notEqual(charlie.pid, doomed);
   assert.equal(charlie.restarts, 1);

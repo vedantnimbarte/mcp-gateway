@@ -4,7 +4,10 @@
   "private": true,
   "type": "module",
   "description": "Local MCP aggregation daemon: one connection per backend, curated tool profiles, audit trail.",
-  "bin": { "mcpgw": "dist/src/cli.js" },
+  "bin": {
+    "mcpgw": "dist/src/cli.js",
+    "mcpgw-bridge": "dist/src/bridge.js"
+  },
   "engines": { "node": ">=20.11" },
   "scripts": {
     "build": "tsc",

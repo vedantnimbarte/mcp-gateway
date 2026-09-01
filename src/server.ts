@@ -2,8 +2,12 @@ import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { isLoopback, type Config } from "./config.js";
-import type { Pool } from "./pool.js";
+import { AuditLog } from "./audit.js";
+import { ConfigError, isLoopback, loadConfig, type Config } from "./config.js";
+import { Guard } from "./guard.js";
+import { BackendAuth, TokenStore } from "./oauth.js";
+import { Pipeline } from "./pipeline.js";
+import { Pool } from "./pool.js";
 import { SessionManager } from "./session.js";
 
 /** SPEC §10.1. */
@@ -13,7 +17,46 @@ export interface Gateway {
   port: number;
   url: string;
   sessions: SessionManager;
-  close(): Promise<void>;
+  /** SIGHUP. Restarts only the backends whose definition changed. */
+  reload(config: Config): Promise<void>;
+  /** SIGTERM. Stops accepting work, waits up to `drainMs` for in-flight calls, then closes. */
+  close(drainMs?: number): Promise<void>;
+}
+
+/** The daemon's object graph. One place, so the CLI and the tests wire it identically. */
+export interface Parts {
+  guard: Guard;
+  audit: AuditLog;
+  pool: Pool;
+  pipeline: Pipeline;
+  tokens: TokenStore;
+}
+
+export function assemble(
+  config: Config,
+  configPath: string,
+  log: (event: string, fields: Record<string, unknown>) => void = () => {},
+): Parts {
+  const guard = Guard.load(config, configPath);
+  const audit = new AuditLog(config.audit, guard);
+  // backend_up / backend_down / drift / pinned are audited as well as logged (SPEC §7).
+  const record = (event: string, fields: Record<string, unknown>) => {
+    log(event, fields);
+    audit.write({ method: event, ...fields });
+  };
+  const tokens = new TokenStore(TokenStore.pathFor(configPath));
+  const authFor = (server: string) => {
+    const cfg = config.servers[server];
+    if (!cfg || cfg.transport === "stdio" || cfg.auth !== "oauth") return undefined;
+    return new BackendAuth(server, tokens, {
+      scope: cfg.scope,
+      clientId: cfg.client_id,
+      clientSecret: cfg.client_secret,
+    });
+  };
+
+  const pool = new Pool(config, record, guard, authFor);
+  return { guard, audit, pool, tokens, pipeline: new Pipeline(config, pool, guard, audit) };
 }
 
 function send(res: ServerResponse, status: number, body: unknown): void {
@@ -57,9 +100,10 @@ function originOk(origin: string | undefined): boolean {
 
 export async function startGateway(
   config: Config,
-  pool: Pool,
-  opts: { port?: number } = {},
+  parts: Parts,
+  opts: { port?: number; configPath?: string } = {},
 ): Promise<Gateway> {
+  const { pool, pipeline, audit } = parts;
   const { host, token } = config.listen;
 
   // NFR-2. Config validation already refuses this, but the interlock belongs at bind time too:
@@ -68,8 +112,9 @@ export async function startGateway(
     throw new Error(`refusing to bind ${host} without listen.token (NFR-2)`);
   }
 
-  const sessions = new SessionManager(config, pool);
+  const sessions = new SessionManager(config, pipeline, audit);
   pool.onCatalogChange = () => sessions.notifyCatalogChanged();
+  pool.onResourceUpdated = (server, uri) => sessions.notifyResourceUpdated(server, uri);
 
   const http = createServer((req, res) => {
     handle(req, res).catch((e: Error) => {
@@ -82,8 +127,33 @@ export async function startGateway(
     const path = new URL(req.url ?? "/", "http://localhost").pathname;
 
     if (path === "/healthz") {
-      const state = Object.fromEntries([...pool.backends].map(([n, b]) => [n, b.state]));
-      send(res, 200, { status: "ok", sessions: sessions.size, backends: state });
+      send(res, 200, health());
+      return;
+    }
+
+    // Windows has no SIGHUP to deliver, so the reload has a door on the loopback listener too.
+    // It reads config.yaml from disk; nothing in the request is trusted but the fact of it.
+    if (path === "/reload") {
+      if (req.method !== "POST") {
+        send(res, 405, { error: "POST only" });
+        return;
+      }
+      if (token && !tokenOk(token, req.headers.authorization)) {
+        send(res, 401, { error: "unauthorized" });
+        return;
+      }
+      if (!opts.configPath) {
+        send(res, 404, { error: "this gateway was not started from a config file" });
+        return;
+      }
+      try {
+        const { config: next } = loadConfig(opts.configPath);
+        await gateway.reload(next);
+        send(res, 200, { status: "reloaded", config: opts.configPath });
+      } catch (e) {
+        const problems = e instanceof ConfigError ? e.problems : [(e as Error).message];
+        send(res, 400, { status: "unchanged", problems });
+      }
       return;
     }
 
@@ -147,16 +217,54 @@ export async function startGateway(
   });
 
   const port = (http.address() as AddressInfo).port;
-  return {
+
+  /** What `/healthz` and `mcpgw status` both report (SPEC §10.1, §11). */
+  function health() {
+    return {
+      status: "ok",
+      uptime_s: Math.round(process.uptime()),
+      sessions: sessions.size,
+      pending_drift: parts.guard.pending().length,
+      backends: Object.fromEntries(
+        [...pool.backends].map(([name, b]) => [
+          name,
+          { state: b.state, tools: b.tools.length, restarts: b.restarts, pid: b.pid, error: b.lastError },
+        ]),
+      ),
+    };
+  }
+
+  const gateway: Gateway = {
     port,
     url: `http://${host}:${port}`,
     sessions,
-    close: () => closeAll(http, sessions, pool),
+    async reload(next: Config) {
+      parts.guard.reload(next);
+      parts.pipeline.reload(next);
+      sessions.reload(next);
+      await pool.reload(next);
+      sessions.notifyCatalogChanged();
+    },
+    close: (drainMs = 0) => closeAll(http, sessions, parts, drainMs),
   };
+  return gateway;
 }
 
-async function closeAll(http: HttpServer, sessions: SessionManager, pool: Pool): Promise<void> {
+async function closeAll(
+  http: HttpServer,
+  sessions: SessionManager,
+  parts: Parts,
+  drainMs: number,
+): Promise<void> {
+  // Stop taking new connections first, then let what is already running finish (SPEC §11).
+  http.close();
+  const deadline = Date.now() + drainMs;
+  while (parts.pipeline.inflight > 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+
   await sessions.closeAll();
-  await pool.close();
+  await parts.pool.close();
   await new Promise<void>((done) => http.close(() => done()));
+  await parts.audit.close();
 }

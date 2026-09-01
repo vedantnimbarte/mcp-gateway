@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/node-%E2%89%A524-5FA04E" alt="Node 24+">
+  <img src="https://img.shields.io/badge/node-%E2%89%A520-5FA04E" alt="Node 20+">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
   <img src="https://img.shields.io/badge/status-in%20development-orange" alt="In development">
 </p>
@@ -43,14 +43,19 @@ connect to `http://127.0.0.1:8420/mcp/<profile>` instead of spawning anything.
 
 ## Requirements
 
-Node 24 or newer. Nothing else — no database, no Redis, no external services. Three runtime
-dependencies total.
+Node 20.11 or newer. Nothing else — no database, no Redis, no external services. Three runtime
+dependencies: the MCP SDK, `yaml`, and `zod`.
 
 ## Install
 
+Not published to npm. Build it from the repository:
+
 ```bash
-npm install -g mcpgw
+npm install && npm run build
 ```
+
+That produces `dist/src/cli.js` (`mcpgw`) and `dist/src/bridge.js` (`mcpgw-bridge`). Link them
+onto your `PATH` with `npm link` if you want the bare command names.
 
 ## Configure
 
@@ -108,27 +113,48 @@ mcpgw start
 
 ## Connect your clients
 
-Clients that support remote MCP servers point straight at a profile URL:
+Give each client the profile that fits it — `coding` for your editor, `readonly` for anything
+you trust less. Every entry below *replaces* that client's direct server entries; nothing but
+the gateway should be spawning backends any more.
+
+**Claude Code** (`~/.claude.json`) speaks HTTP, so it points straight at a profile:
 
 ```json
-{ "mcpServers": { "gateway": { "url": "http://127.0.0.1:8420/mcp/coding" } } }
+{ "mcpServers": { "gateway": { "type": "http", "url": "http://127.0.0.1:8420/mcp/coding" } } }
 ```
 
-Clients that only speak stdio use the bridge, a thin shim that spawns nothing of its own:
+**Claude Desktop** (`%APPDATA%/Claude/claude_desktop_config.json`, or
+`~/Library/Application Support/Claude/` on macOS) speaks only stdio, so it launches the bridge —
+a shim that pipes stdin/stdout to the daemon and spawns no backends of its own:
 
 ```json
 {
   "mcpServers": {
     "gateway": {
-      "command": "npx",
-      "args": ["-y", "mcpgw-bridge", "--url", "http://127.0.0.1:8420/mcp/coding"]
+      "command": "node",
+      "args": ["/abs/path/to/mcp-gateway/dist/src/bridge.js",
+               "--url", "http://127.0.0.1:8420/mcp/readonly"]
     }
   }
 }
 ```
 
-Give each client the profile that fits it — `coding` for your editor, `readonly` for anything
-you trust less.
+**Cursor** (`~/.cursor/mcp.json`) uses the same bridge, usually on a different profile:
+
+```json
+{
+  "mcpServers": {
+    "gateway": {
+      "command": "node",
+      "args": ["/abs/path/to/mcp-gateway/dist/src/bridge.js",
+               "--url", "http://127.0.0.1:8420/mcp/coding"]
+    }
+  }
+}
+```
+
+If the daemon is not running, the bridge exits immediately with a readable message instead of
+hanging on the first tool call.
 
 ## CLI
 
@@ -138,13 +164,63 @@ you trust less.
 | `mcpgw validate` | Check the config without starting; exits non-zero on any error |
 | `mcpgw status` | Backend health, uptime, restart counts, active sessions, pending drift |
 | `mcpgw list --profile coding` | Every tool the profile exposes, plus the rule behind each decision |
-| `mcpgw pin` | Review and accept changed tool descriptions |
+| `mcpgw pin` | Show changed tool descriptions as diffs; `--yes` accepts them |
+| `mcpgw auth <server>` | Authorize an `auth: oauth` backend in a browser, once |
+| `mcpgw reload` | Re-read the config in the running daemon (what SIGHUP does) |
 | `mcpgw tail --denied-only` | Stream the audit log |
 
 `mcpgw list` is the one to reach for when a tool isn't showing up — it prints the decision and
 the exact rule that produced it.
 
-`SIGHUP` reloads the config, restarting only the servers whose definitions actually changed.
+`SIGHUP` reloads the config, restarting only the servers whose definitions actually changed —
+live sessions keep working, and a new allow list applies to them without a reconnect. A bad edit
+is rejected and the previous config keeps serving. `SIGTERM`/`SIGINT` stop accepting new work,
+give in-flight calls up to 5 seconds to finish, then shut the backends down.
+
+## Remote servers that need OAuth
+
+A remote MCP server that answers `401` with a `WWW-Authenticate` header wants an OAuth token,
+not a static header. Mark it and authorize it once:
+
+```yaml
+servers:
+  figma:
+    transport: http
+    url: https://mcp.figma.com/mcp
+    auth: oauth
+    scope: "mcp:connect"
+```
+
+```bash
+mcpgw auth figma
+```
+
+That opens a browser, completes the authorization-code flow with PKCE, and writes the tokens to
+`tools.lock.json`'s neighbour `tokens.json` (mode 0600, gitignored). From then on the daemon
+connects on its own and refreshes the access token silently; you only run `mcpgw auth` again if
+the refresh token is revoked.
+
+The daemon never opens a browser by itself. A backend that needs authorizing stays DOWN with
+`needs authorization: run mcpgw auth <server>` and does **not** retry — retrying an expired
+authorization only burns backoff until a human acts.
+
+**Servers that refuse dynamic registration.** Many commercial servers advertise a registration
+endpoint and then reject it, because they expect an OAuth app you created by hand. Figma is one.
+Create the app with redirect URI `http://127.0.0.1:8419/callback`, then:
+
+```yaml
+servers:
+  figma:
+    transport: http
+    url: https://mcp.figma.com/mcp
+    auth: oauth
+    scope: "mcp:connect"
+    client_id: ${FIGMA_CLIENT_ID}
+    client_secret: ${FIGMA_CLIENT_SECRET}
+```
+
+The credentials come from the environment like every other secret. With `client_id` set, no
+registration is attempted at all.
 
 ## Policy
 
@@ -155,6 +231,40 @@ listing and calling — a tool the model never saw is still refused if it guesse
 Tools are namespaced `<server>__<tool>` so two servers can both have a `search` without
 colliding. Globs always match the canonical name, never the alias, so renaming can never be
 used to slip past a deny rule.
+
+## Resources and prompts
+
+Both are proxied alongside tools, namespaced the same way. Prompts become `<server>__<name>`;
+resources get a scheme, `mcpgw://<server>/<original-uri>`, so the backend's own URI survives
+whole and comes back intact on the way down.
+
+`resources/subscribe` is reference-counted: however many sessions watch the same resource, the
+backend is subscribed once, and `notifications/resources/updated` is delivered only to the
+sessions that asked — closing a session releases whatever it was the last one holding.
+
+The two are filtered differently, and the difference is deliberate:
+
+| | Filtered by |
+|---|---|
+| Tools, prompts | The full policy: server membership, then deny globs, then the allow list |
+| Resources, templates | Server membership only |
+
+Globs are written against names, and a resource is addressed by URI — matching `github__get_*`
+against `mcpgw://github/file:///x` would be guesswork. So a profile that can reach a server can
+read its resources. If that is too broad for a server you are exposing, keep it out of that
+profile's `servers` list rather than trying to express it as a glob.
+
+## Cancellation and logging
+
+A client that cancels a call cancels it all the way down: the abort is carried into the backend
+request, so the backend stops working rather than finishing into a discarded result. Other
+sessions sharing that backend are unaffected.
+
+`logging/setLevel` is recorded per session and never pushed down to the backends — they are
+shared, so one client asking for `debug` would turn it on for everyone. A backend's log messages
+are routed to the session whose call they arrived during and filtered by that session's own
+level (default `info`). A message that arrives with no call in flight is dropped rather than
+broadcast, for the same reason a reverse request in that state gets `-32006`.
 
 ## Audit log
 
@@ -184,6 +294,19 @@ rewrites a tool description after you approved it, the tool is blocked, the chan
 and a diff is printed. `mcpgw pin` is the only way to accept it.
 
 Commit `tools.lock.json`.
+
+## Known limits
+
+Deliberate, and each one is marked in the code:
+
+- **Reverse requests need an idle backend.** A backend asking the client to sample is routed to
+  the session whose call it arrived during. With two calls in flight on one backend, the second
+  gets `-32006` rather than a guess — guessing would leak one client's prompt to another.
+- **Rate limits are in memory.** Restarting the daemon resets them.
+- **Audit writes are best-effort.** A hard crash can lose the last few lines.
+- **`tools/list` pagination is collapsed** into a single page.
+- **OAuth is authorization-code only.** Client-credentials and device-code flows are not wired,
+  and the callback listens on a fixed `127.0.0.1:8419`.
 
 ## Security
 

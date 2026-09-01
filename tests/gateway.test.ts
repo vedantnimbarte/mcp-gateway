@@ -1,15 +1,14 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { loadConfig } from "../src/config.js";
-import { Pool } from "../src/pool.js";
-import { startGateway, type Gateway } from "../src/server.js";
+import { assemble, startGateway, type Gateway } from "../src/server.js";
 
 const fixture = fileURLToPath(new URL("./fixture-server.js", import.meta.url));
 
@@ -25,6 +24,8 @@ const configPath = join(mkdtempSync(join(tmpdir(), "mcpgw-")), "config.yaml");
 writeFileSync(
   configPath,
   `version: 1
+audit:
+  dir: ${JSON.stringify(join(dirname(configPath), "audit"))}
 servers:
   fixture:
     transport: stdio
@@ -43,8 +44,9 @@ let toolsBeforeBackendsWereUp = -1;
 
 before(async () => {
   const { config } = loadConfig(configPath);
-  const pool = new Pool(config);
-  gateway = await startGateway(config, pool, { port: 0 });
+  const parts = assemble(config, configPath);
+  gateway = await startGateway(config, parts, { port: 0 });
+  const pool = parts.pool;
 
   // Connect a client while the backends are still cold: the port must already serve (NFR-6).
   client = new Client({ name: "gateway-test", version: "0.0.0" });
@@ -72,7 +74,17 @@ test("lists the backend's tools, namespaced", async () => {
   const { tools } = await client.listTools();
   assert.deepEqual(
     tools.map((t) => t.name).sort(),
-    ["fixture__ask", "fixture__ask_later", "fixture__crash", "fixture__describe", "fixture__echo"],
+    [
+      "fixture__ask",
+      "fixture__ask_later",
+      "fixture__cancellations",
+      "fixture__crash",
+      "fixture__describe",
+      "fixture__echo",
+      "fixture__emit_logs",
+      "fixture__sleep",
+      "fixture__touch_note",
+    ],
   );
   assert.equal(tools.find((t) => t.name === "fixture__echo")?.description, "Echoes the message back.");
 });
@@ -128,9 +140,18 @@ test("a cross-origin browser tab is refused", async () => {
   assert.equal(res.status, 403);
 });
 
-test("healthz reports backend state", async () => {
+test("healthz reports what `mcpgw status` needs", async () => {
   const health = (await (await fetch(`${gateway.url}/healthz`)).json()) as {
-    backends: Record<string, string>;
+    status: string;
+    sessions: number;
+    pending_drift: number;
+    backends: Record<string, { state: string; tools: number; restarts: number; pid: number }>;
   };
-  assert.deepEqual(health.backends, { fixture: "up" });
+  assert.equal(health.status, "ok");
+  assert.equal(health.pending_drift, 0);
+  assert.ok(health.sessions >= 1);
+  assert.equal(health.backends.fixture?.state, "up");
+  assert.equal(health.backends.fixture?.tools, 9);
+  assert.equal(health.backends.fixture?.restarts, 0);
+  assert.ok(typeof health.backends.fixture?.pid === "number");
 });

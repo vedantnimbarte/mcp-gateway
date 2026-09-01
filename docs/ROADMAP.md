@@ -117,7 +117,7 @@ and silently useless.
 
 **Resources and prompts can slip.** Tools are 95% of the value. If Phase 2 runs long, ship
 tools-only and add `resources`/`prompts` after cutover — the catalog abstraction already
-accommodates them.
+accommodates them. *(Done after cutover, as planned: the catalog took them without a rewrite.)*
 
 ## Deferred, with triggers
 
@@ -129,7 +129,8 @@ accommodates them.
 | Content scanning for injected instructions | Description pinning proves insufficient in practice |
 | Response cache for idempotent tools | Latency becomes annoying enough to measure |
 | Per-server concurrency limits | One backend starts starving the others |
-| Config hot-reload without SIGHUP | Restarting becomes a genuine irritation |
+| Config hot-reload without SIGHUP | Restarting becomes a genuine irritation — *done in Phase 5: Windows has no SIGHUP, so `POST /reload` and `mcpgw reload` exist* |
+| ~~OAuth for `http`/`sse` backends~~ | *Done: `auth: oauth`, `mcpgw auth <server>`, refresh on expiry, and pre-registered clients for servers like Figma that refuse dynamic registration* |
 
 ## Known ceilings accepted in v1
 
