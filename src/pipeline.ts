@@ -38,18 +38,37 @@ const WARN_PREFIX = "⚠ [unverified change] ";
  * in a `finally` so a throwing backend cannot leak a slot.
  */
 export class Pipeline {
-  readonly #limiters: Map<string, Limiter>;
-  /** alias → canonical, per profile. Renames are static, so this is built once. */
-  readonly #aliases = new Map<string, Map<string, string>>();
+  #limiters: Map<string, Limiter>;
+  /** alias → canonical, per profile. Renames are static between reloads, so this is built once. */
+  #aliases = new Map<string, Map<string, string>>();
 
   constructor(
-    private readonly config: Config,
+    private config: Config,
     private readonly pool: Pool,
     private readonly guard: Guard,
     private readonly audit: AuditLog,
-    now?: () => number,
+    private readonly now?: () => number,
   ) {
     this.#limiters = limitersFor(config, now);
+    for (const [name, profile] of Object.entries(config.profiles)) {
+      const byAlias = new Map<string, string>();
+      for (const [canonical, alias] of Object.entries(profile.rename)) byAlias.set(alias, canonical);
+      this.#aliases.set(name, byAlias);
+    }
+  }
+
+  /** Calls currently dispatched to a backend, across every profile — what a drain waits for. */
+  get inflight(): number {
+    let total = 0;
+    for (const limiter of this.#limiters.values()) total += limiter.inflight;
+    return total;
+  }
+
+  /** SIGHUP: new profiles, globs, renames and limits take effect on the next call. */
+  reload(config: Config): void {
+    this.config = config;
+    this.#limiters = limitersFor(config, this.now);
+    this.#aliases = new Map();
     for (const [name, profile] of Object.entries(config.profiles)) {
       const byAlias = new Map<string, string>();
       for (const [canonical, alias] of Object.entries(profile.rename)) byAlias.set(alias, canonical);

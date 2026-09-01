@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/node-%E2%89%A524-5FA04E" alt="Node 24+">
+  <img src="https://img.shields.io/badge/node-%E2%89%A520-5FA04E" alt="Node 20+">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
   <img src="https://img.shields.io/badge/status-in%20development-orange" alt="In development">
 </p>
@@ -43,14 +43,19 @@ connect to `http://127.0.0.1:8420/mcp/<profile>` instead of spawning anything.
 
 ## Requirements
 
-Node 24 or newer. Nothing else — no database, no Redis, no external services. Three runtime
-dependencies total.
+Node 20.11 or newer. Nothing else — no database, no Redis, no external services. Three runtime
+dependencies: the MCP SDK, `yaml`, and `zod`.
 
 ## Install
 
+Not published to npm. Build it from the repository:
+
 ```bash
-npm install -g mcpgw
+npm install && npm run build
 ```
+
+That produces `dist/src/cli.js` (`mcpgw`) and `dist/src/bridge.js` (`mcpgw-bridge`). Link them
+onto your `PATH` with `npm link` if you want the bare command names.
 
 ## Configure
 
@@ -108,27 +113,48 @@ mcpgw start
 
 ## Connect your clients
 
-Clients that support remote MCP servers point straight at a profile URL:
+Give each client the profile that fits it — `coding` for your editor, `readonly` for anything
+you trust less. Every entry below *replaces* that client's direct server entries; nothing but
+the gateway should be spawning backends any more.
+
+**Claude Code** (`~/.claude.json`) speaks HTTP, so it points straight at a profile:
 
 ```json
-{ "mcpServers": { "gateway": { "url": "http://127.0.0.1:8420/mcp/coding" } } }
+{ "mcpServers": { "gateway": { "type": "http", "url": "http://127.0.0.1:8420/mcp/coding" } } }
 ```
 
-Clients that only speak stdio use the bridge, a thin shim that spawns nothing of its own:
+**Claude Desktop** (`%APPDATA%/Claude/claude_desktop_config.json`, or
+`~/Library/Application Support/Claude/` on macOS) speaks only stdio, so it launches the bridge —
+a shim that pipes stdin/stdout to the daemon and spawns no backends of its own:
 
 ```json
 {
   "mcpServers": {
     "gateway": {
-      "command": "npx",
-      "args": ["-y", "mcpgw-bridge", "--url", "http://127.0.0.1:8420/mcp/coding"]
+      "command": "node",
+      "args": ["/abs/path/to/mcp-gateway/dist/src/bridge.js",
+               "--url", "http://127.0.0.1:8420/mcp/readonly"]
     }
   }
 }
 ```
 
-Give each client the profile that fits it — `coding` for your editor, `readonly` for anything
-you trust less.
+**Cursor** (`~/.cursor/mcp.json`) uses the same bridge, usually on a different profile:
+
+```json
+{
+  "mcpServers": {
+    "gateway": {
+      "command": "node",
+      "args": ["/abs/path/to/mcp-gateway/dist/src/bridge.js",
+               "--url", "http://127.0.0.1:8420/mcp/coding"]
+    }
+  }
+}
+```
+
+If the daemon is not running, the bridge exits immediately with a readable message instead of
+hanging on the first tool call.
 
 ## CLI
 
@@ -138,13 +164,16 @@ you trust less.
 | `mcpgw validate` | Check the config without starting; exits non-zero on any error |
 | `mcpgw status` | Backend health, uptime, restart counts, active sessions, pending drift |
 | `mcpgw list --profile coding` | Every tool the profile exposes, plus the rule behind each decision |
-| `mcpgw pin` | Review and accept changed tool descriptions |
+| `mcpgw pin` | Show changed tool descriptions as diffs; `--yes` accepts them |
 | `mcpgw tail --denied-only` | Stream the audit log |
 
 `mcpgw list` is the one to reach for when a tool isn't showing up — it prints the decision and
 the exact rule that produced it.
 
-`SIGHUP` reloads the config, restarting only the servers whose definitions actually changed.
+`SIGHUP` reloads the config, restarting only the servers whose definitions actually changed —
+live sessions keep working, and a new allow list applies to them without a reconnect. A bad edit
+is rejected and the previous config keeps serving. `SIGTERM`/`SIGINT` stop accepting new work,
+give in-flight calls up to 5 seconds to finish, then shut the backends down.
 
 ## Policy
 
@@ -184,6 +213,18 @@ rewrites a tool description after you approved it, the tool is blocked, the chan
 and a diff is printed. `mcpgw pin` is the only way to accept it.
 
 Commit `tools.lock.json`.
+
+## Known limits
+
+Deliberate, and each one is marked in the code:
+
+- **Reverse requests need an idle backend.** A backend asking the client to sample is routed to
+  the session whose call it arrived during. With two calls in flight on one backend, the second
+  gets `-32006` rather than a guess — guessing would leak one client's prompt to another.
+- **Rate limits are in memory.** Restarting the daemon resets them.
+- **Audit writes are best-effort.** A hard crash can lose the last few lines.
+- **`tools/list` pagination is collapsed** into a single page.
+- **Resources and prompts are not proxied yet.** Tools only.
 
 ## Security
 

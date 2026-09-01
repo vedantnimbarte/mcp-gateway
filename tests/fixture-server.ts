@@ -55,6 +55,15 @@ server.registerTool(
 );
 
 server.registerTool(
+  "sleep",
+  { description: "Returns after a delay.", inputSchema: { ms: z.number() } },
+  async ({ ms }) => {
+    await new Promise((r) => setTimeout(r, Math.min(ms, 5000)));
+    return { content: [{ type: "text", text: `slept ${ms}ms` }] };
+  },
+);
+
+server.registerTool(
   "crash",
   { description: "Exits the process, to test supervision.", inputSchema: {} },
   () => process.exit(1),

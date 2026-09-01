@@ -74,7 +74,14 @@ test("lists the backend's tools, namespaced", async () => {
   const { tools } = await client.listTools();
   assert.deepEqual(
     tools.map((t) => t.name).sort(),
-    ["fixture__ask", "fixture__ask_later", "fixture__crash", "fixture__describe", "fixture__echo"],
+    [
+      "fixture__ask",
+      "fixture__ask_later",
+      "fixture__crash",
+      "fixture__describe",
+      "fixture__echo",
+      "fixture__sleep",
+    ],
   );
   assert.equal(tools.find((t) => t.name === "fixture__echo")?.description, "Echoes the message back.");
 });
@@ -130,9 +137,18 @@ test("a cross-origin browser tab is refused", async () => {
   assert.equal(res.status, 403);
 });
 
-test("healthz reports backend state", async () => {
+test("healthz reports what `mcpgw status` needs", async () => {
   const health = (await (await fetch(`${gateway.url}/healthz`)).json()) as {
-    backends: Record<string, string>;
+    status: string;
+    sessions: number;
+    pending_drift: number;
+    backends: Record<string, { state: string; tools: number; restarts: number; pid: number }>;
   };
-  assert.deepEqual(health.backends, { fixture: "up" });
+  assert.equal(health.status, "ok");
+  assert.equal(health.pending_drift, 0);
+  assert.ok(health.sessions >= 1);
+  assert.equal(health.backends.fixture?.state, "up");
+  assert.equal(health.backends.fixture?.tools, 6);
+  assert.equal(health.backends.fixture?.restarts, 0);
+  assert.ok(typeof health.backends.fixture?.pid === "number");
 });

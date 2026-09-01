@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type Server as HttpServer, type Ser
 import type { AddressInfo } from "node:net";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { AuditLog } from "./audit.js";
-import { isLoopback, type Config } from "./config.js";
+import { ConfigError, isLoopback, loadConfig, type Config } from "./config.js";
 import { Guard } from "./guard.js";
 import { Pipeline } from "./pipeline.js";
 import { Pool } from "./pool.js";
@@ -16,7 +16,10 @@ export interface Gateway {
   port: number;
   url: string;
   sessions: SessionManager;
-  close(): Promise<void>;
+  /** SIGHUP. Restarts only the backends whose definition changed. */
+  reload(config: Config): Promise<void>;
+  /** SIGTERM. Stops accepting work, waits up to `drainMs` for in-flight calls, then closes. */
+  close(drainMs?: number): Promise<void>;
 }
 
 /** The daemon's object graph. One place, so the CLI and the tests wire it identically. */
@@ -85,7 +88,7 @@ function originOk(origin: string | undefined): boolean {
 export async function startGateway(
   config: Config,
   parts: Parts,
-  opts: { port?: number } = {},
+  opts: { port?: number; configPath?: string } = {},
 ): Promise<Gateway> {
   const { pool, pipeline, audit } = parts;
   const { host, token } = config.listen;
@@ -110,8 +113,33 @@ export async function startGateway(
     const path = new URL(req.url ?? "/", "http://localhost").pathname;
 
     if (path === "/healthz") {
-      const state = Object.fromEntries([...pool.backends].map(([n, b]) => [n, b.state]));
-      send(res, 200, { status: "ok", sessions: sessions.size, backends: state });
+      send(res, 200, health());
+      return;
+    }
+
+    // Windows has no SIGHUP to deliver, so the reload has a door on the loopback listener too.
+    // It reads config.yaml from disk; nothing in the request is trusted but the fact of it.
+    if (path === "/reload") {
+      if (req.method !== "POST") {
+        send(res, 405, { error: "POST only" });
+        return;
+      }
+      if (token && !tokenOk(token, req.headers.authorization)) {
+        send(res, 401, { error: "unauthorized" });
+        return;
+      }
+      if (!opts.configPath) {
+        send(res, 404, { error: "this gateway was not started from a config file" });
+        return;
+      }
+      try {
+        const { config: next } = loadConfig(opts.configPath);
+        await gateway.reload(next);
+        send(res, 200, { status: "reloaded", config: opts.configPath });
+      } catch (e) {
+        const problems = e instanceof ConfigError ? e.problems : [(e as Error).message];
+        send(res, 400, { status: "unchanged", problems });
+      }
       return;
     }
 
@@ -175,15 +203,52 @@ export async function startGateway(
   });
 
   const port = (http.address() as AddressInfo).port;
-  return {
+
+  /** What `/healthz` and `mcpgw status` both report (SPEC §10.1, §11). */
+  function health() {
+    return {
+      status: "ok",
+      uptime_s: Math.round(process.uptime()),
+      sessions: sessions.size,
+      pending_drift: parts.guard.pending().length,
+      backends: Object.fromEntries(
+        [...pool.backends].map(([name, b]) => [
+          name,
+          { state: b.state, tools: b.tools.length, restarts: b.restarts, pid: b.pid, error: b.lastError },
+        ]),
+      ),
+    };
+  }
+
+  const gateway: Gateway = {
     port,
     url: `http://${host}:${port}`,
     sessions,
-    close: () => closeAll(http, sessions, parts),
+    async reload(next: Config) {
+      parts.guard.reload(next);
+      parts.pipeline.reload(next);
+      sessions.reload(next);
+      await pool.reload(next);
+      sessions.notifyCatalogChanged();
+    },
+    close: (drainMs = 0) => closeAll(http, sessions, parts, drainMs),
   };
+  return gateway;
 }
 
-async function closeAll(http: HttpServer, sessions: SessionManager, parts: Parts): Promise<void> {
+async function closeAll(
+  http: HttpServer,
+  sessions: SessionManager,
+  parts: Parts,
+  drainMs: number,
+): Promise<void> {
+  // Stop taking new connections first, then let what is already running finish (SPEC §11).
+  http.close();
+  const deadline = Date.now() + drainMs;
+  while (parts.pipeline.inflight > 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+
   await sessions.closeAll();
   await parts.pool.close();
   await new Promise<void>((done) => http.close(() => done()));

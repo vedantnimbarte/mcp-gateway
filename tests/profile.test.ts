@@ -15,7 +15,7 @@ const backend = (name: string) => `  ${name}:
     command: ${JSON.stringify(process.execPath)}
     args: [${JSON.stringify(fixture)}]`;
 
-// Each fixture exposes: ask, ask_later, crash, describe, echo.
+// Each fixture exposes: ask, ask_later, crash, describe, echo, sleep.
 const configPath = join(mkdtempSync(join(tmpdir(), "mcpgw-")), "config.yaml");
 writeFileSync(
   configPath,
@@ -80,7 +80,7 @@ test("a curated profile lists a fraction of what the default one does", async ()
   const all = await names(await open("default"));
   const few = await names(await open("readonly"));
 
-  assert.equal(all.length, 10, "two fixtures, five tools each");
+  assert.equal(all.length, 12, "two fixtures, six tools each");
   assert.deepEqual(few, ["alpha__describe", "alpha__echo"]);
 });
 
@@ -101,7 +101,13 @@ test("a denied tool is refused when called by its exact canonical name", async (
 
 test("deny beats allow through the whole stack", async () => {
   const coding = await open("coding");
-  assert.deepEqual(await names(coding), ["about", "alpha__ask", "alpha__ask_later", "say"]);
+  assert.deepEqual(await names(coding), [
+    "about",
+    "alpha__ask",
+    "alpha__ask_later",
+    "alpha__sleep",
+    "say",
+  ]);
 
   await assert.rejects(
     coding.callTool({ name: "alpha__crash", arguments: {} }),

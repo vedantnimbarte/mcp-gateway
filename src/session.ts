@@ -53,7 +53,7 @@ export class SessionManager {
   readonly #sweeper: NodeJS.Timeout;
 
   constructor(
-    private readonly config: Config,
+    private config: Config,
     private readonly pipeline: Pipeline,
     private readonly audit: AuditLog,
   ) {
@@ -73,6 +73,11 @@ export class SessionManager {
 
   hasProfile(profile: string): boolean {
     return profile in this.config.profiles;
+  }
+
+  /** After a SIGHUP, live sessions keep their profile name; what it means may have changed. */
+  reload(config: Config): void {
+    this.config = config;
   }
 
   /**
