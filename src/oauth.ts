@@ -1,5 +1,5 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type {
@@ -41,11 +41,24 @@ interface StoreFile {
  */
 export class TokenStore {
   #file: StoreFile = { version: 1, servers: {} };
+  #mtime = 0;
 
   constructor(readonly path: string) {
+    this.#load();
+  }
+
+  /**
+   * Re-reads when the file has changed underneath us. `mcpgw auth` is a separate process, so
+   * without this the daemon would hold the empty store it started with, and a backend that was
+   * just authorized could never come up without a full daemon restart.
+   */
+  #load(): void {
     try {
-      const parsed = JSON.parse(readFileSync(path, "utf8")) as StoreFile;
+      const mtime = statSync(this.path).mtimeMs;
+      if (mtime === this.#mtime) return;
+      const parsed = JSON.parse(readFileSync(this.path, "utf8")) as StoreFile;
       if (parsed.version === 1 && parsed.servers) this.#file = parsed;
+      this.#mtime = mtime;
     } catch {
       // No tokens yet, or an unreadable file: treat as empty and let `mcpgw auth` rebuild it.
     }
@@ -56,11 +69,15 @@ export class TokenStore {
   }
 
   get(server: string): Entry {
+    this.#load();
     return this.#file.servers[server] ?? {};
   }
 
   set(server: string, patch: Entry): void {
-    this.#file.servers[server] = { ...this.get(server), ...patch };
+    // `get` may reload the file from disk, replacing `#file`. Merge first, assign second:
+    // otherwise the assignment target is resolved against the object the reload discarded.
+    const merged = { ...this.get(server), ...patch };
+    this.#file.servers[server] = merged;
     this.#save();
   }
 
@@ -75,6 +92,12 @@ export class TokenStore {
 
   #save(): void {
     writeFileSync(this.path, `${JSON.stringify(this.#file, null, 2)}\n`, { mode: 0o600 });
+    // Our own write must not read back as someone else's, or the next #load would re-parse it.
+    try {
+      this.#mtime = statSync(this.path).mtimeMs;
+    } catch {
+      this.#mtime = 0;
+    }
     try {
       chmodSync(this.path, 0o600);
     } catch {

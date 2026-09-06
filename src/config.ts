@@ -135,7 +135,9 @@ function interpolate(node: unknown, missing: Set<string>): unknown {
   return node;
 }
 
-export const GATEWAY_INFO = { name: "mcp-gateway", version: "0.0.0" };
+/** What clients see in the handshake. Kept in step with package.json by hand — importing it
+ *  would resolve against dist/ at runtime, and there is one string to remember. */
+export const GATEWAY_INFO = { name: "mcp-gateway", version: "0.1.0" };
 
 export function isLoopback(host: string): boolean {
   return host === "localhost" || host === "::1" || host === "[::1]" || /^127\./.test(host);

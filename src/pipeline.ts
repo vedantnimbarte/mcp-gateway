@@ -290,8 +290,13 @@ export class Pipeline {
 
   async readResource(ctx: CallContext, uri: string): Promise<ReadResourceResult> {
     const target = this.#resource(ctx, uri);
-    return this.#audited({ ...this.#line(ctx, "resources/read"), server: target.server, tool: uri }, () =>
-      target.backend.readResource(target.original, ctx.signal),
+    return this.#metered(
+      ctx,
+      { ...this.#line(ctx, "resources/read"), server: target.server, tool: uri },
+      async () => {
+        const raw = await target.backend.readResource(target.original, ctx.signal);
+        return this.guard.capContents(raw).result;
+      },
     );
   }
 
@@ -321,7 +326,7 @@ export class Pipeline {
     }
 
     const backend = this.pool.backends.get(entry.server)!;
-    return this.#audited({ ...line, server: entry.server, tool: entry.name }, () =>
+    return this.#metered(ctx, { ...line, server: entry.server, tool: entry.name }, () =>
       backend.getPrompt(entry.name, args, ctx.signal),
     );
   }
@@ -380,13 +385,13 @@ export class Pipeline {
         return this.#refuse(line, new McpError(ErrorCode.MethodNotFound, "unknown prompt"));
       }
       const backend = this.pool.backends.get(entry.server)!;
-      return this.#audited({ ...line, server: entry.server, tool: entry.name }, () =>
+      return this.#metered(ctx, { ...line, server: entry.server, tool: entry.name }, () =>
         backend.complete({ ...params, ref: { type: "ref/prompt", name: entry.name } }, ctx.signal),
       );
     }
 
     const target = this.#resource(ctx, params.ref.uri);
-    return this.#audited({ ...line, server: target.server, tool: params.ref.uri }, () =>
+    return this.#metered(ctx, { ...line, server: target.server, tool: params.ref.uri }, () =>
       target.backend.complete(
         { ...params, ref: { type: "ref/resource", uri: target.original } },
         ctx.signal,
@@ -415,11 +420,40 @@ export class Pipeline {
     return { method, session: ctx.session, profile: ctx.profile, client: ctx.client };
   }
 
+  /**
+   * The limiter for the non-tool methods that still make a backend do work. A profile's rpm is
+   * its whole budget, not its tool-call budget — the limit exists to protect the backend, and a
+   * `resources/read` loop costs it exactly as much as a `tools/call` loop.
+   *
+   * `subscribe`/`unsubscribe` are deliberately not metered: they are bookkeeping, and refusing
+   * an unsubscribe would strand the backend subscription the session had already released.
+   */
+  async #metered<T>(ctx: CallContext, line: AuditInput, run: () => Promise<T>): Promise<T> {
+    const limiter = this.#limiters.get(ctx.profile);
+    const grant = limiter?.acquire() ?? { ok: true as const };
+    if (!grant.ok) {
+      return this.#refuse(
+        { ...line, decision: "rate_limited" },
+        gwError(ERR.RATE_LIMITED, `profile "${ctx.profile}" is over its limit`, {
+          reason: "rate_limited",
+          profile: ctx.profile,
+          retry_after_ms: grant.retryAfterMs,
+        }),
+      );
+    }
+    try {
+      return await this.#audited(line, run);
+    } finally {
+      limiter?.release();
+    }
+  }
+
   /** One audit line per proxied request, whatever happened to it (SPEC 7). */
   async #audited<T>(line: AuditInput, run: () => Promise<T>): Promise<T> {
     const started = Date.now();
     try {
-      const result = await run();
+      // FR-16 applies to everything the gateway forwards, not only to tool results.
+      const result = this.guard.redact(await run());
       this.audit.write({ ...line, decision: "allow", status: "ok", dur_ms: Date.now() - started });
       return result;
     } catch (e) {

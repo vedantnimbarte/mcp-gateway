@@ -64,6 +64,21 @@ export class Pool {
     await Promise.all(starting);
   }
 
+  /**
+   * Stop and start one backend, whatever state it is in. This is the only way back for a
+   * backend that exhausted its retries or that was DOWN awaiting `mcpgw auth`, since `reload`
+   * skips any server whose definition has not changed.
+   */
+  async restart(name: string): Promise<void> {
+    const existing = this.backends.get(name);
+    if (!existing) return;
+    this.log("backend_stopping", { server: name, reason: "restart requested" });
+    await existing.close();
+    this.backends.delete(name);
+    await this.#add(name, this.#config).start().catch(() => {});
+    this.#rebuild();
+  }
+
   /** In parallel, each with its own timeout: a slow backend never blocks its peers (NFR-6). */
   async start(): Promise<void> {
     await Promise.all([...this.backends.values()].map((b) => b.start().catch(() => {})));

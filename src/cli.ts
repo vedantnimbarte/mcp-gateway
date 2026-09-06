@@ -28,6 +28,7 @@ Usage:
   mcpgw auth     SERVER [--config PATH] [--reset] [--print-url]
                                                          authorize an oauth backend in a browser
   mcpgw reload   [--config PATH]                         re-read the config in the running daemon
+  mcpgw restart  SERVER [--config PATH]                  reconnect one backend in the running daemon
   mcpgw tail     [--config PATH] [--profile P] [--denied-only] [--follow]
 
 Signals: SIGHUP reloads the config (POSIX only; on Windows use 'mcpgw reload').
@@ -315,7 +316,7 @@ authorize ${server} here:
     await client.close();
     console.log(`
 authorized ${server}: ${tools.length} tools reachable`);
-    console.log(`tokens saved to ${store.path} — restart the daemon, or run \`mcpgw reload\``);
+    console.log(`tokens saved to ${store.path} — run \`mcpgw restart ${server}\` to connect it`);
     return 0;
   } catch (e) {
     const message = (e as Error).message;
@@ -364,6 +365,44 @@ async function reload(config: Config): Promise<number> {
   }
   console.error("reload rejected; the daemon is still serving the previous config:");
   for (const problem of body.problems ?? []) console.error(`  - ${problem}`);
+  return 1;
+}
+
+/**
+ * Brings one backend back without touching the others. `reload` cannot do this: it skips any
+ * server whose definition is unchanged, which is exactly the case for a backend that exhausted
+ * its retries or that was DOWN waiting for `mcpgw auth`.
+ */
+async function restart(config: Config, server: string | undefined): Promise<number> {
+  if (!server) {
+    console.error("which server? usage: mcpgw restart SERVER");
+    return 1;
+  }
+  const base = `http://${config.listen.host}:${config.listen.port}`;
+  const headers: Record<string, string> = config.listen.token
+    ? { Authorization: `Bearer ${config.listen.token}` }
+    : {};
+  let res: Response;
+  try {
+    res = await fetch(`${base}/restart/${encodeURIComponent(server)}`, {
+      method: "POST",
+      headers,
+      signal: AbortSignal.timeout(60_000),
+    });
+  } catch {
+    console.error(`no daemon answering at ${base}`);
+    return 1;
+  }
+  const body = (await res.json()) as { status?: string; tools?: number; error?: string };
+  if (!res.ok) {
+    console.error(`restart refused: ${body.error ?? res.status}`);
+    return 1;
+  }
+  if (body.status === "up") {
+    console.log(`${server} is up (${body.tools} tools)`);
+    return 0;
+  }
+  console.error(`${server} is ${body.status}: ${body.error ?? "no reason given"}`);
   return 1;
 }
 
@@ -476,7 +515,7 @@ async function main(argv: string[]): Promise<number> {
   });
 
   const command = positionals[0];
-  const known = ["start", "validate", "list", "pin", "tail", "status", "reload", "auth"];
+  const known = ["start", "validate", "list", "pin", "tail", "status", "reload", "restart", "auth"];
 
   if (values.help || !command) {
     console.log(USAGE);
@@ -513,6 +552,8 @@ async function main(argv: string[]): Promise<number> {
       return status(config, values.json);
     case "reload":
       return reload(config);
+    case "restart":
+      return restart(config, positionals[1]);
     case "auth":
       return authorize(config, path, positionals[1], {
         reset: values.reset,
