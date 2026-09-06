@@ -14,7 +14,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "validate": "npm run build --silent && node dist/src/cli.js validate",
-    "test": "npm run build --silent && node --test dist/tests/"
+    "test": "npm run build --silent && cd dist && node --test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.18.0",
