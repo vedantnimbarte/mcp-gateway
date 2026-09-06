@@ -130,6 +130,9 @@ accommodates them. *(Done after cutover, as planned: the catalog took them witho
 | Response cache for idempotent tools | Latency becomes annoying enough to measure |
 | Per-server concurrency limits | One backend starts starving the others |
 | Config hot-reload without SIGHUP | Restarting becomes a genuine irritation — *done in Phase 5: Windows has no SIGHUP, so `POST /reload` and `mcpgw reload` exist* |
+| Forwarding `notifications/progress` | A long-running backend tool leaves a client visibly stuck. Blocked on the same correlation problem as reverse requests, with no `-32006` to fall back on |
+| SSE resumability (`Last-Event-ID`) | A dropped stream costs something. On loopback it costs a re-initialize, which clients already do |
+| `mcpgw start --verbose` | The structured stderr log stops being enough |
 | ~~OAuth for `http`/`sse` backends~~ | *Done: `auth: oauth`, `mcpgw auth <server>`, refresh on expiry, and pre-registered clients for servers like Figma that refuse dynamic registration* |
 
 ## Known ceilings accepted in v1
@@ -145,3 +148,5 @@ at the relevant code site so they surface later.
 | `tools/list` pagination collapsed | A backend with 1000 tools returns one large page | Paginate the merged catalog |
 | Single process | One core ceiling | Multiple daemons on different ports |
 | Drift detection is hash-only | Catches change, not malice on first sight | Content scanning (deferred above) |
+| Prompts are not pinned | A prompt rewritten after approval is not caught | Hash prompts as well as tools; the guard already takes an arbitrary shape |
+| `killTree` is Windows-only | A leaked `npx` grandchild on POSIX | Spawn detached and signal the process group |

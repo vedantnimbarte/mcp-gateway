@@ -241,9 +241,14 @@ negotiates independently with each backend.
 
 ### 4.2 Gateway → client (reverse)
 
-`sampling/createMessage`, `elicitation/create`, `roots/list` and
-`notifications/message` / `progress` are routed per ARCHITECTURE §3.2. Unroutable reverse
-requests get `-32006` and an audit line with `decision: "unroutable"`.
+`sampling/createMessage`, `elicitation/create`, `roots/list` and `notifications/message` are
+routed per ARCHITECTURE §3.2. Unroutable reverse requests get `-32006` and an audit line with
+`decision: "unroutable"`.
+
+`notifications/progress` is **not** forwarded. Routing it needs the same
+call-in-flight correlation as a reverse request, and unlike a request there is no `-32006` to
+return when the correlation fails — a misrouted progress note would surface one client's work
+inside another's. See the deferred table in ROADMAP.md.
 
 ### 4.3 ID remapping (normative)
 
@@ -361,6 +366,11 @@ counting semaphore of size `concurrent`. Both are process-wide per profile — *
 sessions**, since the limit protects the backend, not the client. Exhausting either returns
 `-32005` with `retry_after_ms` in `error.data`.
 
+The budget covers every method that makes a backend do work: `tools/call`, `resources/read`,
+`prompts/get` and `completion/complete`. `resources/subscribe` and `unsubscribe` are exempt —
+they are bookkeeping, and refusing an unsubscribe would strand the backend subscription the
+session had already released.
+
 ## 9. Errors
 
 | Code | Meaning | Emitted when |
@@ -384,14 +394,15 @@ not swallowed: original `code`/`message` land in `error.data.upstream`.
 
 | Aspect | Behaviour |
 |--------|-----------|
-| Path | `POST`/`GET`/`DELETE` `/mcp/<profile>`. Unknown profile → `404`. `/healthz` → `200 {status, backends}` |
+| Path | `POST`/`GET`/`DELETE` `/mcp/<profile>`. Unknown profile → `404`. `POST /reload` re-reads the config; `POST /restart/<server>` reconnects one backend |
+| `/healthz` | `200 {status}` always; the `{uptime_s, sessions, pending_drift, backends}` detail only when the request is authorized, since it names backends and pids |
 | Session | `Mcp-Session-Id` response header on initialize; required on subsequent requests. Unknown/expired → `404`, client re-initializes |
-| SSE | `GET` opens the server→client stream; resumable via `Last-Event-ID` |
+| SSE | `GET` opens the server→client stream. Not resumable: no event store is configured, so a dropped stream is re-established by the client re-initializing |
 | Termination | `DELETE` ends the session and releases its id-map entries |
 | Body limit | 4 MiB; exceeded → `413` |
 | Idle expiry | 30 min without traffic → session dropped |
 | Token | When `listen.token` is set, every request must carry `Authorization: Bearer <token>`; compared with `timingSafeEqual`. Missing/wrong → `401` |
-| Origin | `Origin` header, when present, must be absent, `localhost`, or `127.0.0.1` — blocks DNS-rebinding from a browser tab |
+| Origin | `Origin` header, when present, must be `localhost` or `127.0.0.1` — blocks DNS-rebinding from a browser tab. Checked **first**, before the token and before `/healthz`, so no route answers a browser tab |
 
 ### 10.2 stdio bridge
 
@@ -408,13 +419,20 @@ messages. Exits non-zero with a readable message if the daemon is unreachable. C
 ## 11. CLI
 
 ```
-mcpgw start     [--config PATH] [--port N] [--verbose]
+mcpgw start     [--config PATH] [--port N]
 mcpgw validate  [--config PATH]         # exit 1 on any config error
 mcpgw status    [--json]                # backends, uptime, restarts, drift, sessions
 mcpgw pin       [--yes] [--server NAME] # review + accept tool changes
 mcpgw tail      [--profile P] [--denied-only] [--follow]
 mcpgw list      [--profile P]           # effective exposed tools after policy
+mcpgw reload                            # re-read the config in the running daemon
+mcpgw restart   SERVER                  # reconnect one backend in the running daemon
+mcpgw auth      SERVER [--reset] [--print-url]
 ```
+
+`mcpgw restart` is the only way back for a backend that exhausted its retries or that was DOWN
+awaiting `mcpgw auth`: `reload` deliberately skips any server whose definition has not changed,
+which is exactly those two cases.
 
 `mcpgw list` is the debugging workhorse: it answers "why can't the model see this tool"
 by printing each tool with its decision and the rule that produced it.

@@ -125,9 +125,19 @@ export async function startGateway(
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const path = new URL(req.url ?? "/", "http://localhost").pathname;
+    const authorized = !token || tokenOk(token, req.headers.authorization);
 
+    // Checked first, and for every route: a browser tab must not be able to reach any of them,
+    // including the ones that answer before the token check (SPEC 10.1).
+    if (!originOk(req.headers.origin)) {
+      send(res, 403, { error: "forbidden origin" });
+      return;
+    }
+
+    // The bridge probes this without a token, so an unauthorized caller still gets a liveness
+    // answer — but backend names, pids and error strings are detail, and detail needs the token.
     if (path === "/healthz") {
-      send(res, 200, health());
+      send(res, 200, authorized ? health() : { status: "ok" });
       return;
     }
 
@@ -138,7 +148,7 @@ export async function startGateway(
         send(res, 405, { error: "POST only" });
         return;
       }
-      if (token && !tokenOk(token, req.headers.authorization)) {
+      if (!authorized) {
         send(res, 401, { error: "unauthorized" });
         return;
       }
@@ -157,12 +167,31 @@ export async function startGateway(
       return;
     }
 
-    if (token && !tokenOk(token, req.headers.authorization)) {
-      send(res, 401, { error: "unauthorized" });
+    // A backend that exhausted its retries, or one that has just been given OAuth tokens, needs
+    // a way back up that is not "restart the daemon": `reload` deliberately skips a server whose
+    // definition has not changed, so it cannot be that way back.
+    if (path.startsWith("/restart/")) {
+      if (req.method !== "POST") {
+        send(res, 405, { error: "POST only" });
+        return;
+      }
+      if (!authorized) {
+        send(res, 401, { error: "unauthorized" });
+        return;
+      }
+      const server = decodeURIComponent(path.slice("/restart/".length));
+      if (!pool.backends.has(server)) {
+        send(res, 404, { error: `no such server "${server}"` });
+        return;
+      }
+      await pool.restart(server);
+      const backend = pool.backends.get(server)!;
+      send(res, 200, { status: backend.state, server, tools: backend.tools.length, error: backend.lastError });
       return;
     }
-    if (!originOk(req.headers.origin)) {
-      send(res, 403, { error: "forbidden origin" });
+
+    if (!authorized) {
+      send(res, 401, { error: "unauthorized" });
       return;
     }
 

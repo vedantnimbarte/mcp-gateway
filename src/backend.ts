@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { UnauthorizedError, type OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
@@ -335,7 +336,13 @@ export class Backend {
    */
   #route(method: string): ReverseTarget {
     if (this.#inflight.size !== 1) {
-      this.onEvent?.("unroutable", { server: this.name, method, inflight: this.#inflight.size });
+      // `decision`, not just `method`: PRD 8.5 greps the log with `select(.decision != "allow")`.
+      this.onEvent?.("unroutable", {
+        server: this.name,
+        decision: "unroutable",
+        rpc_method: method,
+        inflight: this.#inflight.size,
+      });
       throw gwError(ERR.UNROUTABLE, `cannot route ${method} from "${this.name}" to a session`, {
         reason: "unroutable",
         server: this.name,
@@ -439,6 +446,7 @@ export class Backend {
   async close(): Promise<void> {
     this.#closing = true;
     clearTimeout(this.#retry);
+    const orphan = this.pid;
     this.state = "down";
     this.tools = [];
     this.prompts = [];
@@ -448,5 +456,23 @@ export class Backend {
     this.#client = undefined;
     this.#transport = undefined;
     await client?.close().catch(() => {});
+    if (orphan !== null) killTree(orphan);
+  }
+}
+
+/**
+ * Windows only. The SDK kills the process it spawned, which for `npx` is a `.cmd` launcher whose
+ * `node` grandchild outlives it — so every restart would leak a backend process. POSIX is left
+ * alone deliberately: the SDK does not spawn detached, so the child is not a process-group
+ * leader, and `kill(-pid)` there would signal whatever group happens to carry that id.
+ *
+ * Best effort: an already-dead pid simply fails, which is the common case on a clean shutdown.
+ */
+function killTree(pid: number): void {
+  if (process.platform !== "win32") return;
+  try {
+    spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" }).unref();
+  } catch {
+    // Nothing to do if taskkill itself is unavailable.
   }
 }

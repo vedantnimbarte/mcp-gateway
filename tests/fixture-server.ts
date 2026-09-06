@@ -105,6 +105,26 @@ server.registerResource(
   (uri) => ({ contents: [{ uri: uri.href, text: "the note says hello" }] }),
 );
 
+// Off by default so the resource listings other tests assert on stay as they are; the
+// hardening suite turns them on with `env: { FIXTURE_PAYLOADS: "1" }`.
+if (process.env.FIXTURE_PAYLOADS) {
+  // Carries something the redact patterns match, to prove resource payloads are redacted too.
+  server.registerResource(
+    "secret",
+    "fixture://secret",
+    { description: "A resource that leaks.", mimeType: "text/plain" },
+    (uri) => ({ contents: [{ uri: uri.href, text: "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ01 ok" }] }),
+  );
+
+  // Larger than any sane max_result_bytes, to prove the cap applies to resources.
+  server.registerResource(
+    "big",
+    "fixture://big",
+    { description: "A large resource.", mimeType: "text/plain" },
+    (uri) => ({ contents: [{ uri: uri.href, text: "x".repeat(200_000) }] }),
+  );
+}
+
 server.registerResource(
   "page",
   new ResourceTemplate("fixture://page/{id}", { list: undefined }),

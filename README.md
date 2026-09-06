@@ -167,10 +167,15 @@ hanging on the first tool call.
 | `mcpgw pin` | Show changed tool descriptions as diffs; `--yes` accepts them |
 | `mcpgw auth <server>` | Authorize an `auth: oauth` backend in a browser, once |
 | `mcpgw reload` | Re-read the config in the running daemon (what SIGHUP does) |
+| `mcpgw restart <server>` | Reconnect one backend without touching the others or the daemon |
 | `mcpgw tail --denied-only` | Stream the audit log |
 
 `mcpgw list` is the one to reach for when a tool isn't showing up — it prints the decision and
 the exact rule that produced it.
+
+`mcpgw restart` is what you want when a backend has given up: it exhausted its retries, or it
+was DOWN waiting for `mcpgw auth`. `reload` cannot help there, because it deliberately skips any
+server whose definition has not changed — which is exactly those two cases.
 
 `SIGHUP` reloads the config, restarting only the servers whose definitions actually changed —
 live sessions keep working, and a new allow list applies to them without a reconnect. A bad edit
@@ -196,9 +201,10 @@ mcpgw auth figma
 ```
 
 That opens a browser, completes the authorization-code flow with PKCE, and writes the tokens to
-`tools.lock.json`'s neighbour `tokens.json` (mode 0600, gitignored). From then on the daemon
-connects on its own and refreshes the access token silently; you only run `mcpgw auth` again if
-the refresh token is revoked.
+`tools.lock.json`'s neighbour `tokens.json` (mode 0600, gitignored). Then `mcpgw restart figma`
+brings it up — the daemon notices the new tokens on disk. From then on it connects on its own
+and refreshes the access token silently; you only run `mcpgw auth` again if the refresh token is
+revoked.
 
 The daemon never opens a browser by itself. A backend that needs authorizing stays DOWN with
 `needs authorization: run mcpgw auth <server>` and does **not** retry — retrying an expired
@@ -305,6 +311,11 @@ Deliberate, and each one is marked in the code:
 - **Rate limits are in memory.** Restarting the daemon resets them.
 - **Audit writes are best-effort.** A hard crash can lose the last few lines.
 - **`tools/list` pagination is collapsed** into a single page.
+- **`notifications/progress` is not forwarded.** It needs the same correlation as a reverse
+  request, and unlike a request there is no error code to return when the correlation fails.
+- **The SSE stream is not resumable.** A dropped connection is recovered by re-initializing.
+- **Prompts are not pinned.** The guard covers tools; a prompt has no `inputSchema` to hash
+  alongside its text.
 - **OAuth is authorization-code only.** Client-credentials and device-code flows are not wired,
   and the callback listens on a fixed `127.0.0.1:8419`.
 
@@ -315,6 +326,11 @@ There is no client authentication, by design. The trust boundary is the local ma
 That only holds if the daemon stays local, so the gateway **refuses to bind a non-loopback
 address** unless you explicitly set `listen.token`. Reaching the port means inheriting every
 credential the gateway holds — the interlock is enforced at startup, not left to convention.
+
+Two smaller rules follow from the same reasoning. The `Origin` check runs before everything
+else, so no route — not even `/healthz` — answers a browser tab. And `/healthz` returns bare
+liveness to an unauthorized caller: backend names, pids and error strings are detail, and detail
+needs the token. The bridge only ever needed the liveness half.
 
 ## Logo
 

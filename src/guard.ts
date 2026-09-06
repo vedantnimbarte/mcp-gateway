@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
 import type { JsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/index.js";
-import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult, ReadResourceResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { compileRedact, type Config } from "./config.js";
 
 export const LOCKFILE = "tools.lock.json";
@@ -22,6 +22,13 @@ interface Lockfile {
   version: 1;
   pinned_at: string;
   servers: Record<string, Record<string, Pin>>;
+}
+
+/** A payload after the size cap, with what it cost. */
+export interface Capped<T> {
+  result: T;
+  bytes: number;
+  truncated: boolean;
 }
 
 export type Change =
@@ -259,31 +266,73 @@ export class Guard {
   }
 
   /** FR-17: never forward an unbounded payload; truncate with a marker instead. */
-  capResult(result: CallToolResult): { result: CallToolResult; bytes: number; truncated: boolean } {
+  capResult(result: CallToolResult): Capped<CallToolResult> {
+    const content = [...(result.content ?? [])];
+    const last = content.map((c) => c.type).lastIndexOf("text");
+    const block = last < 0 ? undefined : (content[last] as { type: "text"; text: string });
+    return this.#cap(
+      result,
+      block?.text,
+      (text) => {
+        const trimmed = [...content];
+        trimmed[last] = { ...block!, text };
+        return { ...result, content: trimmed };
+      },
+      (text) => ({ ...result, content: [{ type: "text" as const, text }] }),
+    );
+  }
+
+  /**
+   * The same cap for `resources/read`. A resource is fetched by URI rather than offered to a
+   * model, but it is still an unbounded payload arriving from a backend (FR-17).
+   */
+  capContents(result: ReadResourceResult): Capped<ReadResourceResult> {
+    const contents = [...(result.contents ?? [])];
+    const last = contents.map((c) => "text" in c).lastIndexOf(true);
+    const block = last < 0 ? undefined : (contents[last] as { uri: string; text: string });
+    return this.#cap(
+      result,
+      block?.text,
+      (text) => {
+        const trimmed = [...contents];
+        trimmed[last] = { ...block!, text };
+        return { ...result, contents: trimmed };
+      },
+      (text) => ({ ...result, contents: [{ uri: contents[0]?.uri ?? "mcpgw:truncated", text }] }),
+    );
+  }
+
+  /**
+   * Shrinks whichever text block the caller nominated until the whole payload fits. Measured,
+   * not predicted: JSON escaping makes the serialized size larger than the raw string by an
+   * amount that depends on the content, so this shrinks until it actually fits rather than
+   * computing a budget it cannot know.
+   */
+  #cap<T>(
+    result: T,
+    text: string | undefined,
+    withText: (text: string) => T,
+    replace: (text: string) => T,
+  ): Capped<T> {
     const max = this.cfg.max_result_bytes;
     const bytes = Buffer.byteLength(JSON.stringify(result));
     if (bytes <= max) return { result, bytes, truncated: false };
 
-    const content = [...(result.content ?? [])];
-    const last = content.map((c) => c.type).lastIndexOf("text");
-    const marker = (omitted: number) => `\n\n[truncated by mcp-gateway: ${omitted} bytes omitted]`;
+    const marker = (omitted: number) => `
 
-    if (last < 0) {
+[truncated by mcp-gateway: ${omitted} bytes omitted]`;
+
+    if (text === undefined) {
       // Nothing textual to trim — replace the payload rather than forward it.
-      const capped = { ...result, content: [{ type: "text" as const, text: marker(bytes).trim() }] };
+      const capped = replace(marker(bytes).trim());
       return { result: capped, bytes: Buffer.byteLength(JSON.stringify(capped)), truncated: true };
     }
 
-    const block = content[last] as { type: "text"; text: string };
-    const textBytes = Buffer.byteLength(block.text);
-
-    // Measured, not predicted: JSON escaping makes the serialized size larger than the raw
-    // string by an amount that depends on the content, so shrink until it actually fits.
+    const textBytes = Buffer.byteLength(text);
     let budget = Math.max(0, max - (bytes - textBytes));
     for (;;) {
-      const kept = budget > 0 ? Buffer.from(block.text).subarray(0, budget).toString("utf8") : "";
-      content[last] = { ...block, text: kept + marker(textBytes - Buffer.byteLength(kept)) };
-      const capped = { ...result, content };
+      const kept = budget > 0 ? Buffer.from(text).subarray(0, budget).toString("utf8") : "";
+      const capped = withText(kept + marker(textBytes - Buffer.byteLength(kept)));
       const size = Buffer.byteLength(JSON.stringify(capped));
       // With an empty payload the marker itself is the floor; it is bounded and worth keeping.
       if (size <= max || budget === 0) return { result: capped, bytes: size, truncated: true };
