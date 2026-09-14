@@ -528,14 +528,15 @@ async function closeTree(client: Client, pid: number | null | undefined): Promis
   }
 }
 
-let listing: { at: number; table: Promise<Map<number, number[]>> } | undefined;
+let listing: Promise<Map<number, number[]>> | undefined;
 
 /**
- * pid → child pids, from one OS listing. Shared for a second, because a shutdown closes every
- * backend at once and PowerShell takes most of that second to answer on Windows.
+ * pid → child pids, from one OS listing. A shutdown closes every backend at once and PowerShell
+ * takes most of a second to answer on Windows, so closes that overlap share the listing in flight.
+ * Only in flight: a finished one predates any process started since, which is what it must find.
  */
 function processTable(): Promise<Map<number, number[]>> {
-  if (listing && Date.now() - listing.at < 1000) return listing.table;
+  if (listing) return listing;
   const [command, args] =
     process.platform === "win32"
       ? [
@@ -558,8 +559,11 @@ function processTable(): Promise<Map<number, number[]>> {
       }
       return children;
     })
-    .catch(() => new Map<number, number[]>()); // no listing: fall back to the SDK's own kill
-  listing = { at: Date.now(), table };
+    .catch(() => new Map<number, number[]>()) // no listing: fall back to the SDK's own kill
+    .finally(() => {
+      listing = undefined;
+    });
+  listing = table;
   return table;
 }
 

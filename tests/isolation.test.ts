@@ -200,8 +200,13 @@ profiles:
 function alive(pid: number): boolean {
   try {
     process.kill(pid, 0);
-    return true;
   } catch {
     return false;
+  }
+  // A killed process whose new parent has not reaped it yet still answers signal 0 on Linux.
+  try {
+    return !/^\d+ \(.*\) Z/.test(readFileSync(`/proc/${pid}/stat`, "utf8"));
+  } catch {
+    return true; // no /proc: not Linux, and signal 0 already answered
   }
 }
