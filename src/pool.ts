@@ -42,8 +42,11 @@ export class Pool {
    * connection, its child process, the sessions using it — is left alone.
    */
   async reload(config: Config): Promise<void> {
+    // Limits and caching are the gateway's business, not the process's: changing them must not
+    // restart it.
+    const definition = ({ limits, cache, ...rest }: ServerConfig) => canonicalJson(rest);
     const same = (a: ServerConfig | undefined, b: ServerConfig | undefined) =>
-      a !== undefined && b !== undefined && canonicalJson(a) === canonicalJson(b);
+      a !== undefined && b !== undefined && definition(a) === definition(b);
     const previous = this.#config;
     this.#config = config;
 

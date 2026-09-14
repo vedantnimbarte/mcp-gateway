@@ -42,6 +42,10 @@ servers:
     transport: stdio
     command: npx
     args: ["-y", "@modelcontextprotocol/server-filesystem", "/Users/vedant/code"]
+    limits: { concurrent: 2 }   # per server, on top of each profile's; either bound optional
+    cache:                      # opt-in: results of these tools are reused for ttl_ms
+      tools: ["read_*", "list_*"]
+      ttl_ms: 30000
 
   linear:
     transport: http          # Streamable HTTP
@@ -109,14 +113,29 @@ const Server = z.discriminatedUnion("transport", [
     env: z.record(z.string()).default({}),
     cwd: z.string().optional(),
     restart: Restart,
+    limits: ServerLimits,
+    cache: Cache,
   }),
   z.object({
     transport: z.enum(["http", "sse"]),
     url: z.string().url(),
     headers: z.record(z.string()).default({}),
     restart: Restart,
+    limits: ServerLimits,
+    cache: Cache,
   }),
 ]);
+
+const ServerLimits = z.object({
+  rpm:        z.number().int().positive().optional(),   // absent = unlimited
+  concurrent: z.number().int().positive().optional(),
+}).optional();
+
+const Cache = z.object({
+  tools:       z.array(z.string()).min(1),              // globs on the backend's tool name
+  ttl_ms:      z.number().int().positive().default(60000),
+  max_entries: z.number().int().positive().default(500),
+}).optional();
 
 const Profile = z.object({
   servers: z.array(z.string()).default(["*"]),
@@ -278,17 +297,23 @@ paths above; leaks here are how a gateway grows a memory leak and a cross-talk b
 ```
 1. resolve   alias -> canonical -> (server, originalTool)          [unknown -> -32601]
 2. policy    decide(profile, canonical)                            [deny -> -32004]
-3. limit     bucket.take(profile) && semaphore.acquire(profile)    [reject -> -32005]
+3. limit     profile bucket + semaphore, then the server's (§8)    [reject -> -32005]
 4. guard-in  hash check (already in policy step 5) + validate args against inputSchema
                                                                    [invalid -> -32602]
+4½. cache    a server that caches this tool answers a repeat from its cache: audited with
+             `cached: true`, then straight to step 8
 5. dispatch  backend.call(originalTool, args, timeout)             [timeout -> -32002]
 6. guard-out redact patterns; if bytes > max_result_bytes, truncate the last text content
-             block and append "\n\n[truncated by mcp-gateway: N bytes omitted]"
+             block and append "\n\n[truncated by mcp-gateway: N bytes omitted]"; a cacheable,
+             non-error result is stored as it leaves this step
 7. audit     exactly one line, whatever happened
-8. release   semaphore, always, in a finally
+8. release   semaphores, always, in a finally
 ```
 
-Steps 2 and 3 are ordered deliberately: a denied call must not consume rate-limit budget.
+Steps 2 and 3 are ordered deliberately: a denied call must not consume rate-limit budget. The
+cache comes after both policy and validation, so a cached answer can never bypass either; its key
+includes the tool's hash, so a drifted tool never answers from its old self. Cache hits do spend
+rate budget.
 
 ## 6. Tool pinning
 
@@ -364,6 +389,7 @@ append-only.
 | `status` | `ok` \| `error` \| `timeout` \| `denied` |
 | `args` | Present only when `log_args: full`, post-redaction |
 | `args_hash` | Present when `log_args: hashed` — sha256 of canonical JSON |
+| `cached` | `true` when a `tools/call` was answered from the response cache |
 | `error` | `{ code, message }` on failure, redacted |
 
 Also logged, with `method` set accordingly: `initialize` (session open), `session_close`,
@@ -377,6 +403,15 @@ Token bucket per profile: capacity `rpm`, refill `rpm/60` per second, continuous
 counting semaphore of size `concurrent`. Both are process-wide per profile — **shared across
 sessions**, since the limit protects the backend, not the client. Exhausting either returns
 `-32005` with `retry_after_ms` in `error.data`.
+
+A server with `limits` has a bucket and semaphore of its own, shared by every profile that reaches
+it, so one busy backend cannot starve the others. A call takes its profile's first and then its
+server's; a server refusal (`error.data.server` set) hands the profile its slot back, though not
+its token. Changing a server's `limits` or `cache` on reload does not restart its process.
+
+Buckets are written to `ratelimit.state.json` beside the config on graceful shutdown and restored
+on start, so restarting the daemon is not a way to refill them. A bucket whose `rpm` changed in
+between starts full. A crash skips the write.
 
 The budget covers every method that makes a backend do work: `tools/call`, `resources/read`,
 `prompts/get` and `completion/complete`. `resources/subscribe` and `unsubscribe` are exempt —
@@ -432,7 +467,7 @@ messages. Exits non-zero with a readable message if the daemon is unreachable. C
 ## 11. CLI
 
 ```
-mcpgw start     [--config PATH] [--port N]
+mcpgw start     [--config PATH] [--port N] [--verbose]   # -v mirrors audit lines to stderr
 mcpgw validate  [--config PATH]         # exit 1 on any config error
 mcpgw status    [--json]                # backends, uptime, restarts, drift, sessions
 mcpgw pin       [--yes] [--server NAME] # review + accept tool changes

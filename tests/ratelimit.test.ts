@@ -97,3 +97,45 @@ test("release in a finally keeps a throwing call from leaking its slot", async (
   assert.equal(limiter.inflight, 0);
   assert.equal(limiter.acquire().ok, true);
 });
+
+test("a restored bucket carries its tokens, and refills from when it was saved", () => {
+  const c = clock();
+  const before = new Limiter(60, 10, c.now);
+  for (let i = 0; i < 60; i++) {
+    before.acquire();
+    before.release();
+  }
+  const saved = before.snapshot();
+
+  c.advance(2000); // the daemon was down for two seconds
+  const after = new Limiter(60, 10, c.now);
+  after.restore(saved);
+  assert.equal(after.acquire().ok, true);
+  after.release();
+  assert.equal(after.acquire().ok, true);
+  after.release();
+  assert.equal(after.acquire().ok, false, "two seconds bought two calls, not a full bucket");
+});
+
+test("a snapshot taken under different limits is ignored", () => {
+  const c = clock();
+  const old = new Limiter(1, 10, c.now);
+  old.acquire();
+  const fresh = new Limiter(100, 10, c.now);
+  fresh.restore(old.snapshot());
+  for (let i = 0; i < 100; i++) {
+    assert.equal(fresh.acquire().ok, true);
+    fresh.release();
+  }
+});
+
+test("an unset bound is unlimited", () => {
+  const limiter = new Limiter(Infinity, 1);
+  assert.equal(limiter.acquire().ok, true);
+  assert.equal(limiter.acquire().ok, false, "the concurrency bound still holds");
+  limiter.release();
+  for (let i = 0; i < 1000; i++) {
+    assert.equal(limiter.acquire().ok, true);
+    limiter.release();
+  }
+});

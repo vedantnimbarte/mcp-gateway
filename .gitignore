@@ -21,6 +21,7 @@ audit/
 *.log
 logs/
 mcpgw.pid
+ratelimit.state.json
 
 # Test coverage
 coverage/

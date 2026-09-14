@@ -19,7 +19,8 @@ import { ERR, gwError } from "./errors.js";
 import type { Guard } from "./guard.js";
 import { decide, reaches, type Decision } from "./policy.js";
 import type { Pool } from "./pool.js";
-import { limitersFor, type Limiter } from "./ratelimit.js";
+import { ResponseCache } from "./cache.js";
+import { limitersFor, restoreLimiters, saveLimiters, type Limiters } from "./ratelimit.js";
 
 export interface ExposedTool {
   entry: CatalogEntry;
@@ -53,7 +54,8 @@ const WARN_PREFIX = "⚠ [unverified change] ";
  * in a `finally` so a throwing backend cannot leak a slot.
  */
 export class Pipeline {
-  #limiters: Map<string, Limiter>;
+  #limiters: Limiters;
+  readonly #cache: ResponseCache;
   /** alias → canonical, per profile. Renames are static between reloads, so this is built once. */
   #aliases = new Map<string, Map<string, string>>();
   /** namespaced resource URI -> the sessions watching it, so a backend is subscribed once. */
@@ -67,6 +69,7 @@ export class Pipeline {
     private readonly now?: () => number,
   ) {
     this.#limiters = limitersFor(config, now);
+    this.#cache = new ResponseCache(config, now);
     for (const [name, profile] of Object.entries(config.profiles)) {
       const byAlias = new Map<string, string>();
       for (const [canonical, alias] of Object.entries(profile.rename)) byAlias.set(alias, canonical);
@@ -74,26 +77,29 @@ export class Pipeline {
     }
   }
 
-  /** Calls currently dispatched to a backend, across every profile — what a drain waits for. */
+  /**
+   * Calls currently dispatched to a backend, across every profile — what a drain waits for.
+   * Profile limiters only: every call holds exactly one of those, and some a server's as well.
+   */
   get inflight(): number {
     let total = 0;
-    for (const limiter of this.#limiters.values()) total += limiter.inflight;
+    for (const limiter of this.#limiters.profiles.values()) total += limiter.inflight;
     return total;
   }
 
-  /** SIGHUP: new profiles, globs, renames and limits take effect on the next call. */
+  /** Graceful shutdown: keep the buckets, so a restart is not a way to refill them. */
+  saveLimits(dir: string): void {
+    saveLimiters(dir, this.#limiters);
+  }
+
+  restoreLimits(dir: string): void {
+    restoreLimiters(dir, this.#limiters);
+  }
+
+  /** SIGHUP: new profiles, globs, renames, limits and cache rules take effect on the next call. */
   reload(config: Config): void {
-    // A profile whose limits did not change keeps its limiter: a fresh one would refill the
-    // bucket on every SIGHUP and forget the calls in flight, which the drain counts on.
-    const limiters = limitersFor(config, this.now);
-    for (const [name, limiter] of this.#limiters) {
-      const was = this.config.profiles[name]?.limits;
-      const is = config.profiles[name]?.limits;
-      if (was && is && was.rpm === is.rpm && was.concurrent === is.concurrent) {
-        limiters.set(name, limiter);
-      }
-    }
-    this.#limiters = limiters;
+    this.#limiters = limitersFor(config, this.now, this.#limiters);
+    this.#cache.reload(config);
     this.config = config;
     this.#aliases = new Map();
     for (const [name, profile] of Object.entries(config.profiles)) {
@@ -230,18 +236,8 @@ export class Pipeline {
     }
 
     // 3. limit
-    const limiter = this.#limiters.get(ctx.profile);
-    const grant = limiter?.acquire() ?? { ok: true as const };
-    if (!grant.ok) {
-      return fail(
-        gwError(ERR.RATE_LIMITED, `profile "${ctx.profile}" is over its limit`, {
-          reason: "rate_limited",
-          profile: ctx.profile,
-          retry_after_ms: grant.retryAfterMs,
-        }),
-        "rate_limited",
-      );
-    }
+    const held = this.#acquire(ctx.profile, entry.server);
+    if (held instanceof McpError) return fail(held, "rate_limited");
 
     try {
       // 4. guard-in: the arguments must fit the schema the backend published.
@@ -251,6 +247,24 @@ export class Pipeline {
           new McpError(ErrorCode.InvalidParams, `invalid arguments for "${exposed}": ${invalid}`),
           "allow",
         );
+      }
+
+      // 4½. cache: after policy and validation, so a hit can never bypass either. It has spent
+      //     rate budget by now — ponytail: move the lookup before step 3 if that ever matters.
+      const cacheKey = this.#cache.keyFor(entry.server, entry.tool, entry.def, args);
+      const cached = cacheKey === undefined ? undefined : this.#cache.get(cacheKey);
+      if (cached) {
+        this.audit.write({
+          ...line,
+          decision: "allow",
+          status: "ok",
+          cached: true,
+          dur_ms: Date.now() - started,
+          result_bytes: Buffer.byteLength(JSON.stringify(cached)),
+          truncated: false,
+          ...this.audit.resultFields(cached),
+        });
+        return cached;
       }
 
       // 5. dispatch
@@ -283,6 +297,7 @@ export class Pipeline {
 
       // 6. guard-out: redact, then cap.
       const { result, bytes, truncated } = this.guard.capResult(this.guard.redact(raw));
+      if (cacheKey !== undefined) this.#cache.set(cacheKey, entry.server, result);
 
       // 7. audit — exactly one line, whatever happened.
       this.audit.write({
@@ -297,7 +312,7 @@ export class Pipeline {
       return result;
     } finally {
       // 8. release, always.
-      limiter?.release();
+      held.release();
     }
   }
 
@@ -455,23 +470,49 @@ export class Pipeline {
    * an unsubscribe would strand the backend subscription the session had already released.
    */
   async #metered<T>(ctx: CallContext, line: AuditInput, run: () => Promise<T>): Promise<T> {
-    const limiter = this.#limiters.get(ctx.profile);
-    const grant = limiter?.acquire() ?? { ok: true as const };
-    if (!grant.ok) {
-      return this.#refuse(
-        { ...line, decision: "rate_limited" },
-        gwError(ERR.RATE_LIMITED, `profile "${ctx.profile}" is over its limit`, {
-          reason: "rate_limited",
-          profile: ctx.profile,
-          retry_after_ms: grant.retryAfterMs,
-        }),
-      );
-    }
+    const held = this.#acquire(ctx.profile, line.server ?? "");
+    if (held instanceof McpError) return this.#refuse({ ...line, decision: "rate_limited" }, held);
     try {
       return await this.#audited(line, run);
     } finally {
-      limiter?.release();
+      held.release();
     }
+  }
+
+  /**
+   * SPEC §8: the profile's budget, then the server's. Both are held or neither is — a server
+   * refusal hands the profile its slot back.
+   *
+   * ponytail: but not its rpm token, since a bucket has no un-take. A call refused by its server
+   * still costs its profile one request per minute.
+   */
+  #acquire(profile: string, server: string): { release(): void } | McpError {
+    const byProfile = this.#limiters.profiles.get(profile);
+    const byServer = this.#limiters.servers.get(server);
+    const first = byProfile?.acquire() ?? { ok: true as const };
+    if (!first.ok) {
+      return gwError(ERR.RATE_LIMITED, `profile "${profile}" is over its limit`, {
+        reason: "rate_limited",
+        profile,
+        retry_after_ms: first.retryAfterMs,
+      });
+    }
+    const second = byServer?.acquire() ?? { ok: true as const };
+    if (!second.ok) {
+      byProfile?.release();
+      return gwError(ERR.RATE_LIMITED, `server "${server}" is over its limit`, {
+        reason: "rate_limited",
+        profile,
+        server,
+        retry_after_ms: second.retryAfterMs,
+      });
+    }
+    return {
+      release: () => {
+        byServer?.release();
+        byProfile?.release();
+      },
+    };
   }
 
   /** One audit line per proxied request, whatever happened to it (SPEC 7). */

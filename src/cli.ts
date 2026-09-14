@@ -20,7 +20,7 @@ const DRAIN_MS = 5000;
 const USAGE = `mcpgw — MCP gateway
 
 Usage:
-  mcpgw start    [--config PATH] [--port N]              run the daemon
+  mcpgw start    [--config PATH] [--port N] [--verbose]  run the daemon; -v also logs each request
   mcpgw validate [--config PATH]                         check config.yaml
   mcpgw list     [--config PATH] [--profile P]           effective tools per profile, and why
   mcpgw pin      [--config PATH] [--server NAME] [--yes] review and accept tool changes
@@ -50,9 +50,19 @@ function log(event: string, fields: Record<string, unknown> = {}): void {
   }
 }
 
-/** ponytail: one process, one core. Upgrade: several daemons, each with its own config dir and port. */
-async function start(config: Config, configPath: string, port?: number): Promise<void> {
+/**
+ * ponytail: one process, one core. Upgrade: several daemons, each with its own config dir and port.
+ */
+async function start(
+  config: Config,
+  configPath: string,
+  opts: { port?: number; verbose?: boolean },
+): Promise<void> {
+  const { port } = opts;
   const parts = assemble(config, configPath, log);
+  // Lifecycle events already reach stderr through `log`; verbose adds every request, as `tail`
+  // would render it, without anyone having to find the audit file.
+  if (opts.verbose) parts.audit.onWrite = (line) => process.stderr.write(`${renderAudit(line)}\n`);
 
   // Bind before the backends connect: a slow `npx` cold start must never delay the port (NFR-6).
   const gateway = await startGateway(config, parts, { port, configPath });
@@ -460,7 +470,7 @@ function renderAudit(line: AuditLine): string {
   const time = line.ts.slice(11, 23);
   const what = line.tool ? `${line.server}__${line.tool}` : (line.server ?? "");
   const as = line.exposed_as && line.exposed_as !== what ? ` as ${line.exposed_as}` : "";
-  const took = line.dur_ms === undefined ? "" : ` ${line.dur_ms}ms`;
+  const took = line.dur_ms === undefined ? "" : ` ${line.dur_ms}ms${line.cached ? " cached" : ""}`;
   const err = line.error ? `  ${line.error.code} ${line.error.message}` : "";
   const verdict = line.decision ?? line.method;
   return `${time} ${(line.profile ?? "-").padEnd(10)} ${verdict.padEnd(21)} ${what}${as}${took}${err}`;
@@ -530,6 +540,7 @@ async function main(argv: string[]): Promise<number> {
       "print-url": { type: "boolean" },
       follow: { type: "boolean", short: "f" },
       "denied-only": { type: "boolean" },
+      verbose: { type: "boolean", short: "v" },
       help: { type: "boolean", short: "h" },
     },
   });
@@ -586,7 +597,10 @@ async function main(argv: string[]): Promise<number> {
         follow: values.follow,
       });
     default:
-      await start(config, path, values.port === undefined ? undefined : Number(values.port));
+      await start(config, path, {
+        port: values.port === undefined ? undefined : Number(values.port),
+        verbose: values.verbose,
+      });
       return 0; // the process stays alive on the listener
   }
 }

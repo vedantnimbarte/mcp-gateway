@@ -1,6 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { dirname } from "node:path";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { AuditLog } from "./audit.js";
 import { ConfigError, isLoopback, loadConfig, type Config } from "./config.js";
@@ -125,6 +126,8 @@ export async function startGateway(
     throw new Error(`refusing to bind ${host} without listen.token (NFR-2)`);
   }
 
+  // Buckets as the last graceful shutdown left them, beside the config they belong to.
+  if (opts.configPath) pipeline.restoreLimits(dirname(opts.configPath));
   const sessions = new SessionManager(config, pipeline, audit);
   pool.onCatalogChange = () => sessions.notifyCatalogChanged();
   pool.onResourceUpdated = (server, uri) => sessions.notifyResourceUpdated(server, uri);
@@ -294,7 +297,7 @@ export async function startGateway(
       await pool.reload(next);
       sessions.notifyCatalogChanged();
     },
-    close: (drainMs = 0) => closeAll(http, sessions, parts, drainMs),
+    close: (drainMs = 0) => closeAll(http, sessions, parts, drainMs, opts.configPath),
   };
   return gateway;
 }
@@ -304,6 +307,7 @@ async function closeAll(
   sessions: SessionManager,
   parts: Parts,
   drainMs: number,
+  configPath?: string,
 ): Promise<void> {
   // Stop taking new connections first, then let what is already running finish (SPEC §11).
   http.close();
@@ -311,6 +315,7 @@ async function closeAll(
   while (parts.pipeline.inflight > 0 && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 50));
   }
+  if (configPath) parts.pipeline.saveLimits(dirname(configPath));
 
   await sessions.closeAll();
   await parts.pool.close();
