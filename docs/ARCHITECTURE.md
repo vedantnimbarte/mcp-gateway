@@ -220,7 +220,8 @@ to documentation.
 | Threat | Handling |
 |--------|----------|
 | Silent tool-description mutation (rug-pull) | Lockfile hashes; block on drift (FR-13/14) |
-| Injected instructions inside tool descriptions | Partially: change detection only. Content scanning deferred |
+| Injected instructions inside tool descriptions | Partially: change detection, plus a heuristic content scan of tools and prompts (`guard.on_suspicious`) that flags or blocks until a human vouches for it |
+| An auto-approved destructive call | `profiles.*.approve`: the call waits for a human's yes in the calling client, and is refused without one |
 | Overbroad tool exposure | Profiles: allow/deny enforced on list *and* call |
 | Credential leakage into logs | Env-var-only secrets, regex redaction, error scrubbing |
 | Runaway/looping agent | Per-profile rpm + concurrency caps |

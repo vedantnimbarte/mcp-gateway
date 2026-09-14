@@ -71,6 +71,8 @@ const Profile = z.object({
   allow: z.array(z.string()).optional(), // absent = all not denied
   deny: z.array(z.string()).default([]),
   rename: z.record(z.string(), z.string()).default({}), // canonical -> alias
+  // Globs on the canonical name, like `deny`: matching calls wait for the human to approve them.
+  approve: z.array(z.string()).default([]),
   limits: z
     .object({
       rpm: z.number().int().positive().default(120),
@@ -102,8 +104,13 @@ const ConfigSchema = z.object({
     .object({
       pin_tools: z.boolean().default(true),
       on_drift: z.enum(["block", "warn"]).default("block"),
+      // Descriptions that read like injected instructions: flagged in listings, or blocked.
+      on_suspicious: z.enum(["off", "warn", "block"]).default("warn"),
+      scan_patterns: z.array(z.string()).default([]), // added to the built-in ones
       max_result_bytes: z.number().int().positive().default(262144),
       redact: z.array(z.string()).default([]),
+      // How long an approval prompt waits for the human before the call is refused.
+      approval_timeout_ms: z.number().int().positive().default(120000),
     })
     .default({}),
   audit: z
@@ -111,6 +118,8 @@ const ConfigSchema = z.object({
       dir: z.string().default("./audit"),
       log_args: z.enum(["full", "hashed", "none"]).default("hashed"),
       log_results: z.enum(["full", "truncated", "none"]).default("none"),
+      // fsync every line. Survives a crash; costs a synchronous write per request.
+      durable: z.boolean().default(false),
     })
     .default({}),
 });
@@ -201,11 +210,13 @@ function crossCheck(cfg: Config): string[] {
     }
   }
 
-  for (const [i, pattern] of cfg.guard.redact.entries()) {
-    try {
-      compileRedact(pattern);
-    } catch (e) {
-      problems.push(`guard.redact[${i}]: not a valid regex — ${(e as Error).message}`);
+  for (const field of ["redact", "scan_patterns"] as const) {
+    for (const [i, pattern] of cfg.guard[field].entries()) {
+      try {
+        compileRedact(pattern);
+      } catch (e) {
+        problems.push(`guard.${field}[${i}]: not a valid regex — ${(e as Error).message}`);
+      }
     }
   }
 

@@ -8,6 +8,7 @@ export type DenyReason =
   | "denied_by_policy"
   | "not_allowed"
   | "drift_blocked"
+  | "suspicious_blocked"
   | "server_unavailable";
 
 export type Decision =
@@ -22,6 +23,9 @@ export interface Facts {
   /** Set by the guard when the tool no longer matches its pin (Phase 4). */
   drifted: boolean;
   onDrift: "block" | "warn";
+  /** Set by the guard when the content scan flagged it and no human has vouched for it. */
+  suspicious?: boolean;
+  onSuspicious?: "off" | "warn" | "block";
 }
 
 /** The server component of a canonical `<server>__<tool>` name. Server keys contain no `__`. */
@@ -31,6 +35,15 @@ export function serverOf(canonical: string): string {
 }
 
 const deny = (reason: DenyReason, rule: string): Decision => ({ allow: false, reason, rule });
+
+/**
+ * The approve glob a call matches, if any. Not part of `decide`: an allowed tool stays listed and
+ * callable, and approval is a question put to a human at call time, not a verdict on the name.
+ * Matched against the canonical name, so a rename cannot dodge it.
+ */
+export function needsApproval(profile: ProfileConfig | undefined, canonical: string): string | undefined {
+  return profile?.approve.find((glob) => globMatch(glob, canonical));
+}
 
 /**
  * Step 2 on its own. Resources are addressed by URI, and the globs are written against tool
@@ -74,6 +87,9 @@ export function decide(canonical: string, facts: Facts): Decision {
 
     if (facts.drifted && facts.onDrift === "block") {
       return deny("drift_blocked", "guard: changed since it was pinned");
+    }
+    if (facts.suspicious && facts.onSuspicious === "block") {
+      return deny("suspicious_blocked", "guard: reads like injected instructions");
     }
     if (facts.serverState !== "up") {
       return deny("server_unavailable", `server is ${facts.serverState ?? "unknown"}`);

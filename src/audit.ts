@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
-import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
+import {
+  closeSync,
+  createWriteStream,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  writeSync,
+  type WriteStream,
+} from "node:fs";
 import { join, resolve } from "node:path";
 import { canonicalJson, type Guard } from "./guard.js";
 import type { Config } from "./config.js";
@@ -11,6 +19,9 @@ export type AuditDecision =
   | "server_not_in_profile"
   | "unknown_profile"
   | "drift_blocked"
+  | "suspicious_blocked"
+  | "approval_denied"
+  | "approval_unavailable"
   | "server_unavailable"
   | "rate_limited"
   | "unroutable";
@@ -34,6 +45,8 @@ export interface AuditLine {
   truncated?: boolean;
   /** Answered from the response cache, without a backend round-trip. */
   cached?: boolean;
+  /** A human approved this call in the client before it ran (`profiles.*.approve`). */
+  approved?: boolean;
   result?: unknown;
   error?: { code: number; message: string };
   [key: string]: unknown;
@@ -50,15 +63,17 @@ function lineId(): string {
 }
 
 /**
- * One JSON object per line in `audit/YYYY-MM-DD.jsonl`, UTC (SPEC §7). Writes go through a
- * stream and are never awaited by the request path — durability here is deliberately
- * best-effort, this is a personal tool and not a compliance system (ARCHITECTURE §5).
+ * One JSON object per line in `audit/YYYY-MM-DD.jsonl`, UTC (SPEC §7). By default writes go
+ * through a stream and are never awaited by the request path — best-effort, since this is a
+ * personal tool and not a compliance system (ARCHITECTURE §5). `durable` trades that for fsync.
  */
 export class AuditLog {
   readonly dir: string;
   /** Sees every line as it is written — `mcpgw start --verbose` mirrors them to stderr. */
   onWrite?: (line: AuditLine) => void;
   #stream?: WriteStream;
+  /** Used instead of the stream under `audit.durable`. */
+  #fd?: number;
   #date?: string;
 
   constructor(
@@ -71,15 +86,23 @@ export class AuditLog {
   /**
    * Fire and forget. Never throws: a failed log line must not fail the call it describes.
    *
-   * ponytail: best-effort, buffered by the stream, so a hard crash can lose the last few lines.
-   * Upgrade: fsync per line, at a real throughput cost.
+   * By default the stream buffers, so a hard crash can lose the last few lines. `durable: true`
+   * appends and fsyncs each line synchronously instead.
+   * ponytail: synchronously — every audited request blocks the event loop on a disk flush. That
+   * is the price of surviving a crash; leave it off unless losing lines costs more.
    */
   write(line: AuditInput): void {
     try {
       const today = new Date().toISOString().slice(0, 10);
       if (today !== this.#date) this.#rotate(today);
       const full = { ts: new Date().toISOString(), id: lineId(), ...line };
-      this.#stream?.write(`${JSON.stringify(full)}\n`);
+      const text = `${JSON.stringify(full)}\n`;
+      if (this.#fd !== undefined) {
+        writeSync(this.#fd, text);
+        fsyncSync(this.#fd);
+      } else {
+        this.#stream?.write(text);
+      }
       this.onWrite?.(full);
     } catch {
       // Losing an audit line is preferable to losing the request.
@@ -108,9 +131,17 @@ export class AuditLog {
 
   #rotate(today: string): void {
     this.#stream?.end();
+    this.#stream = undefined;
+    if (this.#fd !== undefined) closeSync(this.#fd);
+    this.#fd = undefined;
     mkdirSync(this.dir, { recursive: true });
-    this.#stream = createWriteStream(join(this.dir, `${today}.jsonl`), { flags: "a" });
-    this.#stream.on("error", () => {});
+    const path = join(this.dir, `${today}.jsonl`);
+    if (this.cfg.durable) {
+      this.#fd = openSync(path, "a");
+    } else {
+      this.#stream = createWriteStream(path, { flags: "a" });
+      this.#stream.on("error", () => {});
+    }
     this.#date = today;
   }
 
@@ -127,6 +158,8 @@ export class AuditLog {
     const stream = this.#stream;
     this.#stream = undefined;
     this.#date = undefined;
+    if (this.#fd !== undefined) closeSync(this.#fd);
+    this.#fd = undefined;
     if (stream) await new Promise<void>((done) => stream.end(done));
   }
 }

@@ -92,9 +92,11 @@ export class Pool {
     // any session is told the listing changed.
     for (const backend of this.backends.values()) {
       if (backend.state !== "up") continue;
-      for (const change of this.guard?.review(backend.name, backend.tools) ?? []) {
-        this.log(change.kind, { ...change, kind: undefined });
-      }
+      const changes = [
+        ...(this.guard?.review(backend.name, backend.tools) ?? []),
+        ...(this.guard?.reviewPrompts(backend.name, backend.prompts) ?? []),
+      ];
+      for (const change of changes) this.log(change.kind, { ...change, kind: undefined });
     }
     this.catalog = Catalog.build(this.backends.values());
     this.onCatalogChange?.();

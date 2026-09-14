@@ -62,6 +62,9 @@ profiles:
     rename:
       github__create_issue: file_bug
       fs__read_text_file: read_file
+    approve:                 # these wait for a human's yes in the calling client
+      - "github__create_pull_request"
+      - "fs__write_file"
     limits:
       rpm: 60
       concurrent: 4
@@ -69,6 +72,9 @@ profiles:
 guard:
   pin_tools: true
   on_drift: block            # block | warn
+  on_suspicious: warn        # off | warn | block — descriptions that read like injected instructions
+  # scan_patterns: ["(?i)bitcoin"]   # added to the built-in ones
+  approval_timeout_ms: 120000
   max_result_bytes: 262144
   redact:
     - "gh[pousr]_[A-Za-z0-9]{16,}"
@@ -79,3 +85,4 @@ audit:
   dir: ./audit
   log_args: hashed           # full | hashed | none
   log_results: none          # full | truncated | none
+  durable: false             # true: fsync every line, synchronously

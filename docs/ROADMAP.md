@@ -146,12 +146,14 @@ existing three dependencies only.
 
 **Exit:** a saturated backend does not delay another; a cached call audits `cached: true`.
 
-## Phase 9 — Brakes
+## Phase 9 — Brakes · *done*
 
 - `profiles.*.approve` globs: the gateway asks the calling client through `elicitation/create`,
-  failing closed when the client cannot elicit
-- Heuristic content scanning of descriptions (`guard.on_suspicious`), prompt pinning, redaction
-  across adjacent text blocks, opt-in `audit.durable`
+  failing closed when the client cannot elicit, declines, dismisses or does not answer
+- Heuristic content scanning of tools and prompts (`guard.on_suspicious`), on first sight as well
+  as on change, cleared only by `mcpgw pin` of that exact hash
+- Prompt pinning, in its own `prompts` section of the lockfile
+- Redaction across adjacent text blocks; opt-in `audit.durable`
 
 **Exit:** an approve-listed call is refused unless the human accepts it in the client.
 
@@ -186,8 +188,8 @@ accommodates them. *(Done after cutover, as planned: the catalog took them witho
 |------|---------------|
 | SQLite audit + `mcpgw query` | A `jq` invocation you want takes more than one line |
 | Read-only web dashboard | You check the log more than weekly |
-| Approval prompts for high-risk tools | An auto-approved destructive call actually burns you |
-| Content scanning for injected instructions | Description pinning proves insufficient in practice |
+| ~~Approval prompts for high-risk tools~~ | *Done in Phase 9, through MCP elicitation* |
+| ~~Content scanning for injected instructions~~ | *Done in Phase 9, as heuristics* |
 | ~~Response cache for idempotent tools~~ | *Done in Phase 8, opt-in per server* |
 | ~~Per-server concurrency limits~~ | *Done in Phase 8, with per-server rpm as well* |
 | Config hot-reload without SIGHUP | Restarting becomes a genuine irritation — *done in Phase 5: Windows has no SIGHUP, so `POST /reload` and `mcpgw reload` exist* |
@@ -204,11 +206,11 @@ at the relevant code site so they surface later.
 | Ceiling | Impact | Upgrade |
 |---------|--------|---------|
 | Rate limits persisted only on graceful shutdown | A crash resets the buckets | Write them periodically |
-| Best-effort audit writes | A crash can lose the last few lines | `fsync` per line, at a real throughput cost |
+| Best-effort audit writes by default | A crash can lose the last few lines | `audit.durable: true` (Phase 9) |
 | No session persistence | Restart forces clients to re-initialize | MCP already handles this; leave it |
 | `tools/list` pagination collapsed | A backend with 1000 tools returns one large page | Paginate the merged catalog |
 | Single process | One core ceiling | Multiple daemons on different ports |
-| Drift detection is hash-only | Catches change, not malice on first sight | Content scanning (deferred above) |
-| Prompts are not pinned | A prompt rewritten after approval is not caught | Hash prompts as well as tools; the guard already takes an arbitrary shape |
+| Content scanning is regex heuristics | Catches careless injections, not careful ones | A model-based review |
+| Approval waits hold rate-limit slots | A human who walks away holds a slot for `approval_timeout_ms` | Release slots while waiting, re-acquire on yes |
 | Process trees are not cleaned up after a crash | A crashed launcher can leave its children | Own the spawn, detached, and signal the process group |
 | Response cache evicts oldest-first | A hot key can be evicted | True LRU |

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ProfileConfig } from "../src/config.js";
-import { decide, serverOf, type Decision, type Facts } from "../src/policy.js";
+import { decide, needsApproval, serverOf, type Decision, type Facts } from "../src/policy.js";
 
 /** Flattens a decision to one comparable label. */
 const verdict = (d: Decision) => (d.allow ? "allow" : d.reason);
@@ -9,6 +9,7 @@ const verdict = (d: Decision) => (d.allow ? "allow" : d.reason);
 const profile = (over: Partial<ProfileConfig> = {}): ProfileConfig => ({
   servers: ["*"],
   deny: [],
+  approve: [],
   rename: {},
   limits: { rpm: 120, concurrent: 8 },
   ...over,
@@ -102,4 +103,18 @@ test("serverOf splits on the first double underscore", () => {
   assert.equal(serverOf("gh__create_issue"), "gh");
   assert.equal(serverOf("gh__a__b"), "gh");
   assert.equal(serverOf("bare"), "");
+});
+
+test("a suspicious tool is blocked only under on_suspicious: block, and after drift", () => {
+  const with_ = (over: Partial<Facts>) => verdict(decide("github__x", facts(over)));
+  assert.equal(with_({ suspicious: true, onSuspicious: "warn" }), "allow");
+  assert.equal(with_({ suspicious: true, onSuspicious: "block" }), "suspicious_blocked");
+  assert.equal(with_({ suspicious: true, onSuspicious: "block", drifted: true }), "drift_blocked");
+});
+
+test("approval matches the canonical name, and is not a denial", () => {
+  const careful = profile({ approve: ["github__delete_*"] });
+  assert.equal(needsApproval(careful, "github__delete_repo"), "github__delete_*");
+  assert.equal(needsApproval(careful, "github__list_repos"), undefined);
+  assert.equal(verdict(decide("github__delete_repo", facts({ profile: careful }))), "allow");
 });

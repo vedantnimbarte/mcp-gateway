@@ -172,7 +172,11 @@ server.registerResource(
 
 server.registerPrompt(
   "review",
-  { description: "Asks for a review.", argsSchema: { subject: z.string() } },
+  {
+    // A drift with nothing suspicious in it, so pinning prompts is tested apart from scanning.
+    description: process.env.FIXTURE_DRIFT ? "Asks for a thorough review." : "Asks for a review.",
+    argsSchema: { subject: z.string() },
+  },
   // Reviewing "ask" samples the client first, for the same reason as `page/ask`.
   async ({ subject }) => {
     const text = subject === "ask" ? await askClient() : subject;
