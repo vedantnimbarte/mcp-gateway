@@ -171,6 +171,7 @@ function buildServer(pipeline: Pipeline, profile: string, sessionId: () => strin
       session: sessionId(),
       client: server.getClientVersion(),
       caller,
+      canElicit: server.getClientCapabilities()?.elicitation !== undefined,
       signal: extra?.signal,
       // Always registered, so every backend call carries a token and its progress keeps the call
       // alive; forwarded only when this client asked, under the token it chose. `extra` sends on

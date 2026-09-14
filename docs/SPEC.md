@@ -78,6 +78,9 @@ profiles:
     rename:
       github__create_issue: file_bug
       fs__read_text_file: read_file
+    approve:                 # these wait for a human's yes in the calling client
+      - "github__create_pull_request"
+      - "fs__write_file"
     limits:
       rpm: 60
       concurrent: 4
@@ -85,6 +88,9 @@ profiles:
 guard:
   pin_tools: true
   on_drift: block            # block | warn
+  on_suspicious: warn        # off | warn | block — descriptions that read like injected instructions
+  # scan_patterns: ["(?i)bitcoin"]   # added to the built-in ones
+  approval_timeout_ms: 120000
   max_result_bytes: 262144
   redact:
     - "gh[pousr]_[A-Za-z0-9]{16,}"
@@ -95,6 +101,7 @@ audit:
   dir: ./audit
   log_args: hashed           # full | hashed | none
   log_results: none          # full | truncated | none
+  durable: false             # true: fsync every line, synchronously
 ```
 
 ### 1.3 Schema (zod)
@@ -142,6 +149,7 @@ const Profile = z.object({
   allow:   z.array(z.string()).optional(),   // absent = all not denied
   deny:    z.array(z.string()).default([]),
   rename:  z.record(z.string()).default({}), // canonical -> alias
+  approve: z.array(z.string()).default([]),  // globs on the canonical name (§5 step 4¼)
   limits:  z.object({
     rpm:        z.number().int().positive().default(120),
     concurrent: z.number().int().positive().default(8),
@@ -165,13 +173,17 @@ const Config = z.object({
   guard: z.object({
     pin_tools:        z.boolean().default(true),
     on_drift:         z.enum(["block", "warn"]).default("block"),
+    on_suspicious:    z.enum(["off", "warn", "block"]).default("warn"),
+    scan_patterns:    z.array(z.string()).default([]),
     max_result_bytes: z.number().int().positive().default(262144),
     redact:           z.array(z.string()).default([]),
+    approval_timeout_ms: z.number().int().positive().default(120000),
   }).default({}),
   audit: z.object({
     dir:         z.string().default("./audit"),
     log_args:    z.enum(["full", "hashed", "none"]).default("hashed"),
     log_results: z.enum(["full", "truncated", "none"]).default("none"),
+    durable:     z.boolean().default(false),
   }).default({}),
 });
 ```
@@ -219,9 +231,15 @@ decide(profile, canonicalName) -> Decision
 4. profile.allow present
      and no allow glob matches           -> DENY  not_allowed
 5. tool marked DRIFTED and on_drift=block-> DENY  drift_blocked
+5b. tool marked SUSPICIOUS
+     and on_suspicious=block             -> DENY  suspicious_blocked
 6. server state != UP                    -> DENY  server_unavailable
 7. otherwise                             -> ALLOW
 ```
+
+Prompts go through the same function, with their own drift and suspicious marks (§6).
+Approval (`profiles.*.approve`) is deliberately not a step here: an approve-listed tool is
+allowed, listed and callable, and the question is put to a human at call time (§5).
 
 Order is normative. **Deny is checked before allow** — an allow entry can never resurrect a
 denied tool. Every step is fail-closed: any error inside `decide` is a DENY.
@@ -235,7 +253,8 @@ the alias — otherwise renaming would be a policy bypass).
 ### 3.3 Effect on listings
 
 `tools/list` returns only ALLOW tools. Drifted tools under `on_drift: warn` are listed with
-`⚠ [unverified change] ` prefixed to their description.
+`⚠ [unverified change] ` prefixed to their description, and suspicious ones under
+`on_suspicious: warn` with `⚠ [suspicious content] `. `prompts/list` does the same.
 
 ## 4. MCP surface
 
@@ -300,6 +319,11 @@ paths above; leaks here are how a gateway grows a memory leak and a cross-talk b
 3. limit     profile bucket + semaphore, then the server's (§8)    [reject -> -32005]
 4. guard-in  hash check (already in policy step 5) + validate args against inputSchema
                                                                    [invalid -> -32602]
+4¼. approve  if an approve glob matches the canonical name, ask the calling client with
+             `elicitation/create` (redacted arguments, ≤ 2 KB) and wait up to
+             `approval_timeout_ms`. Only `accept` with `approve: true` continues, and the
+             audit line then carries `approved: true`   [no/timeout -> -32004 approval_denied]
+                                    [client cannot elicit -> -32004 approval_unavailable]
 4½. cache    a server that caches this tool answers a repeat from its cache: audited with
              `cached: true`, then straight to step 8
 5. dispatch  backend.call(originalTool, args, timeout)             [timeout -> -32002]
@@ -327,6 +351,8 @@ sha256( JSON.stringify({ name, description: description ?? "", inputSchema })
 Sorted keys because backends do not guarantee key order across restarts; without sorting
 every restart looks like drift.
 
+Prompts are pinned the same way, hashing `{ name, description ?? "", arguments ?? [] }`.
+
 ### 6.2 `tools.lock.json`
 
 ```json
@@ -338,9 +364,18 @@ every restart looks like drift.
       "create_issue": { "hash": "sha256:1f3a…", "seen": "2026-08-31T10:04:00Z" },
       "list_issues":  { "hash": "sha256:9b02…", "seen": "2026-08-31T10:04:00Z" }
     }
+  },
+  "prompts": {
+    "github": {
+      "review_pr": { "hash": "sha256:5c1e…", "seen": "2026-08-31T10:04:00Z" }
+    }
   }
 }
 ```
+
+Each pin also records its `description`, so `mcpgw pin` can show a diff, and `approved: true` once
+a human has accepted that exact hash despite the content scan. `prompts` is optional: a lockfile
+written before prompts were pinned simply pins them on first sight.
 
 ### 6.3 Rules
 
@@ -350,13 +385,23 @@ every restart looks like drift.
 | Hash matches | Normal |
 | Hash differs | Mark DRIFTED; `block` (default) removes it from listings and refuses calls; `warn` lists it flagged. Log `drift`, printing a description diff to stderr |
 | Tool in lockfile, absent from server | Log `removed`; entry kept until `mcpgw pin` |
-| `pin_tools: false` | Skip entirely |
+| Content scan finds something | Mark SUSPICIOUS, whether the tool is new or changed; `warn` (default) lists it flagged, `block` refuses it, `off` skips the scan. Log `suspicious` with the findings |
+| `pin_tools: false` | Skip entirely, scan included |
 
-`mcpgw pin` prints every pending change as a diff and rewrites the lockfile. `--yes` skips
-the prompt, and then asks a running daemon to reload: a reload re-reads the lockfile and unblocks
-exactly the changes it now records. An unreadable lockfile on reload keeps the pins in memory —
-believing an empty one would re-pin every drifted tool as new. There is intentionally no auto-accept-on-drift mode: silent acceptance would
-defeat the entire mechanism.
+The content scan runs on every review, over every string a tool or prompt shows the model:
+description, title, and every string in its `inputSchema` or `arguments`. It looks for
+instruction overrides ("ignore previous instructions"), concealment ("do not tell the user"),
+hidden directive tags (`<IMPORTANT>`), invisible and bidi-control characters, credential paths
+(`id_rsa`, `.ssh/`) and exfiltration phrasing ("send … to https://"), plus any
+`guard.scan_patterns`. These are heuristics, and a hit is a reason for a human to look. Only
+`mcpgw pin` of that exact hash clears it.
+
+`mcpgw pin` prints every pending change — drift as a diff, findings as a list — and rewrites
+the lockfile. `--yes` skips the prompt, and then asks a running daemon to reload: a reload
+re-reads the lockfile and unblocks exactly the changes it now records. An unreadable lockfile on
+reload keeps the pins in memory — believing an empty one would re-pin every drifted tool as new.
+There is intentionally no auto-accept-on-drift mode: silent acceptance would defeat the entire
+mechanism.
 
 ## 7. Audit
 
@@ -385,7 +430,8 @@ append-only.
 
 | Field | Notes |
 |-------|-------|
-| `decision` | `allow` \| `denied_by_policy` \| `not_allowed` \| `server_not_in_profile` \| `unknown_profile` \| `drift_blocked` \| `server_unavailable` \| `rate_limited` \| `unroutable` |
+| `decision` | `allow` \| `denied_by_policy` \| `not_allowed` \| `server_not_in_profile` \| `unknown_profile` \| `drift_blocked` \| `suspicious_blocked` \| `approval_denied` \| `approval_unavailable` \| `server_unavailable` \| `rate_limited` \| `unroutable` |
+| `approved` | `true` when a human approved the call before it ran |
 | `status` | `ok` \| `error` \| `timeout` \| `denied` |
 | `args` | Present only when `log_args: full`, post-redaction |
 | `args_hash` | Present when `log_args: hashed` — sha256 of canonical JSON |
@@ -393,9 +439,11 @@ append-only.
 | `error` | `{ code, message }` on failure, redacted |
 
 Also logged, with `method` set accordingly: `initialize` (session open), `session_close`,
-`backend_up`, `backend_down`, `drift`, `pinned`. A refusal is a request too: a resource URI that
-is malformed or outside the profile gets its line like a denied tool call. Writes go through a
-stream and are never awaited by the request path.
+`backend_up`, `backend_down`, `drift`, `pinned`, `suspicious`. A refusal is a request too: a
+resource URI that is malformed or outside the profile gets its line like a denied tool call.
+Writes go through a stream and are never awaited by the request path. Under `audit.durable`
+each line is instead appended and fsynced synchronously, surviving a crash at the cost of a
+blocking flush per request.
 
 ## 8. Rate limiting
 
@@ -427,7 +475,7 @@ session had already released.
 | `-32602` | Invalid params | Args fail the backend's `inputSchema` |
 | `-32002` | Request timeout | `call_timeout_ms` elapsed without progress, or `max_call_ms` elapsed |
 | `-32003` | Backend unavailable | Server DOWN, or died mid-call |
-| `-32004` | Blocked by policy | Any DENY from §3.1 steps 2–5 |
+| `-32004` | Blocked by policy | Any DENY from §3.1 steps 2–5b, or an approval refused or impossible (§5 step 4¼) |
 | `-32005` | Rate limited | Bucket or semaphore exhausted |
 | `-32006` | Unroutable reverse request | §4.2 |
 

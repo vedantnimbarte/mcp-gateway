@@ -130,7 +130,7 @@ Ordered by likely regret. Nothing here blocks v1.
 |----------|----------|
 | SQLite-backed audit | JSONL + `jq` stops answering your questions |
 | Read-only web dashboard | You want to look at the log more than once a week |
-| Human-in-the-loop approval for high-risk tools | You actually get burned by an auto-approved destructive call |
-| Content-based prompt-injection scanning | Description pinning proves insufficient |
+| ~~Human-in-the-loop approval for high-risk tools~~ | *Built in Phase 9 (ROADMAP), through MCP elicitation* |
+| ~~Content-based prompt-injection scanning~~ | *Built as heuristics in Phase 9 (ROADMAP)* |
 | Response caching for idempotent tools | Latency becomes annoying |
 | Shared token / mTLS for LAN exposure | You genuinely need it from another machine |

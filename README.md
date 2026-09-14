@@ -253,6 +253,20 @@ Tools are namespaced `<server>__<tool>` so two servers can both have a `search` 
 colliding. Globs always match the canonical name, never the alias, so renaming can never be
 used to slip past a deny rule.
 
+Some tools you want reachable, but not unattended. List them under `approve`, and each call
+waits for you to say yes in the client that made it:
+
+```yaml
+profiles:
+  coding:
+    servers: [github, fs]
+    approve: ["github__create_pull_request", "fs__write_file"]
+```
+
+The gateway asks through MCP elicitation, showing the tool and its (redacted) arguments. A
+decline, a dismissal, or no answer within `guard.approval_timeout_ms` refuses the call. So does
+a client that cannot elicit at all — an approval that cannot be asked for is never assumed.
+
 ## Resources and prompts
 
 Both are proxied alongside tools, namespaced the same way. Prompts become `<server>__<name>`;
@@ -309,11 +323,19 @@ nothing — either way, configured regex patterns are redacted before anything i
 
 ## Tool pinning
 
-The first time a tool is seen, `sha256(name + description + inputSchema)` goes into
-`tools.lock.json`. Every startup and every `tools/list_changed` re-checks it. If a server
-rewrites a tool description after you approved it, the tool is blocked, the change is logged,
-and a diff is printed. `mcpgw pin` is the only way to accept it, and `mcpgw pin --yes` tells a
-running daemon to reload, so the accepted tool comes back without a restart.
+The first time a tool or prompt is seen, a hash of what it tells the model — name, description,
+and its schema or arguments — goes into `tools.lock.json`. Every startup and every
+`list_changed` re-checks it. If a server rewrites one after you approved it, it is blocked, the
+change is logged, and a diff is printed. `mcpgw pin` is the only way to accept it, and
+`mcpgw pin --yes` tells a running daemon to reload, so the accepted tool comes back without a
+restart.
+
+A hash only notices change. So every description is also scanned for what injected instructions
+tend to look like — "ignore previous instructions", "do not tell the user", `<IMPORTANT>` tags,
+invisible characters, credential paths — including on first sight. By default a hit is flagged
+in the listing (`on_suspicious: warn`); `block` refuses it until `mcpgw pin` shows you the
+findings and you accept them. It is a heuristic: it catches the careless attack, not the
+careful one.
 
 Commit `tools.lock.json`.
 
@@ -329,13 +351,14 @@ Deliberate, and each one is marked in the code:
   backend it kills whatever that backend's launcher left running, but a launcher that crashed on
   its own may leave its children behind.
 - **Rate limits survive only a graceful restart.** A crash resets the buckets.
-- **Audit writes are best-effort.** A hard crash can lose the last few lines.
+- **Audit writes are best-effort by default.** A hard crash can lose the last few lines;
+  `audit.durable: true` fsyncs every line, at the cost of a synchronous write per request.
 - **`tools/list` pagination is collapsed** into a single page.
 - **SSE resumption is in memory.** A client that drops its stream can resume with
   `Last-Event-ID` from the last 256 events (4 MiB) of its session; after a daemon restart, or a
   longer gap, it re-initializes.
-- **Prompts are not pinned.** The guard covers tools; a prompt has no `inputSchema` to hash
-  alongside its text.
+- **Approvals hold their slot.** A call waiting on a human keeps its rate-limit slots for up to
+  `approval_timeout_ms`.
 - **OAuth is authorization-code only.** Client-credentials and device-code flows are not wired,
   and the callback listens on a fixed `127.0.0.1:8419`.
 

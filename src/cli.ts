@@ -115,8 +115,10 @@ async function list(config: Config, configPath: string, only?: string): Promise<
     console.log(`\nprofile ${profile}  (${allowed} of ${rows.length} tools exposed)`);
     for (const row of rows) {
       const renamed = row.exposed === row.entry.canonical ? "" : `  [${row.entry.canonical}]`;
-      const verdict = row.decision.allow ? "allow" : row.decision.reason;
-      console.log(`  ${verdict.padEnd(21)} ${row.exposed.padEnd(40)} ${row.decision.rule}${renamed}`);
+      const approval = row.decision.allow && parts.pipeline.approvalRule(profile, row.entry.canonical);
+      const verdict = row.decision.allow ? (approval ? "approve" : "allow") : row.decision.reason;
+      const rule = approval ? `${row.decision.rule}; approve: ${approval}` : row.decision.rule;
+      console.log(`  ${verdict.padEnd(21)} ${row.exposed.padEnd(40)} ${rule}${renamed}`);
     }
   }
 
@@ -141,12 +143,16 @@ async function pin(
   if (pending.length === 0) console.log("nothing pending; every tool matches its pin");
 
   for (const change of pending) {
+    const name = `${change.server}__${change.tool}${change.of === "prompt" ? "  (prompt)" : ""}`;
     if (change.kind === "drift") {
-      console.log(`\ndrift  ${change.server}__${change.tool}`);
+      console.log(`\ndrift  ${name}`);
       console.log(`  ${change.from.slice(0, 14)}… → ${change.to.slice(0, 14)}…`);
       for (const l of change.diff.split("\n")) console.log(`  ${l}`);
     } else if (change.kind === "removed") {
-      console.log(`\nremoved  ${change.server}__${change.tool}  (pinned, no longer offered)`);
+      console.log(`\nremoved  ${name}  (pinned, no longer offered)`);
+    } else if (change.kind === "suspicious") {
+      console.log(`\nsuspicious  ${name}`);
+      for (const finding of change.findings) console.log(`  ${finding}`);
     }
   }
 

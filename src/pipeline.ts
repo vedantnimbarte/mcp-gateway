@@ -3,6 +3,7 @@ import type {
   CallToolResult,
   CompleteRequest,
   CompleteResult,
+  ElicitResult,
   GetPromptResult,
   Progress,
   Prompt,
@@ -13,11 +14,11 @@ import type {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { AuditInput, AuditLine, AuditLog } from "./audit.js";
 import type { Backend, ReverseTarget } from "./backend.js";
-import { parseUri, type CatalogEntry } from "./catalog.js";
+import { parseUri, type CatalogEntry, type PromptEntry } from "./catalog.js";
 import type { Config } from "./config.js";
 import { ERR, gwError } from "./errors.js";
-import type { Guard } from "./guard.js";
-import { decide, reaches, type Decision } from "./policy.js";
+import type { Guard, Pinned } from "./guard.js";
+import { decide, needsApproval, reaches, type Decision } from "./policy.js";
 import type { Pool } from "./pool.js";
 import { ResponseCache } from "./cache.js";
 import { limitersFor, restoreLimiters, saveLimiters, type Limiters } from "./ratelimit.js";
@@ -43,10 +44,17 @@ export interface CallContext {
   signal?: AbortSignal;
   /** Where the backend's progress for this call goes (SPEC 4.2). */
   onprogress?: (progress: Progress) => void;
+  /** Whether this client declared it can answer `elicitation/create` — what approval needs. */
+  canElicit?: boolean;
 }
 
 /** SPEC §3.3: under `on_drift: warn` a changed tool is still listed, but flagged. */
 const WARN_PREFIX = "⚠ [unverified change] ";
+/** The same, for content the scan flagged under `on_suspicious: warn`. */
+const SUSPICIOUS_PREFIX = "⚠ [suspicious content] ";
+
+/** An approval prompt shows the arguments; past this they are cut, not the prompt refused. */
+const APPROVAL_ARGS_CHARS = 2000;
 
 /**
  * SPEC §5, in order: resolve → policy → limit → guard-in → dispatch → guard-out → audit →
@@ -123,16 +131,11 @@ export class Pipeline {
   visibleTools(profileName: string): Tool[] {
     return this.explain(profileName)
       .filter((row) => row.decision.allow)
-      .map((row) => {
-        const drifted = this.guard.isDrifted(row.entry.server, row.entry.tool);
-        return {
-          ...row.entry.def,
-          name: row.exposed,
-          description: drifted
-            ? WARN_PREFIX + (row.entry.def.description ?? "")
-            : row.entry.def.description,
-        };
-      });
+      .map(({ entry, exposed }) => ({
+        ...entry.def,
+        name: exposed,
+        description: this.#flagged(entry.def.description, entry.server, entry.tool, "tool"),
+      }));
   }
 
   /** Prompts are named like tools, so the same allow/deny decision applies to them. */
@@ -140,8 +143,17 @@ export class Pipeline {
     const profile = this.config.profiles[profileName];
     return this.pool.catalog
       .allPrompts()
-      .filter((entry) => this.#decideNamed(profileName, entry.canonical, entry.server).allow)
-      .map((entry) => ({ ...entry.def, name: profile?.rename[entry.canonical] ?? entry.canonical }));
+      .filter((entry) => this.#decidePrompt(profileName, entry).allow)
+      .map((entry) => ({
+        ...entry.def,
+        name: profile?.rename[entry.canonical] ?? entry.canonical,
+        description: this.#flagged(entry.def.description, entry.server, entry.name, "prompt"),
+      }));
+  }
+
+  /** The approve glob a tool matches in a profile, if any — for `mcpgw list`. */
+  approvalRule(profileName: string, canonical: string): string | undefined {
+    return needsApproval(this.config.profiles[profileName], canonical);
   }
 
   /** Resources are filtered by server membership only (SPEC 4.1). */
@@ -249,6 +261,15 @@ export class Pipeline {
         );
       }
 
+      // 4¼. approval: a human says yes in the calling client, or the call does not happen. Ahead
+      //     of the cache, so a cached answer never stands in for a yes.
+      const rule = needsApproval(this.config.profiles[ctx.profile], canonical);
+      if (rule) {
+        const refusal = await this.#approve(ctx, exposed, canonical, rule, args);
+        if (refusal) return fail(refusal.error, refusal.decision);
+        line.approved = true;
+      }
+
       // 4½. cache: after policy and validation, so a hit can never bypass either. It has spent
       //     rate budget by now — ponytail: move the lookup before step 3 if that ever matters.
       const cacheKey = this.#cache.keyFor(entry.server, entry.tool, entry.def, args);
@@ -340,7 +361,7 @@ export class Pipeline {
       return this.#refuse(line, new McpError(ErrorCode.MethodNotFound, `unknown prompt "${exposed}"`));
     }
 
-    const decision = this.#decideNamed(ctx.profile, entry.canonical, entry.server);
+    const decision = this.#decidePrompt(ctx.profile, entry);
     if (!decision.allow) {
       const code = decision.reason === "server_unavailable" ? ERR.BACKEND_DOWN : ERR.POLICY;
       return this.#refuse(
@@ -409,7 +430,7 @@ export class Pipeline {
       const entry = this.pool.catalog.getPrompt(
         this.#aliases.get(ctx.profile)?.get(params.ref.name) ?? params.ref.name,
       );
-      if (!entry || !this.#decideNamed(ctx.profile, entry.canonical, entry.server).allow) {
+      if (!entry || !this.#decidePrompt(ctx.profile, entry).allow) {
         return this.#refuse(line, new McpError(ErrorCode.MethodNotFound, "unknown prompt"));
       }
       const backend = this.pool.backends.get(entry.server)!;
@@ -545,24 +566,87 @@ export class Pipeline {
     throw error;
   }
 
-  /** The tool decision, for things that are named like tools but are not in the tool catalog. */
-  #decideNamed(profileName: string, canonical: string, server: string): Decision {
-    return decide(canonical, {
-      profile: this.config.profiles[profileName],
-      serverState: this.pool.backends.get(server)?.state,
-      // ponytail: prompts are not pinned, so one rewritten after approval is not caught. Upgrade:
-      // hash name + description + arguments beside the tools; the lockfile takes any shape.
-      drifted: false,
-      onDrift: this.config.guard.on_drift,
+  /**
+   * Puts the call to the human through the client that made it (`elicitation/create`). Fails
+   * closed: a client that cannot elicit, a decline, a dismissal, a timeout and a dropped
+   * connection all refuse. This is the gateway's own request to its own session, so unlike a
+   * backend's reverse request there is nothing to correlate.
+   *
+   * ponytail: the wait holds the call's rate-limit slots. That is the brake working, but a human
+   * who walks away holds a slot for up to `approval_timeout_ms`.
+   */
+  async #approve(
+    ctx: CallContext,
+    exposed: string,
+    canonical: string,
+    rule: string,
+    args: Record<string, unknown> | undefined,
+  ): Promise<{ error: McpError; decision: "approval_denied" | "approval_unavailable" } | undefined> {
+    const refuse = (decision: "approval_denied" | "approval_unavailable", why: string) => ({
+      decision,
+      error: gwError(ERR.POLICY, `"${exposed}" needs approval: ${why}`, {
+        reason: decision,
+        profile: ctx.profile,
+        tool: canonical,
+      }),
     });
+    if (!ctx.canElicit || !ctx.caller) {
+      return refuse("approval_unavailable", "this client cannot be asked (no elicitation support)");
+    }
+
+    // Redacted: the prompt is shown to a person, and may be screenshotted or logged by the client.
+    const shown = JSON.stringify(this.guard.redact(args ?? {}), null, 2);
+    const message = [
+      `Allow ${exposed}${exposed === canonical ? "" : ` (${canonical})`}?`,
+      `Profile "${ctx.profile}" requires approval for it (approve: ${rule}).`,
+      "",
+      shown.length > APPROVAL_ARGS_CHARS ? `${shown.slice(0, APPROVAL_ARGS_CHARS)}\n… (truncated)` : shown,
+    ].join("\n");
+
+    try {
+      const reply = (await ctx.caller.elicitInput(
+        {
+          message,
+          requestedSchema: {
+            type: "object",
+            properties: { approve: { type: "boolean", title: "Allow this call" } },
+            required: ["approve"],
+          },
+        },
+        { timeout: this.config.guard.approval_timeout_ms, signal: ctx.signal },
+      )) as ElicitResult;
+      if (reply.action === "accept" && reply.content?.approve === true) return undefined;
+      return refuse("approval_denied", reply.action === "accept" ? "not approved" : `${reply.action}ed`);
+    } catch (e) {
+      return refuse("approval_denied", `no answer: ${(e as Error).message}`);
+    }
+  }
+
+  /** The tool decision, applied to a prompt: they are named alike, and pinned alike. */
+  #decidePrompt(profileName: string, entry: PromptEntry): Decision {
+    return this.#facts(profileName, entry.canonical, entry.server, entry.name, "prompt");
   }
 
   #decide(profileName: string, entry: CatalogEntry): Decision {
-    return decide(entry.canonical, {
-      profile: this.config.profiles[profileName],
-      serverState: this.pool.backends.get(entry.server)?.state,
-      drifted: this.guard.isDrifted(entry.server, entry.tool),
+    return this.#facts(profileName, entry.canonical, entry.server, entry.tool, "tool");
+  }
+
+  #facts(profile: string, canonical: string, server: string, name: string, of: Pinned): Decision {
+    return decide(canonical, {
+      profile: this.config.profiles[profile],
+      serverState: this.pool.backends.get(server)?.state,
+      drifted: this.guard.isDrifted(server, name, of),
       onDrift: this.config.guard.on_drift,
+      suspicious: this.guard.isSuspicious(server, name, of),
+      onSuspicious: this.config.guard.on_suspicious,
     });
+  }
+
+  /** SPEC §3.3: what a listing says about an allowed tool or prompt it still has doubts about. */
+  #flagged(description: string | undefined, server: string, name: string, of: Pinned) {
+    let flags = "";
+    if (this.guard.isDrifted(server, name, of)) flags += WARN_PREFIX;
+    if (this.guard.isSuspicious(server, name, of)) flags += SUSPICIOUS_PREFIX;
+    return flags ? flags + (description ?? "") : description;
   }
 }
