@@ -9,6 +9,9 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { AuditLog, recentLines } from "./audit.js";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard.js";
 import { ConfigError, isLoopback, loadConfig, type Config } from "./config.js";
+import { LayoutError, setServerDisabled, setToolDenied } from "./configfile.js";
+import { globMatch } from "./glob.js";
+import { serverOf } from "./policy.js";
 import { Guard } from "./guard.js";
 import { BackendAuth, TokenStore } from "./oauth.js";
 import { Pipeline } from "./pipeline.js";
@@ -50,8 +53,8 @@ export function assemble(
     audit.write({ method: event, ...fields });
   };
   const tokens = new TokenStore(TokenStore.pathFor(configPath));
-  const authFor = (server: string) => {
-    const cfg = config.servers[server];
+  const authFor = (server: string, current: Config) => {
+    const cfg = current.servers[server];
     if (!cfg || cfg.transport === "stdio" || cfg.auth !== "oauth") return undefined;
     if (cfg.oauth_grant === "client_credentials") {
       // Machine-to-machine: the SDK fetches a token itself whenever it has none, so there is no
@@ -66,7 +69,7 @@ export function assemble(
       scope: cfg.scope,
       clientId: cfg.client_id,
       clientSecret: cfg.client_secret,
-      callbackPort: config.listen.oauth_callback_port,
+      callbackPort: current.listen.oauth_callback_port,
     });
   };
 
@@ -172,9 +175,51 @@ export async function startGateway(
     audit.write({ method: "unauthorized", path, remote: req.socket.remoteAddress });
     send(res, 401, { error: "unauthorized" });
   };
-  /** Who reloaded, restarted or stopped the gateway, and whether it worked. */
+  /** Who reloaded, restarted, stopped or reconfigured the gateway, and whether it worked. */
   const manage = (req: IncomingMessage, action: string, status: "ok" | "error", fields = {}) =>
     audit.write({ method: "manage", action, status, remote: req.socket.remoteAddress, ...fields });
+
+  /** The config the daemon is running, which after a reload is no longer the one it started with. */
+  let current = config;
+  let changing: Promise<unknown> = Promise.resolve();
+  /** One config change at a time: two overlapping reloads would each diff against a half-applied pool. */
+  const serially = (fn: () => Promise<void>): Promise<void> => {
+    const run = changing.then(fn, fn);
+    changing = run.catch(() => {});
+    return run;
+  };
+
+  /** Writes config.yaml through `write`, then reloads what it wrote. A refused edit changes nothing. */
+  async function saveAndReload(
+    req: IncomingMessage,
+    res: ServerResponse,
+    action: string,
+    fields: Record<string, string>,
+    write: (file: string) => Config,
+  ): Promise<void> {
+    const file = opts.configPath;
+    if (!file) {
+      send(res, 404, { error: "this gateway was not started from a config file" });
+      return;
+    }
+    await serially(async () => {
+      let next: Config;
+      try {
+        next = write(file);
+      } catch (e) {
+        const known = e instanceof ConfigError || e instanceof LayoutError;
+        if (!known) throw e;
+        const problems = e instanceof ConfigError ? e.problems : [e.message];
+        manage(req, action, "error", { ...fields, problems });
+        // 409 for a layout the splice will not touch: the edit itself was fine, the YAML is the obstacle.
+        send(res, e instanceof LayoutError ? 409 : 400, { status: "unchanged", problems });
+        return;
+      }
+      await gateway.reload(next);
+      manage(req, action, "ok", fields);
+      send(res, 200, { status: "saved", ...fields });
+    });
+  }
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://localhost");
@@ -231,35 +276,42 @@ export async function startGateway(
         send(res, 404, { error: "this gateway was not started from a config file" });
         return;
       }
-      try {
-        const { config: next } = loadConfig(opts.configPath);
-        await gateway.reload(next);
-        manage(req, "reload", "ok");
-        send(res, 200, { status: "reloaded", config: opts.configPath });
-      } catch (e) {
-        const problems = e instanceof ConfigError ? e.problems : [(e as Error).message];
-        manage(req, "reload", "error", { problems });
-        send(res, 400, { status: "unchanged", problems });
-      }
+      const configPath = opts.configPath;
+      await serially(async () => {
+        try {
+          const { config: next } = loadConfig(configPath);
+          await gateway.reload(next);
+          manage(req, "reload", "ok");
+          send(res, 200, { status: "reloaded", config: configPath });
+        } catch (e) {
+          const problems = e instanceof ConfigError ? e.problems : [(e as Error).message];
+          manage(req, "reload", "error", { problems });
+          send(res, 400, { status: "unchanged", problems });
+        }
+      });
       return;
     }
 
-    // The status page's stop button. Management beyond reload and restart needs a token set at
-    // all: with none, loopback reachability would be the only thing between a local process and
-    // taking the gateway down.
-    if (path === "/stop") {
-      if (req.method !== "POST") {
-        send(res, 405, { error: "POST only" });
-        return;
-      }
-      if (!token) {
+    /**
+     * The status page's management routes. Beyond reload and restart they need a token set at all:
+     * with none, loopback reachability would be the only thing between any local process and
+     * stopping or rewriting the gateway. Answers the refusal itself and returns false.
+     */
+    const gated = (method: "GET" | "POST"): boolean => {
+      if (req.method !== method) {
+        send(res, 405, { error: `${method} only` });
+      } else if (!token) {
         send(res, 403, { error: "management requires listen.token" });
-        return;
-      }
-      if (!authorized) {
+      } else if (!authorized) {
         unauthorized(req, res, path);
-        return;
+      } else {
+        return true;
       }
+      return false;
+    };
+
+    if (path === "/stop") {
+      if (!gated("POST")) return;
       if (!opts.onStop) {
         send(res, 404, { error: "this gateway cannot be stopped over HTTP" });
         return;
@@ -292,6 +344,74 @@ export async function startGateway(
       const backend = pool.backends.get(server)!;
       manage(req, "restart", backend.state === "up" ? "ok" : "error", { server });
       send(res, 200, { status: backend.state, server, tools: backend.tools.length, error: backend.lastError });
+      return;
+    }
+
+    // Switching a server off or on is `disabled: true|false` in config.yaml, then a reload: the
+    // file stays the one source of truth, so the next reload or restart cannot quietly undo it.
+    const serverToggle = /^\/servers\/([^/]+)\/(disable|enable)$/.exec(path);
+    if (serverToggle) {
+      if (!gated("POST")) return;
+      const server = decodeURIComponent(serverToggle[1]!);
+      if (!(server in current.servers) && !current.disabled?.includes(server)) {
+        send(res, 404, { error: `no such server "${server}"` });
+        return;
+      }
+      const disabled = serverToggle[2] === "disable";
+      await saveAndReload(req, res, `${serverToggle[2]}_server`, { server }, (file) =>
+        setServerDisabled(file, server, disabled),
+      );
+      return;
+    }
+
+    // What `mcpgw list` prints for one profile, plus which tools the page can switch: an exact
+    // deny entry can be removed, and a tool no deny glob covers can be given one. Globs and allow
+    // lists are left to the YAML.
+    const toolList = /^\/profiles\/([^/]+)\/tools$/.exec(path);
+    if (toolList) {
+      if (!gated("GET")) return;
+      const name = decodeURIComponent(toolList[1]!);
+      const profile = current.profiles[name];
+      if (!profile) {
+        send(res, 404, { error: `unknown profile "${name}"` });
+        return;
+      }
+      const tools = pipeline.explain(name).map(({ entry, exposed, decision }) => {
+        const exact = profile.deny.includes(entry.canonical);
+        const globbed = profile.deny.some((g) => g !== entry.canonical && globMatch(g, entry.canonical));
+        const notAllowed = !decision.allow && decision.reason === "not_allowed";
+        const toggle = globbed ? null : exact ? "enable" : notAllowed ? null : "disable";
+        return {
+          tool: exposed,
+          canonical: entry.canonical,
+          allow: decision.allow,
+          reason: decision.allow ? undefined : decision.reason,
+          rule: decision.rule,
+          toggle,
+        };
+      });
+      tools.sort((a, b) => a.tool.localeCompare(b.tool));
+      send(res, 200, { profile: name, tools });
+      return;
+    }
+
+    const toolToggle = /^\/profiles\/([^/]+)\/tools\/([^/]+)\/(disable|enable)$/.exec(path);
+    if (toolToggle) {
+      if (!gated("POST")) return;
+      const profile = decodeURIComponent(toolToggle[1]!);
+      const tool = decodeURIComponent(toolToggle[2]!);
+      if (!(profile in current.profiles)) {
+        send(res, 404, { error: `unknown profile "${profile}"` });
+        return;
+      }
+      if (!serverOf(tool)) {
+        send(res, 400, { error: `"${tool}" is not a canonical <server>__<tool> name` });
+        return;
+      }
+      const denied = toolToggle[3] === "disable";
+      await saveAndReload(req, res, `${toolToggle[3]}_tool`, { profile, tool }, (file) =>
+        setToolDenied(file, profile, tool, denied),
+      );
       return;
     }
 
@@ -370,6 +490,8 @@ export async function startGateway(
       uptime_s: Math.round(process.uptime()),
       sessions: sessions.size,
       pending_drift: parts.guard.pending().length,
+      profiles: Object.keys(current.profiles),
+      disabled: current.disabled ?? [],
       backends: Object.fromEntries(
         [...pool.backends].map(([name, b]) => [
           name,
@@ -384,6 +506,7 @@ export async function startGateway(
     url: `${tls ? "https" : "http"}://${host}:${port}`,
     sessions,
     async reload(next: Config) {
+      current = next;
       parts.guard.reload(next);
       parts.pipeline.reload(next);
       sessions.reload(next);

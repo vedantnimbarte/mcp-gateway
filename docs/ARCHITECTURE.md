@@ -260,6 +260,7 @@ mcp-gateway/
 └─ src/
    ├─ cli.ts                    # parseArgs → start|status|pin|tail|validate
    ├─ config.ts                 # load, ${ENV} interpolate, zod validate
+   ├─ configfile.ts             # status-page edits to config.yaml: splice, verify, validate, write
    ├─ server.ts                 # node:http listener, loopback interlock, /mcp/<profile>
    ├─ session.ts                # session lifecycle, id remap, progress tokens
    ├─ pipeline.ts               # resolve → policy → limit → guard → dispatch → audit

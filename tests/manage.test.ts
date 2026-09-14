@@ -1,7 +1,7 @@
 // Managing the gateway from the status page: the stop route, the management flag the page reads,
 // the Origin the page sends from a LAN name, and the audit line every action leaves.
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,7 +25,10 @@ servers:
 ${servers}
 profiles:
   default:
+    servers: ["*"]   # every server
+  renamed:
     servers: ["*"]
+    rename: { alpha__echo: shout }
 `;
   const alpha = `  alpha:
     transport: stdio
@@ -135,6 +138,84 @@ test("reload and restart leave a manage line, failures included", async () => {
   const failed = lines.find((l) => l.action === "reload" && l.status === "error");
   assert.ok(failed, "a rejected reload left no line");
   assert.ok(Array.isArray(failed.problems) && failed.problems.length > 0);
+});
+
+test("the config-writing routes need a token configured and presented", async () => {
+  for (const [method, path] of [
+    ["POST", "/servers/alpha/disable"],
+    ["GET", "/profiles/default/tools"],
+    ["POST", "/profiles/default/tools/alpha__echo/disable"],
+  ] as const) {
+    assert.equal((await fetch(`${open.gateway.url}${path}`, { method })).status, 403, path);
+    assert.equal((await fetch(`${managed.gateway.url}${path}`, { method })).status, 401, path);
+  }
+  const url = managed.gateway.url;
+  assert.equal((await fetch(`${url}/servers/nope/disable`, { method: "POST", headers: auth })).status, 404);
+  assert.equal((await fetch(`${url}/profiles/nope/tools`, { headers: auth })).status, 404);
+  const bare = await fetch(`${url}/profiles/default/tools/echo/disable`, { method: "POST", headers: auth });
+  assert.equal(bare.status, 400, "a tool name without its server");
+});
+
+type Health = { backends: Record<string, { state: string }>; disabled: string[]; profiles: string[] };
+type Tools = { tools: Array<{ canonical: string; allow: boolean; rule: string; toggle: string | null }> };
+
+test("disabling a server writes the flag, stops it, and enabling brings it back", async () => {
+  const g = await launch(TOKEN);
+  try {
+    const url = g.gateway.url;
+    const off = await fetch(`${url}/servers/alpha/disable`, { method: "POST", headers: auth });
+    assert.equal(off.status, 200);
+    assert.match(readFileSync(g.configPath, "utf8"), /\n {4}disabled: true\n/);
+    assert.match(readFileSync(g.configPath, "utf8"), /# every server/, "a comment was lost");
+
+    let health = (await (await fetch(`${url}/healthz`, { headers: auth })).json()) as Health;
+    assert.equal(health.backends.alpha, undefined, "the backend is still running");
+    assert.deepEqual(health.disabled, ["alpha"]);
+    assert.deepEqual(health.profiles, ["default", "renamed"]);
+
+    assert.equal((await fetch(`${url}/servers/alpha/enable`, { method: "POST", headers: auth })).status, 200);
+    health = (await (await fetch(`${url}/healthz`, { headers: auth })).json()) as Health;
+    assert.equal(health.backends.alpha?.state, "up");
+    assert.deepEqual(health.disabled, []);
+
+    const actions = (await manageLines(g.parts)).map((l) => `${l.action}:${l.status}`);
+    assert.deepEqual(actions, ["disable_server:ok", "enable_server:ok"]);
+  } finally {
+    await g.gateway.close();
+  }
+});
+
+test("a tool is switched off and on per profile through its exact deny entry", async () => {
+  const g = await launch(TOKEN);
+  try {
+    const url = g.gateway.url;
+    const tools = async (profile: string) =>
+      ((await (await fetch(`${url}/profiles/${profile}/tools`, { headers: auth })).json()) as Tools).tools;
+    const echo = async (profile: string) => (await tools(profile)).find((t) => t.canonical === "alpha__echo")!;
+
+    assert.equal((await echo("default")).toggle, "disable");
+    const off = await fetch(`${url}/profiles/default/tools/alpha__echo/disable`, { method: "POST", headers: auth });
+    assert.equal(off.status, 200);
+    const denied = await echo("default");
+    assert.deepEqual([denied.allow, denied.rule, denied.toggle], [false, "deny: alpha__echo", "enable"]);
+    assert.equal((await echo("renamed")).allow, true, "another profile was affected");
+
+    assert.equal(
+      (await fetch(`${url}/profiles/default/tools/alpha__echo/enable`, { method: "POST", headers: auth })).status,
+      200,
+    );
+    assert.equal((await echo("default")).allow, true);
+
+    // Denying a renamed tool would leave an alias that can never be exposed: refused, file untouched.
+    const before = readFileSync(g.configPath, "utf8");
+    const bad = await fetch(`${url}/profiles/renamed/tools/alpha__echo/disable`, { method: "POST", headers: auth });
+    assert.equal(bad.status, 400);
+    assert.match(((await bad.json()) as { problems: string[] }).problems.join(), /denied by this profile/);
+    assert.equal(readFileSync(g.configPath, "utf8"), before);
+    assert.ok((await manageLines(g.parts)).some((l) => l.action === "disable_tool" && l.status === "error"));
+  } finally {
+    await g.gateway.close();
+  }
 });
 
 test("the status page ships its controls, and they call the gated routes", async () => {

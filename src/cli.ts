@@ -202,6 +202,8 @@ interface Health {
     string,
     { state: string; tools: number; restarts: number; pid: number | null; error?: string }
   >;
+  /** Absent from a daemon older than `disabled: true`. */
+  disabled?: string[];
 }
 
 /** Best effort: the URL is always printed, so a failed opener costs nothing. */
@@ -515,6 +517,8 @@ async function status(config: Config, asJson?: boolean): Promise<number> {
     const restarts = b.restarts > 0 ? `  ${b.restarts} restart(s)` : "";
     console.log(`  ${b.state.padEnd(11)} ${name.padEnd(16)} ${detail}${restarts}`);
   }
+  // Switched off on purpose, so not a reason to exit 1.
+  for (const name of health.disabled ?? []) console.log(`  ${"disabled".padEnd(11)} ${name}`);
   return Object.values(health.backends).some((b) => b.state !== "up") ? 1 : 0;
 }
 

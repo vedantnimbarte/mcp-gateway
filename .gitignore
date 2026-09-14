@@ -40,3 +40,7 @@ desktop.ini
 
 # Local config overrides — config.yaml itself is committed
 config.local.yaml
+
+# What the status page leaves beside config.yaml when it saves a change
+*.yaml.bak
+*.yaml.*.tmp
