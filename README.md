@@ -48,14 +48,27 @@ dependencies: the MCP SDK, `yaml`, and `zod`.
 
 ## Install
 
-Not published to npm. Build it from the repository:
+Not published to npm. Install it straight from GitHub — npm clones the repository and builds it
+during install:
 
 ```bash
-npm install && npm run build
+npm install -g github:vedantnimbarte/mcp-gateway
 ```
 
-That produces `dist/src/cli.js` (`mcpgw`) and `dist/src/bridge.js` (`mcpgw-bridge`). Link them
-onto your `PATH` with `npm link` if you want the bare command names.
+That puts `mcpgw` and `mcpgw-bridge` on your `PATH`. The bridge script the client configs below
+point at is `$(npm root -g)/mcp-gateway/dist/src/bridge.js`.
+
+### From source
+
+```bash
+git clone https://github.com/vedantnimbarte/mcp-gateway.git
+cd mcp-gateway
+npm install
+```
+
+`npm install` also builds, producing `dist/src/cli.js` (`mcpgw`) and `dist/src/bridge.js`
+(`mcpgw-bridge`); after editing the source, rebuild with `npm run build`. Link them onto your
+`PATH` with `npm link` if you want the bare command names.
 
 ## Configure
 

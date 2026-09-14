@@ -9,11 +9,15 @@
     "mcpgw": "dist/src/cli.js",
     "mcpgw-bridge": "dist/src/bridge.js"
   },
+  "files": [
+    "dist/src"
+  ],
   "engines": {
     "node": ">=22.13"
   },
   "scripts": {
     "build": "tsc",
+    "prepare": "tsc",
     "typecheck": "tsc --noEmit",
     "validate": "npm run build --silent && node dist/src/cli.js validate",
     "test": "npm run build --silent && cd dist && node --test"
