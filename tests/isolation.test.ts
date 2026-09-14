@@ -188,13 +188,22 @@ profiles:
   await own.pool.start();
   assert.equal(own.pool.backends.get("wrapped")?.state, "up");
   const straggler = Number(readFileSync(pidFile, "utf8"));
-  assert.ok(alive(straggler), "the straggler should be running while the backend is");
+  try {
+    assert.ok(alive(straggler), "the straggler should be running while the backend is");
 
-  await own.pool.close();
-  await own.audit.close();
-  const deadline = Date.now() + 5000;
-  while (alive(straggler) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
-  assert.equal(alive(straggler), false, "the launcher's child outlived the backend");
+    await own.pool.close();
+    await own.audit.close();
+    const deadline = Date.now() + 5000;
+    while (alive(straggler) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    assert.equal(alive(straggler), false, "the launcher's child outlived the backend");
+  } finally {
+    // Never leave it behind, even when this test fails: a detached process can hold a CI step open.
+    try {
+      process.kill(straggler, "SIGKILL");
+    } catch {
+      // already gone, as it should be
+    }
+  }
 });
 
 function alive(pid: number): boolean {
