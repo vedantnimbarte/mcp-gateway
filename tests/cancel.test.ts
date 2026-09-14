@@ -101,6 +101,24 @@ test("one client's cancellation does not disturb another's call", async () => {
   assert.equal(await cancellations(first), before + 1, "exactly one call was cancelled");
 });
 
+test("ending a session cancels the calls it left running (SPEC 4.3)", async () => {
+  const observer = await open();
+  const before = await cancellations(observer);
+
+  const leaving = new Client({ name: "leaving", version: "0.0.0" });
+  const transport = new StreamableHTTPClientTransport(new URL(`${gateway.url}/mcp/default`));
+  await leaving.connect(transport);
+  const call = leaving.callTool({ name: "alpha__sleep", arguments: { ms: 4000 } });
+  await new Promise((r) => setTimeout(r, 200));
+
+  await transport.terminateSession(); // DELETE: the session is gone, its work should be too
+  await leaving.close();
+  await call.catch(() => {});
+
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(await cancellations(observer), before + 1, "the backend kept working for nobody");
+});
+
 test("backend log messages reach the session that triggered them", async () => {
   const client = await open();
   logs.length = 0;

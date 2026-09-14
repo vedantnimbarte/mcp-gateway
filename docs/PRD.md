@@ -118,7 +118,7 @@ v1 is done when:
 
 ## 9. Assumptions
 
-- Node 24+ available; single machine; macOS/Linux/Windows dev use.
+- Node 22.13+ available; single machine; macOS/Linux/Windows dev use.
 - Backends are largely trusted-but-unverified: the threat model is *accidental damage and silent tool mutation*, not a determined local attacker who already has your shell.
 - Client count is single digits; session count is tens.
 

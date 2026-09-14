@@ -58,6 +58,12 @@ export interface ReverseTarget {
   log(params: LoggingMessageNotification["params"]): void;
 }
 
+/** Who a request is on behalf of: the session to route reverse requests to, and its abort. */
+export interface Caller {
+  caller?: ReverseTarget;
+  signal?: AbortSignal;
+}
+
 function makeTransport(cfg: ServerConfig, authProvider?: OAuthClientProvider): Transport {
   if (cfg.transport === "stdio") {
     return new StdioClientTransport({
@@ -97,7 +103,8 @@ export class Backend {
 
   #client?: Client;
   #transport?: StdioClientTransport;
-  #inflight = new Set<ReverseTarget>();
+  /** Sessions with work outstanding here, counted: one session may have several calls running. */
+  #inflight = new Map<ReverseTarget, number>();
   #attempt = 0;
   #retry?: NodeJS.Timeout;
   #closing = false;
@@ -127,17 +134,23 @@ export class Backend {
       { capabilities: { sampling: {}, elicitation: {}, roots: {} } },
     );
 
-    client.setRequestHandler(CreateMessageRequestSchema, async (request) => {
+    // The backend's cancel reaches the client, and the wait is bounded like the call it serves.
+    const reverse = (signal: AbortSignal): RequestOptions => ({
+      signal,
+      timeout: this.defaults.call_timeout_ms,
+    });
+    client.setRequestHandler(CreateMessageRequestSchema, async (request, extra) => {
       const target = this.#route("sampling/createMessage");
-      return (await target.createMessage(request.params)) as CreateMessageResult;
+      const reply = await target.createMessage(request.params, reverse(extra.signal));
+      return reply as CreateMessageResult;
     });
-    client.setRequestHandler(ElicitRequestSchema, async (request) => {
+    client.setRequestHandler(ElicitRequestSchema, async (request, extra) => {
       const target = this.#route("elicitation/create");
-      return (await target.elicitInput(request.params)) as ElicitResult;
+      return (await target.elicitInput(request.params, reverse(extra.signal))) as ElicitResult;
     });
-    client.setRequestHandler(ListRootsRequestSchema, async (request) => {
+    client.setRequestHandler(ListRootsRequestSchema, async (request, extra) => {
       const target = this.#route("roots/list");
-      return (await target.listRoots(request.params)) as ListRootsResult;
+      return (await target.listRoots(request.params, reverse(extra.signal))) as ListRootsResult;
     });
     client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
       void this.#relist();
@@ -154,7 +167,7 @@ export class Backend {
     client.setNotificationHandler(LoggingMessageNotificationSchema, (notification) => {
       // A notification cannot be answered with an error, so an unroutable one is simply
       // dropped rather than broadcast — the same rule as reverse requests, minus the -32006.
-      const target = this.#inflight.size === 1 ? [...this.#inflight][0] : undefined;
+      const target = this.#inflight.size === 1 ? [...this.#inflight.keys()][0] : undefined;
       if (target) target.log({ ...notification.params, logger: notification.params.logger ?? this.name });
       else this.onEvent?.("log_dropped", { server: this.name, level: notification.params.level });
     });
@@ -249,44 +262,40 @@ export class Backend {
   async callTool(
     tool: string,
     args: Record<string, unknown> | undefined,
-    caller?: ReverseTarget,
-    signal?: AbortSignal,
+    from: Caller = {},
   ): Promise<CallToolResult> {
-    const client = this.#client;
-    if (!client || this.state !== "up") {
-      throw gwError(ERR.BACKEND_DOWN, `backend "${this.name}" is ${this.state}`, {
-        reason: "server_unavailable",
-        server: this.name,
-        tool,
-      });
-    }
-    if (caller) this.#inflight.add(caller);
-    try {
-      return (await client.callTool({ name: tool, arguments: args }, CallToolResultSchema, {
-        timeout: this.defaults.call_timeout_ms,
-        // Aborting this makes the SDK send notifications/cancelled to the backend (SPEC 4.3).
-        signal,
-      })) as CallToolResult;
-    } catch (e) {
-      throw this.#wrap(e, tool);
-    } finally {
-      if (caller) this.#inflight.delete(caller);
-    }
+    return this.#request(
+      "tools/call",
+      tool,
+      (client) =>
+        client.callTool({ name: tool, arguments: args }, CallToolResultSchema, {
+          timeout: this.defaults.call_timeout_ms,
+          // Aborting this makes the SDK send notifications/cancelled to the backend (SPEC 4.3).
+          signal: from.signal,
+        }) as Promise<CallToolResult>,
+      from.caller,
+    );
   }
 
-  async readResource(uri: string, signal?: AbortSignal): Promise<ReadResourceResult> {
-    return this.#request("resources/read", uri, (client) =>
-      client.readResource({ uri }, this.#opts(signal)),
+  async readResource(uri: string, from: Caller = {}): Promise<ReadResourceResult> {
+    return this.#request(
+      "resources/read",
+      uri,
+      (client) => client.readResource({ uri }, this.#opts(from.signal)),
+      from.caller,
     );
   }
 
   async getPrompt(
     name: string,
     args: Record<string, string> | undefined,
-    signal?: AbortSignal,
+    from: Caller = {},
   ): Promise<GetPromptResult> {
-    return this.#request("prompts/get", name, (client) =>
-      client.getPrompt({ name, arguments: args }, this.#opts(signal)),
+    return this.#request(
+      "prompts/get",
+      name,
+      (client) => client.getPrompt({ name, arguments: args }, this.#opts(from.signal)),
+      from.caller,
     );
   }
 
@@ -302,37 +311,58 @@ export class Backend {
     );
   }
 
-  async complete(params: CompleteRequest["params"], signal?: AbortSignal): Promise<CompleteResult> {
-    return this.#request("completion/complete", params.ref.type, (client) =>
-      client.complete(params, this.#opts(signal)),
+  async complete(params: CompleteRequest["params"], from: Caller = {}): Promise<CompleteResult> {
+    return this.#request(
+      "completion/complete",
+      params.ref.type,
+      (client) => client.complete(params, this.#opts(from.signal)),
+      from.caller,
     );
   }
 
-  /** The shared shape of every non-tool call: refuse when down, wrap what the backend throws. */
-  async #request<T>(method: string, what: string, run: (client: Client) => Promise<T>): Promise<T> {
+  /**
+   * The shared shape of every call: refuse when down, hold the caller as the reverse-request
+   * target while it runs, wrap what the backend throws.
+   */
+  async #request<T>(
+    method: string,
+    what: string,
+    run: (client: Client) => Promise<T>,
+    caller?: ReverseTarget,
+  ): Promise<T> {
+    // A tool call reports under the tool's own name; anything else as "method what".
+    const label = method === "tools/call" ? what : `${method} ${what}`;
     const client = this.#client;
     if (!client || this.state !== "up") {
       throw gwError(ERR.BACKEND_DOWN, `backend "${this.name}" is ${this.state}`, {
         reason: "server_unavailable",
         server: this.name,
-        tool: `${method} ${what}`,
+        tool: label,
       });
     }
+    if (caller) this.#inflight.set(caller, (this.#inflight.get(caller) ?? 0) + 1);
     try {
       return await run(client);
     } catch (e) {
-      throw this.#wrap(e, `${method} ${what}`);
+      throw this.#wrap(e, label);
+    } finally {
+      if (caller) {
+        const left = (this.#inflight.get(caller) ?? 1) - 1;
+        if (left > 0) this.#inflight.set(caller, left);
+        else this.#inflight.delete(caller);
+      }
     }
   }
 
   /**
    * Routes a backend→client request to the session that owns the call it arrived during.
    *
-   * ponytail: single-outstanding-call routing only. `_meta.relatedRequestId` would be exact,
-   * but the SDK does not expose the request id it allocated, so the correlation cannot be made
-   * without reimplementing its dispatch. Concurrent calls on one backend therefore get -32006
-   * rather than a guess — the failure is visible, and guessing would leak one client's prompt
-   * to another. Upgrade: own the JSON-RPC ids, or use an SDK that surfaces them.
+   * ponytail: single-session routing only. Nothing on the wire ties a reverse request to the call
+   * it serves (`relatedRequestId` is an SDK transport option, never serialized over stdio), so
+   * when calls from two different sessions are outstanding on one backend the request gets
+   * -32006 rather than a guess: the failure is visible, and guessing would leak one client's
+   * prompt to another. Upgrade: a backend-side `_meta` convention, or a per-server concurrency
+   * limit of 1 for backends that sample.
    */
   #route(method: string): ReverseTarget {
     if (this.#inflight.size !== 1) {
@@ -348,7 +378,7 @@ export class Backend {
         server: this.name,
       });
     }
-    return [...this.#inflight][0]!;
+    return [...this.#inflight.keys()][0]!;
   }
 
   async #relist(): Promise<void> {
@@ -462,9 +492,11 @@ export class Backend {
 
 /**
  * Windows only. The SDK kills the process it spawned, which for `npx` is a `.cmd` launcher whose
- * `node` grandchild outlives it — so every restart would leak a backend process. POSIX is left
- * alone deliberately: the SDK does not spawn detached, so the child is not a process-group
- * leader, and `kill(-pid)` there would signal whatever group happens to carry that id.
+ * `node` grandchild outlives it — so every restart would leak a backend process.
+ *
+ * ponytail: POSIX is left alone, so a grandchild can leak there. The SDK does not spawn
+ * detached, so the child is not a process-group leader, and `kill(-pid)` would signal whatever
+ * group happens to carry that id. Upgrade: snapshot descendants before closing (ROADMAP 8.4).
  *
  * Best effort: an already-dead pid simply fails, which is the common case on a clean shutdown.
  */

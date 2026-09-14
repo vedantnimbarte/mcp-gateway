@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
+import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, before, test } from "node:test";
@@ -140,6 +141,25 @@ test("a cross-origin browser tab is refused", async () => {
   assert.equal(res.status, 403);
 });
 
+/** `fetch` will not send a Host header of our choosing, so this goes through node:http. */
+function statusWithHost(url: string, host: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    request(url, { headers: { host } }, (res) => {
+      res.resume();
+      resolve(res.statusCode ?? 0);
+    })
+      .on("error", reject)
+      .end();
+  });
+}
+
+test("a DNS-rebound page is refused by its Host header, even without an Origin", async () => {
+  // Browsers omit Origin on a same-origin GET, and a rebound page is same-origin with itself.
+  assert.equal(await statusWithHost(`${gateway.url}/healthz`, "evil.example:8420"), 403);
+  const port = new URL(gateway.url).port;
+  assert.equal(await statusWithHost(`${gateway.url}/healthz`, `localhost:${port}`), 200);
+});
+
 test("healthz reports what `mcpgw status` needs", async () => {
   const health = (await (await fetch(`${gateway.url}/healthz`)).json()) as {
     status: string;
@@ -154,4 +174,30 @@ test("healthz reports what `mcpgw status` needs", async () => {
   assert.equal(health.backends.fixture?.tools, 9);
   assert.equal(health.backends.fixture?.restarts, 0);
   assert.ok(typeof health.backends.fixture?.pid === "number");
+});
+
+test("the idle sweep closes a silent session but spares one that is still streaming", async () => {
+  // A client that initialized over raw HTTP and then went quiet: nothing of it is open any more.
+  const res = await fetch(`${gateway.url}/mcp/default`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "gone", version: "0" },
+      },
+    }),
+  });
+  const silent = res.headers.get("mcp-session-id")!;
+  await res.text();
+  await until("the silent session to settle", () => gateway.sessions.get(silent)?.open === 0);
+
+  // `client` holds its GET stream open. Both look an hour stale to the sweep.
+  gateway.sessions.sweep(Date.now() + 60 * 60 * 1000);
+  await until("the silent session to be swept", () => gateway.sessions.get(silent) === undefined);
+  assert.equal((await client.listTools()).tools.length > 0, true, "the streaming client was swept");
 });

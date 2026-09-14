@@ -8,6 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
   CreateMessageRequestSchema,
+  ElicitRequestSchema,
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { loadConfig } from "../src/config.js";
@@ -70,8 +71,12 @@ async function until(what: string, ok: () => boolean, ms = 15_000): Promise<void
 async function connect(profile: string, sink: string[]): Promise<Client> {
   const client = new Client(
     { name: `test-${profile}`, version: "0.0.0" },
-    { capabilities: { sampling: {} } },
+    { capabilities: { sampling: {}, elicitation: {} } },
   );
+  client.setRequestHandler(ElicitRequestSchema, () => ({
+    action: "accept",
+    content: { name: profile },
+  }));
   client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
     sink.push(profile);
   });
@@ -168,6 +173,29 @@ test("a reverse request reaches the session that triggered it", async () => {
   assert.deepEqual(await narrow.callTool({ name: "alpha__ask", arguments: {} }), {
     content: [{ type: "text", text: "pong from onlyAlpha" }],
   });
+});
+
+test("an elicitation reaches the session that triggered it", async () => {
+  assert.deepEqual(await narrow.callTool({ name: "alpha__ask", arguments: { how: "elicit" } }), {
+    content: [{ type: "text", text: "accept onlyAlpha" }],
+  });
+});
+
+test("one session's finished call does not orphan its other call's reverse request", async () => {
+  // The sleep ends first; the ask samples afterwards, while the same session still owns it.
+  const [asked] = await Promise.all([
+    wide.callTool({ name: "delta__ask", arguments: { delay_ms: 300 } }),
+    wide.callTool({ name: "delta__sleep", arguments: { ms: 50 } }),
+  ]);
+  assert.deepEqual(asked.content, [{ type: "text", text: "pong from all" }]);
+});
+
+test("a reverse request during a resource read or a prompt fetch is routed too", async () => {
+  const read = await wide.readResource({ uri: "mcpgw://delta/fixture://page/ask" });
+  assert.equal((read.contents[0] as { text: string }).text, "pong from all");
+
+  const prompt = await wide.getPrompt({ name: "delta__review", arguments: { subject: "ask" } });
+  assert.deepEqual(prompt.messages[0]?.content, { type: "text", text: "Please review pong from all." });
 });
 
 test("a reverse request with nothing in flight is refused, not guessed", async () => {

@@ -120,6 +120,24 @@ test("a profile added by a reload is reachable", async () => {
   }
 });
 
+test("a reload keeps the rate limiter of a profile whose limits did not change", async () => {
+  const wide = new Client({ name: "wide", version: "0.0.0" });
+  await wide.connect(new StreamableHTTPClientTransport(new URL(`${gateway.url}/mcp/all`)));
+  try {
+    const call = wide.callTool({ name: "alpha__sleep", arguments: { ms: 400 } });
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(parts.pipeline.inflight, 1);
+
+    await reload();
+    // A fresh limiter would report 0, and a drain begun now would not wait for the call.
+    assert.equal(parts.pipeline.inflight, 1, "the reload forgot a call in flight");
+    await call;
+    assert.equal(parts.pipeline.inflight, 0);
+  } finally {
+    await wide.close();
+  }
+});
+
 test("shutdown drains an in-flight call instead of cutting it off", async () => {
   const { config } = loadConfig(configPath);
   const own = assemble(config, configPath);

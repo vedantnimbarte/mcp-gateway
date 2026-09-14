@@ -80,8 +80,18 @@ export class Pipeline {
 
   /** SIGHUP: new profiles, globs, renames and limits take effect on the next call. */
   reload(config: Config): void {
+    // A profile whose limits did not change keeps its limiter: a fresh one would refill the
+    // bucket on every SIGHUP and forget the calls in flight, which the drain counts on.
+    const limiters = limitersFor(config, this.now);
+    for (const [name, limiter] of this.#limiters) {
+      const was = this.config.profiles[name]?.limits;
+      const is = config.profiles[name]?.limits;
+      if (was && is && was.rpm === is.rpm && was.concurrent === is.concurrent) {
+        limiters.set(name, limiter);
+      }
+    }
+    this.#limiters = limiters;
     this.config = config;
-    this.#limiters = limitersFor(config, this.now);
     this.#aliases = new Map();
     for (const [name, profile] of Object.entries(config.profiles)) {
       const byAlias = new Map<string, string>();
@@ -254,7 +264,7 @@ export class Pipeline {
 
       let raw: CallToolResult;
       try {
-        raw = await backend.callTool(entry.tool, args, ctx.caller, ctx.signal);
+        raw = await backend.callTool(entry.tool, args, ctx);
       } catch (e) {
         const error = e as Error & { code?: number };
         this.audit.write({
@@ -289,12 +299,12 @@ export class Pipeline {
   }
 
   async readResource(ctx: CallContext, uri: string): Promise<ReadResourceResult> {
-    const target = this.#resource(ctx, uri);
+    const target = this.#resource(ctx, "resources/read", uri);
     return this.#metered(
       ctx,
       { ...this.#line(ctx, "resources/read"), server: target.server, tool: uri },
       async () => {
-        const raw = await target.backend.readResource(target.original, ctx.signal);
+        const raw = await target.backend.readResource(target.original, ctx);
         return this.guard.capContents(raw).result;
       },
     );
@@ -326,14 +336,14 @@ export class Pipeline {
     }
 
     const backend = this.pool.backends.get(entry.server)!;
-    return this.#metered(ctx, { ...line, server: entry.server, tool: entry.name }, () =>
-      backend.getPrompt(entry.name, args, ctx.signal),
+    return this.#metered(ctx, { ...line, server: entry.server, tool: entry.name }, async () =>
+      this.guard.capPrompt(await backend.getPrompt(entry.name, args, ctx)).result,
     );
   }
 
   /** Subscribes the backend once, however many sessions are watching the same resource. */
   async subscribe(ctx: CallContext, uri: string): Promise<void> {
-    const target = this.#resource(ctx, uri);
+    const target = this.#resource(ctx, "resources/subscribe", uri);
     const watchers = this.#watchers.get(uri) ?? new Set<string>();
     const first = watchers.size === 0;
     watchers.add(ctx.session ?? "");
@@ -354,7 +364,7 @@ export class Pipeline {
     if (watchers.size > 0) return;
 
     this.#watchers.delete(uri);
-    const target = this.#resource(ctx, uri);
+    const target = this.#resource(ctx, "resources/unsubscribe", uri);
     await this.#audited(
       { ...this.#line(ctx, "resources/unsubscribe"), server: target.server, tool: uri },
       () => target.backend.unsubscribe(target.original),
@@ -385,33 +395,46 @@ export class Pipeline {
         return this.#refuse(line, new McpError(ErrorCode.MethodNotFound, "unknown prompt"));
       }
       const backend = this.pool.backends.get(entry.server)!;
-      return this.#metered(ctx, { ...line, server: entry.server, tool: entry.name }, () =>
-        backend.complete({ ...params, ref: { type: "ref/prompt", name: entry.name } }, ctx.signal),
+      const ref = { type: "ref/prompt" as const, name: entry.name };
+      return this.#metered(ctx, { ...line, server: entry.server, tool: entry.name }, async () =>
+        this.guard.capCompletion(await backend.complete({ ...params, ref }, ctx)).result,
       );
     }
 
-    const target = this.#resource(ctx, params.ref.uri);
-    return this.#metered(ctx, { ...line, server: target.server, tool: params.ref.uri }, () =>
-      target.backend.complete(
-        { ...params, ref: { type: "ref/resource", uri: target.original } },
-        ctx.signal,
-      ),
+    const target = this.#resource(ctx, "completion/complete", params.ref.uri);
+    const ref = { type: "ref/resource" as const, uri: target.original };
+    return this.#metered(ctx, { ...line, server: target.server, tool: params.ref.uri }, async () =>
+      this.guard.capCompletion(await target.backend.complete({ ...params, ref }, ctx)).result,
     );
   }
 
-  /** Resolve a namespaced URI to its backend, refusing anything this profile cannot reach. */
-  #resource(ctx: CallContext, uri: string): { backend: Backend; server: string; original: string } {
+  /**
+   * Resolve a namespaced URI to its backend, refusing anything this profile cannot reach. A
+   * refusal is still a request, so it gets its audit line like any other (G4).
+   */
+  #resource(
+    ctx: CallContext,
+    method: string,
+    uri: string,
+  ): { backend: Backend; server: string; original: string } {
+    const line = { ...this.#line(ctx, method), tool: uri };
     const parsed = parseUri(uri);
     const backend = parsed ? this.pool.backends.get(parsed.server) : undefined;
     if (!parsed || !backend) {
-      throw new McpError(ErrorCode.InvalidParams, `not a gateway resource URI: "${uri}"`);
+      return this.#refuse(
+        line,
+        new McpError(ErrorCode.InvalidParams, `not a gateway resource URI: "${uri}"`),
+      );
     }
     if (!reaches(this.config.profiles[ctx.profile], parsed.server)) {
-      throw gwError(ERR.POLICY, `"${uri}" is not available: server_not_in_profile`, {
-        reason: "server_not_in_profile",
-        profile: ctx.profile,
-        server: parsed.server,
-      });
+      return this.#refuse(
+        { ...line, server: parsed.server, decision: "server_not_in_profile" },
+        gwError(ERR.POLICY, `"${uri}" is not available: server_not_in_profile`, {
+          reason: "server_not_in_profile",
+          profile: ctx.profile,
+          server: parsed.server,
+        }),
+      );
     }
     return { backend, server: parsed.server, original: parsed.original };
   }
@@ -483,7 +506,9 @@ export class Pipeline {
     return decide(canonical, {
       profile: this.config.profiles[profileName],
       serverState: this.pool.backends.get(server)?.state,
-      drifted: false, // pinning covers tools; a prompt has no inputSchema to pin
+      // ponytail: prompts are not pinned, so one rewritten after approval is not caught. Upgrade:
+      // hash name + description + arguments beside the tools; the lockfile takes any shape.
+      drifted: false,
       onDrift: this.config.guard.on_drift,
     });
   }

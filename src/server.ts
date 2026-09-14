@@ -98,6 +98,19 @@ function originOk(origin: string | undefined): boolean {
   }
 }
 
+/**
+ * The half of DNS-rebinding that `Origin` misses: browsers omit `Origin` on same-origin GETs, and
+ * a rebound `evil.com:8420` page is same-origin with itself. Its `Host` still says `evil.com`.
+ */
+function hostOk(host: string | undefined): boolean {
+  if (!host) return false;
+  try {
+    return isLoopback(new URL(`http://${host}`).hostname);
+  } catch {
+    return false;
+  }
+}
+
 export async function startGateway(
   config: Config,
   parts: Parts,
@@ -131,6 +144,12 @@ export async function startGateway(
     // including the ones that answer before the token check (SPEC 10.1).
     if (!originOk(req.headers.origin)) {
       send(res, 403, { error: "forbidden origin" });
+      return;
+    }
+    // Without a token, loopback is the only authority, so the name the request used must be
+    // loopback too. With one, LAN hostnames are legitimate and the detail is token-gated anyway.
+    if (!token && !hostOk(req.headers.host)) {
+      send(res, 403, { error: "forbidden host" });
       return;
     }
 
@@ -224,6 +243,7 @@ export async function startGateway(
         send(res, 404, { error: "unknown session" });
         return;
       }
+      sessions.track(session, res);
       await session.transport.handleRequest(req, res, body);
       return;
     }

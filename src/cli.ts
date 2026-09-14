@@ -50,6 +50,7 @@ function log(event: string, fields: Record<string, unknown> = {}): void {
   }
 }
 
+/** ponytail: one process, one core. Upgrade: several daemons, each with its own config dir and port. */
 async function start(config: Config, configPath: string, port?: number): Promise<void> {
   const parts = assemble(config, configPath, log);
 
@@ -143,6 +144,15 @@ async function pin(
     if (opts.yes) {
       parts.guard.accept(opts.server);
       console.log(`\naccepted ${pending.length} change(s); tools.lock.json updated`);
+      // A running daemon re-reads the lockfile on reload; without this it stays blocked until
+      // restarted. No daemon is fine — the next one reads the file at startup.
+      const { base, headers } = daemon(config);
+      const reloaded = await fetch(`${base}/reload`, {
+        method: "POST",
+        headers,
+        signal: AbortSignal.timeout(3000),
+      }).catch(() => undefined);
+      if (reloaded?.ok) console.log(`the daemon at ${base} now serves the accepted tools`);
     } else {
       console.log(`\n${pending.length} change(s) pending. Re-run with --yes to accept.`);
     }
@@ -345,12 +355,19 @@ redirect URI ${REDIRECT_URI}, then add its credentials to the server block:
   }
 }
 
+/** Where the running daemon listens, and the header every control route needs. */
+function daemon(config: Config): { base: string; headers: Record<string, string> } {
+  const { host, port, token } = config.listen;
+  return {
+    base: `http://${host}:${port}`,
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  };
+}
+
 /** Same reload the daemon does on SIGHUP, reachable on platforms that have no such signal. */
 async function reload(config: Config): Promise<number> {
-  const url = `http://${config.listen.host}:${config.listen.port}/reload`;
-  const headers: Record<string, string> = config.listen.token
-    ? { Authorization: `Bearer ${config.listen.token}` }
-    : {};
+  const { base, headers } = daemon(config);
+  const url = `${base}/reload`;
   let res: Response;
   try {
     res = await fetch(url, { method: "POST", headers, signal: AbortSignal.timeout(30_000) });
@@ -378,10 +395,7 @@ async function restart(config: Config, server: string | undefined): Promise<numb
     console.error("which server? usage: mcpgw restart SERVER");
     return 1;
   }
-  const base = `http://${config.listen.host}:${config.listen.port}`;
-  const headers: Record<string, string> = config.listen.token
-    ? { Authorization: `Bearer ${config.listen.token}` }
-    : {};
+  const { base, headers } = daemon(config);
   let res: Response;
   try {
     res = await fetch(`${base}/restart/${encodeURIComponent(server)}`, {
@@ -408,14 +422,20 @@ async function restart(config: Config, server: string | undefined): Promise<numb
 
 /** Asks the running daemon, rather than guessing from the config. */
 async function status(config: Config, asJson?: boolean): Promise<number> {
-  const url = `http://${config.listen.host}:${config.listen.port}/healthz`;
+  const { base, headers } = daemon(config);
+  const url = `${base}/healthz`;
   let health: Health;
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+    const res = await fetch(url, { headers, signal: AbortSignal.timeout(3000) });
     if (!res.ok) throw new Error(`${res.status}`);
     health = (await res.json()) as Health;
   } catch {
     console.error(`no daemon answering at ${url}`);
+    return 1;
+  }
+  // Liveness only: the daemon has a token and this config does not carry the same one.
+  if (!health.backends) {
+    console.error(`${url} is up but withheld detail: listen.token does not match the daemon's`);
     return 1;
   }
 

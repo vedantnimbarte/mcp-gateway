@@ -24,17 +24,31 @@ server.registerTool(
   () => ({ content: [{ type: "text", text: "fixture server, two tools" }] }),
 );
 
-// Reverse direction: the backend asks the calling client for a sample (ARCHITECTURE §3.2).
+/** Reverse direction: the backend asks the calling client for something (ARCHITECTURE §3.2). */
+async function askClient(how: "sample" | "elicit" = "sample"): Promise<string> {
+  if (how === "elicit") {
+    const reply = await server.server.elicitInput({
+      message: "name?",
+      requestedSchema: { type: "object", properties: { name: { type: "string" } } },
+    });
+    return `${reply.action} ${String(reply.content?.name ?? "")}`.trim();
+  }
+  const reply = await server.server.createMessage({
+    messages: [{ role: "user", content: { type: "text", text: "ping" } }],
+    maxTokens: 16,
+  });
+  return reply.content.type === "text" ? reply.content.text : "(non-text)";
+}
+
 server.registerTool(
   "ask",
-  { description: "Asks the client to sample.", inputSchema: {} },
-  async () => {
-    const reply = await server.server.createMessage({
-      messages: [{ role: "user", content: { type: "text", text: "ping" } }],
-      maxTokens: 16,
-    });
-    const text = reply.content.type === "text" ? reply.content.text : "(non-text)";
-    return { content: [{ type: "text", text }] };
+  {
+    description: "Asks the client to sample, or with `how: elicit` to fill in a form.",
+    inputSchema: { delay_ms: z.number().optional(), how: z.enum(["sample", "elicit"]).optional() },
+  },
+  async ({ delay_ms, how }) => {
+    if (delay_ms) await new Promise((r) => setTimeout(r, delay_ms));
+    return { content: [{ type: "text", text: await askClient(how) }] };
   },
 );
 
@@ -129,15 +143,21 @@ server.registerResource(
   "page",
   new ResourceTemplate("fixture://page/{id}", { list: undefined }),
   { description: "A templated resource.", mimeType: "text/plain" },
-  (uri, { id }) => ({ contents: [{ uri: uri.href, text: `page ${String(id)}` }] }),
+  // `page/ask` samples the client mid-read: reverse requests are not only for tool calls.
+  async (uri, { id }) => {
+    const text = id === "ask" ? await askClient() : `page ${String(id)}`;
+    return { contents: [{ uri: uri.href, text }] };
+  },
 );
 
 server.registerPrompt(
   "review",
   { description: "Asks for a review.", argsSchema: { subject: z.string() } },
-  ({ subject }) => ({
-    messages: [{ role: "user", content: { type: "text", text: `Please review ${subject}.` } }],
-  }),
+  // Reviewing "ask" samples the client first, for the same reason as `page/ask`.
+  async ({ subject }) => {
+    const text = subject === "ask" ? await askClient() : subject;
+    return { messages: [{ role: "user", content: { type: "text", text: `Please review ${text}.` } }] };
+  },
 );
 
 // Lets a test make the server announce that `fixture://note` changed.

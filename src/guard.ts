@@ -3,7 +3,13 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
 import type { JsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/index.js";
-import type { CallToolResult, ReadResourceResult, Tool } from "@modelcontextprotocol/sdk/types.js";
+import type {
+  CallToolResult,
+  CompleteResult,
+  GetPromptResult,
+  ReadResourceResult,
+  Tool,
+} from "@modelcontextprotocol/sdk/types.js";
 import { compileRedact, type Config } from "./config.js";
 
 export const LOCKFILE = "tools.lock.json";
@@ -62,6 +68,15 @@ export function hashTool(tool: Tool): string {
   return `sha256:${createHash("sha256").update(material).digest("hex")}`;
 }
 
+function readLock(path: string): Lockfile | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as Lockfile;
+    return parsed.version === 1 && parsed.servers ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // Backend tool names are unsanitized here, so the separator must be one they cannot contain.
 const key = (server: string, tool: string) => [server, tool].join(String.fromCharCode(0));
 
@@ -104,14 +119,9 @@ export class Guard {
   /** The lockfile lives beside the config it belongs to. */
   static load(config: Config, configPath: string): Guard {
     const lockPath = join(dirname(configPath), LOCKFILE);
-    let lock: Lockfile = { version: 1, pinned_at: new Date().toISOString(), servers: {} };
-    try {
-      const parsed = JSON.parse(readFileSync(lockPath, "utf8")) as Lockfile;
-      if (parsed.version === 1 && parsed.servers) lock = parsed;
-    } catch {
-      // No lockfile yet: everything is new, and everything gets auto-pinned on first sight.
-    }
-    return new Guard(config.guard, lockPath, lock);
+    // No lockfile yet: everything is new, and everything gets auto-pinned on first sight.
+    const empty: Lockfile = { version: 1, pinned_at: new Date().toISOString(), servers: {} };
+    return new Guard(config.guard, lockPath, readLock(lockPath) ?? empty);
   }
 
   /**
@@ -172,10 +182,29 @@ export class Guard {
     return changes;
   }
 
-  /** SIGHUP: new redaction patterns, caps and drift policy. Existing pins are untouched. */
+  /**
+   * SIGHUP: new redaction patterns, caps and drift policy, and the lockfile as it is on disk now —
+   * `mcpgw pin` accepts changes from its own process, and this is how the daemon hears about it.
+   */
   reload(config: Config): void {
     this.cfg = config.guard;
     this.#patterns = config.guard.redact.map(compileRedact);
+
+    // An unreadable lockfile keeps the pins in memory: treating it as empty would re-pin, and so
+    // silently accept, every drifted tool.
+    const lock = readLock(this.lockPath);
+    if (!lock) return;
+    this.#lock = lock;
+    // Clear only what the lockfile now settles. Clearing everything and re-reviewing would leave
+    // a window in which a drifted tool is callable.
+    for (const [k, drift] of this.#drifted) {
+      if (lock.servers[drift.server]?.[drift.tool]?.hash !== drift.to) continue;
+      this.#drifted.delete(k);
+      this.#shapes.delete(k);
+    }
+    for (const [k, removal] of this.#removed) {
+      if (!lock.servers[removal.server]?.[removal.tool]) this.#removed.delete(k);
+    }
   }
 
   isDrifted(server: string, tool: string): boolean {
@@ -300,6 +329,41 @@ export class Guard {
       },
       (text) => ({ ...result, contents: [{ uri: contents[0]?.uri ?? "mcpgw:truncated", text }] }),
     );
+  }
+
+  /** The same cap for `prompts/get`: a prompt's text is as unbounded as a tool result's. */
+  capPrompt(result: GetPromptResult): Capped<GetPromptResult> {
+    const messages = [...(result.messages ?? [])];
+    const last = messages.map((m) => m.content.type).lastIndexOf("text");
+    const message = last < 0 ? undefined : messages[last]!;
+    const text = message?.content.type === "text" ? message.content.text : undefined;
+    return this.#cap(
+      result,
+      text,
+      (text) => {
+        const trimmed = [...messages];
+        trimmed[last] = { ...message!, content: { type: "text", text } };
+        return { ...result, messages: trimmed };
+      },
+      (text) => ({ ...result, messages: [{ role: "user", content: { type: "text", text } }] }),
+    );
+  }
+
+  /**
+   * Completions are suggestions, so a marker would be offered as one. An oversized list is cut
+   * to the values that fit instead, and `hasMore` tells the client there were others.
+   */
+  capCompletion(result: CompleteResult): Capped<CompleteResult> {
+    const size = (r: CompleteResult) => Buffer.byteLength(JSON.stringify(r));
+    const max = this.cfg.max_result_bytes;
+    if (size(result) <= max) return { result, bytes: size(result), truncated: false };
+    const values = [...result.completion.values];
+    let capped: CompleteResult;
+    do {
+      values.pop();
+      capped = { ...result, completion: { ...result.completion, values, hasMore: true } };
+    } while (values.length > 0 && size(capped) > max);
+    return { result: capped, bytes: size(capped), truncated: true };
   }
 
   /**
