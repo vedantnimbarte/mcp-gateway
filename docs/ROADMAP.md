@@ -134,11 +134,15 @@ existing three dependencies only.
 
 **Exit:** a long tool shows progress through the gateway and completes past `call_timeout_ms`.
 
-## Phase 8 — Isolation and latency
+## Phase 8 — Isolation and latency · *done*
 
-- Per-server `limits` reusing `Limiter`; opt-in per-server response cache keyed on args + tool hash
-- Rate-limit state persisted across graceful restarts
-- Process-tree cleanup on POSIX (descendant snapshot before close); `mcpgw start --verbose`
+- Per-server `limits` reusing `Limiter`, held together with the profile's; changing them on reload
+  does not restart the backend
+- Opt-in per-server response cache keyed on args + tool hash, so drift invalidates it
+- Rate-limit buckets written on graceful shutdown and restored on start
+- Process-tree cleanup on every platform: descendants listed before close, survivors killed.
+  Replaces the Windows-only `taskkill`, which raced the SDK's own kill
+- `mcpgw start --verbose` mirrors audit lines to stderr
 
 **Exit:** a saturated backend does not delay another; a cached call audits `cached: true`.
 
@@ -184,12 +188,12 @@ accommodates them. *(Done after cutover, as planned: the catalog took them witho
 | Read-only web dashboard | You check the log more than weekly |
 | Approval prompts for high-risk tools | An auto-approved destructive call actually burns you |
 | Content scanning for injected instructions | Description pinning proves insufficient in practice |
-| Response cache for idempotent tools | Latency becomes annoying enough to measure |
-| Per-server concurrency limits | One backend starts starving the others |
+| ~~Response cache for idempotent tools~~ | *Done in Phase 8, opt-in per server* |
+| ~~Per-server concurrency limits~~ | *Done in Phase 8, with per-server rpm as well* |
 | Config hot-reload without SIGHUP | Restarting becomes a genuine irritation — *done in Phase 5: Windows has no SIGHUP, so `POST /reload` and `mcpgw reload` exist* |
 | ~~Forwarding `notifications/progress`~~ | *Done in Phase 7. It was never blocked on reverse-request correlation: the SDK routes progress by its own request id* |
 | ~~SSE resumability (`Last-Event-ID`)~~ | *Done in Phase 7, in memory and bounded* |
-| `mcpgw start --verbose` | The structured stderr log stops being enough |
+| ~~`mcpgw start --verbose`~~ | *Done in Phase 8* |
 | ~~OAuth for `http`/`sse` backends~~ | *Done: `auth: oauth`, `mcpgw auth <server>`, refresh on expiry, and pre-registered clients for servers like Figma that refuse dynamic registration* |
 
 ## Known ceilings accepted in v1
@@ -199,11 +203,12 @@ at the relevant code site so they surface later.
 
 | Ceiling | Impact | Upgrade |
 |---------|--------|---------|
-| In-memory rate limits | Reset on restart | Persist counters if it ever matters |
+| Rate limits persisted only on graceful shutdown | A crash resets the buckets | Write them periodically |
 | Best-effort audit writes | A crash can lose the last few lines | `fsync` per line, at a real throughput cost |
 | No session persistence | Restart forces clients to re-initialize | MCP already handles this; leave it |
 | `tools/list` pagination collapsed | A backend with 1000 tools returns one large page | Paginate the merged catalog |
 | Single process | One core ceiling | Multiple daemons on different ports |
 | Drift detection is hash-only | Catches change, not malice on first sight | Content scanning (deferred above) |
 | Prompts are not pinned | A prompt rewritten after approval is not caught | Hash prompts as well as tools; the guard already takes an arbitrary shape |
-| `killTree` is Windows-only | A leaked `npx` grandchild on POSIX | Spawn detached and signal the process group |
+| Process trees are not cleaned up after a crash | A crashed launcher can leave its children | Own the spawn, detached, and signal the process group |
+| Response cache evicts oldest-first | A hot key can be evicted | True LRU |

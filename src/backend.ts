@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { UnauthorizedError, type OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
@@ -178,7 +179,8 @@ export class Backend {
     try {
       await client.connect(transport, { timeout: this.defaults.connect_timeout_ms });
     } catch (e) {
-      await client.close().catch(() => {});
+      // A slow `npx` that timed out has usually already started its grandchild.
+      await closeTree(client, transport instanceof StdioClientTransport ? transport.pid : null);
       this.#failAndRetry(e);
       throw e;
     }
@@ -190,7 +192,7 @@ export class Backend {
     try {
       await this.refresh();
     } catch (e) {
-      await client.close().catch(() => {});
+      await closeTree(client, this.pid);
       this.#failAndRetry(e);
       throw e;
     }
@@ -500,26 +502,78 @@ export class Backend {
     const client = this.#client;
     this.#client = undefined;
     this.#transport = undefined;
-    await client?.close().catch(() => {});
-    if (orphan !== null) killTree(orphan);
+    if (client) await closeTree(client, orphan);
   }
 }
 
 /**
- * Windows only. The SDK kills the process it spawned, which for `npx` is a `.cmd` launcher whose
- * `node` grandchild outlives it — so every restart would leak a backend process.
+ * Closes a client, then whatever its process left running. The SDK stops only the process it
+ * spawned, which for `npx` is a launcher whose `node` grandchild can outlive it — every restart
+ * would leak a backend. So the tree is listed first, while the launcher still owns it, and
+ * anything in it that survives the SDK's own shutdown is killed.
  *
- * ponytail: POSIX is left alone, so a grandchild can leak there. The SDK does not spawn
- * detached, so the child is not a process-group leader, and `kill(-pid)` would signal whatever
- * group happens to carry that id. Upgrade: snapshot descendants before closing (ROADMAP 8.4).
- *
- * Best effort: an already-dead pid simply fails, which is the common case on a clean shutdown.
+ * ponytail: not on the crash path. Once the launcher is dead its children are re-parented, and a
+ * stale listing could name a pid the OS has since reused. Upgrade: own the spawn, detached, and
+ * signal the process group.
  */
-function killTree(pid: number): void {
-  if (process.platform !== "win32") return;
-  try {
-    spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" }).unref();
-  } catch {
-    // Nothing to do if taskkill itself is unavailable.
+async function closeTree(client: Client, pid: number | null | undefined): Promise<void> {
+  const tree = pid ? await descendants(pid) : [];
+  await client.close().catch(() => {});
+  for (const child of tree) {
+    try {
+      process.kill(child, "SIGKILL"); // TerminateProcess on Windows
+    } catch {
+      // Already gone: the common case, when the backend exits on stdin EOF as it should.
+    }
   }
+}
+
+let listing: { at: number; table: Promise<Map<number, number[]>> } | undefined;
+
+/**
+ * pid → child pids, from one OS listing. Shared for a second, because a shutdown closes every
+ * backend at once and PowerShell takes most of that second to answer on Windows.
+ */
+function processTable(): Promise<Map<number, number[]>> {
+  if (listing && Date.now() - listing.at < 1000) return listing.table;
+  const [command, args] =
+    process.platform === "win32"
+      ? [
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }',
+          ],
+        ]
+      : ["ps", ["-A", "-o", "pid=,ppid="]];
+  const table = promisify(execFile)(command, args, { timeout: 5000, windowsHide: true })
+    .then(({ stdout }) => {
+      const children = new Map<number, number[]>();
+      for (const line of stdout.split("\n")) {
+        const [pid, ppid] = line.trim().split(/\s+/).map(Number);
+        if (!pid || ppid === undefined || !Number.isInteger(ppid)) continue;
+        children.set(ppid, [...(children.get(ppid) ?? []), pid]);
+      }
+      return children;
+    })
+    .catch(() => new Map<number, number[]>()); // no listing: fall back to the SDK's own kill
+  listing = { at: Date.now(), table };
+  return table;
+}
+
+async function descendants(root: number): Promise<number[]> {
+  const children = await processTable();
+  const found: number[] = [];
+  const walk = (pid: number): void => {
+    for (const child of children.get(pid) ?? []) {
+      // Windows reuses pids, so its parent links can loop.
+      if (child === root || found.includes(child)) continue;
+      found.push(child);
+      walk(child);
+    }
+  };
+  walk(root);
+  return found;
 }

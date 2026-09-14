@@ -26,6 +26,10 @@ servers:
     transport: stdio
     command: npx
     args: ["-y", "@modelcontextprotocol/server-filesystem", "/Users/vedant/code"]
+    limits: { concurrent: 2 }   # per server, on top of each profile's; either bound optional
+    cache:                      # opt-in: results of these tools are reused for ttl_ms
+      tools: ["read_*", "list_*"]
+      ttl_ms: 30000
 
   linear:
     transport: http          # Streamable HTTP

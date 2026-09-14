@@ -14,6 +14,26 @@ const Restart = z
   })
   .default({});
 
+/**
+ * Per backend, on top of each profile's own: one busy backend must not starve the others. Both
+ * optional; an absent bound is unlimited.
+ */
+const ServerLimits = z
+  .object({
+    rpm: z.number().int().positive().optional(),
+    concurrent: z.number().int().positive().optional(),
+  })
+  .optional();
+
+/** Opt-in: the gateway cannot know a tool is idempotent, so you name the ones that are. */
+const Cache = z
+  .object({
+    tools: z.array(z.string()).min(1), // globs on the backend's own tool name
+    ttl_ms: z.number().int().positive().default(60000),
+    max_entries: z.number().int().positive().default(500),
+  })
+  .optional();
+
 const Server = z.discriminatedUnion("transport", [
   z.object({
     transport: z.literal("stdio"),
@@ -22,6 +42,8 @@ const Server = z.discriminatedUnion("transport", [
     env: z.record(z.string(), z.string()).default({}),
     cwd: z.string().optional(),
     restart: Restart,
+    limits: ServerLimits,
+    cache: Cache,
   }),
   z.object({
     transport: z.enum(["http", "sse"]),
@@ -39,6 +61,8 @@ const Server = z.discriminatedUnion("transport", [
     client_id: z.string().optional(),
     client_secret: z.string().optional(),
     restart: Restart,
+    limits: ServerLimits,
+    cache: Cache,
   }),
 ]);
 

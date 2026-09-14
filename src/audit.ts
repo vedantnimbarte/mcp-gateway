@@ -32,6 +32,8 @@ export interface AuditLine {
   status?: "ok" | "error" | "timeout" | "denied";
   result_bytes?: number;
   truncated?: boolean;
+  /** Answered from the response cache, without a backend round-trip. */
+  cached?: boolean;
   result?: unknown;
   error?: { code: number; message: string };
   [key: string]: unknown;
@@ -54,6 +56,8 @@ function lineId(): string {
  */
 export class AuditLog {
   readonly dir: string;
+  /** Sees every line as it is written — `mcpgw start --verbose` mirrors them to stderr. */
+  onWrite?: (line: AuditLine) => void;
   #stream?: WriteStream;
   #date?: string;
 
@@ -76,6 +80,7 @@ export class AuditLog {
       if (today !== this.#date) this.#rotate(today);
       const full = { ts: new Date().toISOString(), id: lineId(), ...line };
       this.#stream?.write(`${JSON.stringify(full)}\n`);
+      this.onWrite?.(full);
     } catch {
       // Losing an audit line is preferable to losing the request.
     }

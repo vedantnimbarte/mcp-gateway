@@ -37,7 +37,7 @@ connect to `http://127.0.0.1:8420/mcp/<profile>` instead of spawning anything.
 - **Fewer, better tools.** Expose 12 relevant tools instead of 120, renamed to whatever reads
   clearly to the model.
 - **Nothing runs unlogged.** Every call — allowed, denied, or failed — is one line of JSON.
-- **Real brakes.** A denied tool is invisible *and* uncallable. Rate limits are per profile.
+- **Real brakes.** A denied tool is invisible *and* uncallable. Rate limits are per profile, and per server.
 - **Tools can't change under you.** Descriptions are hashed and pinned; a server that quietly
   rewrites one gets blocked until you review the diff.
 
@@ -104,6 +104,21 @@ profiles:
 ```
 
 Credentials come from environment variables via `${VAR}` — they never live in the config file.
+
+A backend can also carry its own limits, so one busy server cannot starve the rest, and can cache
+the tools you know are safe to repeat:
+
+```yaml
+servers:
+  fs:
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/Users/vedant/code"]
+    limits: { concurrent: 2 }           # on top of each profile's own
+    cache:
+      tools: ["read_*", "list_*"]       # opt-in: the gateway cannot know what is idempotent
+      ttl_ms: 30000
+```
 
 Then start it:
 
@@ -310,9 +325,10 @@ Deliberate, and each one is marked in the code:
   sample is routed to the session with work outstanding on it, however many calls that session
   has running. With calls from two different sessions in flight on one backend it gets `-32006`
   rather than a guess — guessing would leak one client's prompt to another.
-- **Process trees are only cleaned up on Windows.** A backend launched through `npx` can leave its
-  `node` grandchild behind on Linux and macOS when the gateway restarts or stops it.
-- **Rate limits are in memory.** Restarting the daemon resets them.
+- **Process trees are not cleaned up after a crash.** When the gateway stops or restarts a
+  backend it kills whatever that backend's launcher left running, but a launcher that crashed on
+  its own may leave its children behind.
+- **Rate limits survive only a graceful restart.** A crash resets the buckets.
 - **Audit writes are best-effort.** A hard crash can lose the last few lines.
 - **`tools/list` pagination is collapsed** into a single page.
 - **SSE resumption is in memory.** A client that drops its stream can resume with
