@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import YAML from "yaml";
 import { z } from "zod";
 import { globMatch } from "./glob.js";
+import { serverOf } from "./policy.js";
 
 /** SPEC §1.3 */
 const Restart = z
@@ -141,12 +142,6 @@ export const GATEWAY_INFO = { name: "mcp-gateway", version: "0.1.0" };
 
 export function isLoopback(host: string): boolean {
   return host === "localhost" || host === "::1" || host === "[::1]" || /^127\./.test(host);
-}
-
-/** The server component of a canonical `<server>__<tool>` name. */
-function serverOf(canonical: string): string | undefined {
-  const i = canonical.indexOf("__");
-  return i > 0 ? canonical.slice(0, i) : undefined;
 }
 
 /** SPEC §1.4 cross-checks. Collects every problem rather than throwing on the first. */

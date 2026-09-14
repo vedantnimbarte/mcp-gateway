@@ -242,8 +242,10 @@ negotiates independently with each backend.
 ### 4.2 Gateway → client (reverse)
 
 `sampling/createMessage`, `elicitation/create`, `roots/list` and `notifications/message` are
-routed per ARCHITECTURE §3.2. Unroutable reverse requests get `-32006` and an audit line with
-`decision: "unroutable"`.
+routed per ARCHITECTURE §3.2: to the one session with work outstanding on that backend — any
+number of its own calls, of any method. Unroutable reverse requests (no session, or two different
+sessions) get `-32006` and an audit line with `decision: "unroutable"`. A routed request carries
+the backend's cancellation and is bounded by `call_timeout_ms`.
 
 `notifications/progress` is **not** forwarded. Routing it needs the same
 call-in-flight correlation as a reverse request, and unlike a request there is no `-32006` to
@@ -319,7 +321,9 @@ every restart looks like drift.
 | `pin_tools: false` | Skip entirely |
 
 `mcpgw pin` prints every pending change as a diff and rewrites the lockfile. `--yes` skips
-the prompt. There is intentionally no auto-accept-on-drift mode: silent acceptance would
+the prompt, and then asks a running daemon to reload: a reload re-reads the lockfile and unblocks
+exactly the changes it now records. An unreadable lockfile on reload keeps the pins in memory —
+believing an empty one would re-pin every drifted tool as new. There is intentionally no auto-accept-on-drift mode: silent acceptance would
 defeat the entire mechanism.
 
 ## 7. Audit
@@ -356,8 +360,9 @@ append-only.
 | `error` | `{ code, message }` on failure, redacted |
 
 Also logged, with `method` set accordingly: `initialize` (session open), `session_close`,
-`backend_up`, `backend_down`, `drift`, `pinned`. Writes go through a stream and are never
-awaited by the request path.
+`backend_up`, `backend_down`, `drift`, `pinned`. A refusal is a request too: a resource URI that
+is malformed or outside the profile gets its line like a denied tool call. Writes go through a
+stream and are never awaited by the request path.
 
 ## 8. Rate limiting
 
@@ -400,9 +405,10 @@ not swallowed: original `code`/`message` land in `error.data.upstream`.
 | SSE | `GET` opens the server→client stream. Not resumable: no event store is configured, so a dropped stream is re-established by the client re-initializing |
 | Termination | `DELETE` ends the session and releases its id-map entries |
 | Body limit | 4 MiB; exceeded → `413` |
-| Idle expiry | 30 min without traffic → session dropped |
+| Idle expiry | 30 min with no request open and none arriving → session dropped. An open GET stream or a long call is not idle |
 | Token | When `listen.token` is set, every request must carry `Authorization: Bearer <token>`; compared with `timingSafeEqual`. Missing/wrong → `401` |
 | Origin | `Origin` header, when present, must be `localhost` or `127.0.0.1` — blocks DNS-rebinding from a browser tab. Checked **first**, before the token and before `/healthz`, so no route answers a browser tab |
+| Host | Without `listen.token`, the `Host` header must name a loopback host, else `403`. Covers the rebinding case `Origin` cannot: a browser omits `Origin` on a same-origin GET, and a rebound page is same-origin with itself. With a token set any Host is accepted — LAN names are legitimate, and detail is token-gated |
 
 ### 10.2 stdio bridge
 

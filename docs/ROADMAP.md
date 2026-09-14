@@ -12,7 +12,7 @@ the riskiest unknown (multiplexing correctness) is hit in Phase 2, not Phase 5.
 
 Scaffold, config loading, no protocol yet.
 
-- `package.json` (Node 24+, ESM, `"type": "module"`), `tsconfig.json`, `.gitignore` (`audit/`, `node_modules`)
+- `package.json` (Node 22.13+, ESM, `"type": "module"`), `tsconfig.json`, `.gitignore` (`audit/`, `node_modules`)
 - Deps: `@modelcontextprotocol/sdk`, `yaml`, `zod`. Nothing else.
 - `config.ts` — load, `${ENV}` interpolate, zod parse, all SPEC §1.4 cross-checks
 - `cli.ts` — `parseArgs`, `validate` subcommand only
@@ -101,6 +101,62 @@ of real use leaves a log where `jq 'select(.decision!="allow")' audit/*.jsonl` i
 - **Cutover:** replace every direct server entry in every client config with a gateway URL
 
 **Exit:** all five PRD §8 success criteria pass.
+
+---
+
+# After cutover: Phases 6–10
+
+Planned 2026-09-14. Three triggers from the deferred table below have fired in real use —
+stuck long-running tools and `-32006`s, one backend starving the others, and a risky call /
+suspicious description — so those phases come first. Constraints unchanged: stdlib and the
+existing three dependencies only.
+
+## Phase 6 — Baseline, drift and real bugs · *done*
+
+- Node baseline raised to 22.13 (`node:sqlite` for Phase 10); CI on 22.13 and 24
+- `Host` check closes the DNS-rebinding case `Origin` misses (same-origin GETs carry no `Origin`)
+- `mcpgw status` sends the token; the idle sweep spares sessions with a request still open
+- Reverse requests: counted per session (two calls from one session no longer orphan each other),
+  routed during resource reads, prompt fetches and completions too, and carry cancellation
+- Refused resource requests are audited; prompts and completions are size-capped
+- `mcpgw pin --yes` reloads a running daemon, which re-reads the lockfile; a reload keeps the
+  rate limiter of any profile whose limits did not change
+
+**Exit:** each fix has a test that fails without it.
+
+## Phase 7 — Long-running calls
+
+- Forward `notifications/progress`: the SDK's per-request `onprogress` already correlates exactly,
+  so this is *not* blocked on reverse-request routing as the deferred table below assumed
+- `resetTimeoutOnProgress` with a new `defaults.max_call_ms` ceiling
+- Resumable SSE via a bounded in-memory event store
+
+**Exit:** a long tool shows progress through the gateway and completes past `call_timeout_ms`.
+
+## Phase 8 — Isolation and latency
+
+- Per-server `limits` reusing `Limiter`; opt-in per-server response cache keyed on args + tool hash
+- Rate-limit state persisted across graceful restarts
+- Process-tree cleanup on POSIX (descendant snapshot before close); `mcpgw start --verbose`
+
+**Exit:** a saturated backend does not delay another; a cached call audits `cached: true`.
+
+## Phase 9 — Brakes
+
+- `profiles.*.approve` globs: the gateway asks the calling client through `elicitation/create`,
+  failing closed when the client cannot elicit
+- Heuristic content scanning of descriptions (`guard.on_suspicious`), prompt pinning, redaction
+  across adjacent text blocks, opt-in `audit.durable`
+
+**Exit:** an approve-listed call is refused unless the human accepts it in the client.
+
+## Phase 10 — Operator tooling and LAN
+
+- PRD amended to allow a read-only status page, token over TLS, and a CLI-only SQLite index
+- `mcpgw query` over a derived `node:sqlite` index of the JSONL; read-only `/dashboard`
+- `listen.tls`; configurable OAuth callback port and client-credentials grant; opt-in pagination
+
+**Exit:** `mcpgw query` answers what one line of `jq` could not; runtime deps still three.
 
 ---
 

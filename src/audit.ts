@@ -64,7 +64,12 @@ export class AuditLog {
     this.dir = resolve(cfg.dir);
   }
 
-  /** Fire and forget. Never throws: a failed log line must not fail the call it describes. */
+  /**
+   * Fire and forget. Never throws: a failed log line must not fail the call it describes.
+   *
+   * ponytail: best-effort, buffered by the stream, so a hard crash can lose the last few lines.
+   * Upgrade: fsync per line, at a real throughput cost.
+   */
   write(line: AuditInput): void {
     try {
       const today = new Date().toISOString().slice(0, 10);

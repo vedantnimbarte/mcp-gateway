@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/node-%E2%89%A520-5FA04E" alt="Node 20+">
+  <img src="https://img.shields.io/badge/node-%E2%89%A522.13-5FA04E" alt="Node 22.13+">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
   <img src="https://img.shields.io/badge/status-in%20development-orange" alt="In development">
 </p>
@@ -43,7 +43,7 @@ connect to `http://127.0.0.1:8420/mcp/<profile>` instead of spawning anything.
 
 ## Requirements
 
-Node 20.11 or newer. Nothing else — no database, no Redis, no external services. Three runtime
+Node 22.13 or newer. Nothing else — no database, no Redis, no external services. Three runtime
 dependencies: the MCP SDK, `yaml`, and `zod`.
 
 ## Install
@@ -297,7 +297,8 @@ nothing — either way, configured regex patterns are redacted before anything i
 The first time a tool is seen, `sha256(name + description + inputSchema)` goes into
 `tools.lock.json`. Every startup and every `tools/list_changed` re-checks it. If a server
 rewrites a tool description after you approved it, the tool is blocked, the change is logged,
-and a diff is printed. `mcpgw pin` is the only way to accept it.
+and a diff is printed. `mcpgw pin` is the only way to accept it, and `mcpgw pin --yes` tells a
+running daemon to reload, so the accepted tool comes back without a restart.
 
 Commit `tools.lock.json`.
 
@@ -305,9 +306,12 @@ Commit `tools.lock.json`.
 
 Deliberate, and each one is marked in the code:
 
-- **Reverse requests need an idle backend.** A backend asking the client to sample is routed to
-  the session whose call it arrived during. With two calls in flight on one backend, the second
-  gets `-32006` rather than a guess — guessing would leak one client's prompt to another.
+- **Reverse requests need one session per backend at a time.** A backend asking the client to
+  sample is routed to the session with work outstanding on it, however many calls that session
+  has running. With calls from two different sessions in flight on one backend it gets `-32006`
+  rather than a guess — guessing would leak one client's prompt to another.
+- **Process trees are only cleaned up on Windows.** A backend launched through `npx` can leave its
+  `node` grandchild behind on Linux and macOS when the gateway restarts or stops it.
 - **Rate limits are in memory.** Restarting the daemon resets them.
 - **Audit writes are best-effort.** A hard crash can lose the last few lines.
 - **`tools/list` pagination is collapsed** into a single page.

@@ -117,6 +117,68 @@ test("a pinned tool that disappears is reported once, and kept until accepted", 
   assert.equal(JSON.parse(readFileSync(join(dir, LOCKFILE), "utf8")).servers.fixture.other, undefined);
 });
 
+test("a reload picks up a pin accepted by another process, and nothing else", () => {
+  const { guard, dir } = guardWith();
+  const configPath = join(dir, "config.yaml");
+  const { config } = loadConfig(configPath);
+  guard.review("fixture", [tool(), tool({ name: "other" })]);
+  guard.review("fixture", [
+    tool({ description: "changed" }),
+    tool({ name: "other", description: "also changed" }),
+  ]);
+  assert.equal(guard.pending().length, 2);
+
+  // What `mcpgw pin --yes` does from its own process, having only seen the first change.
+  const pinner = Guard.load(config, configPath);
+  pinner.review("fixture", [tool({ description: "changed" }), tool({ name: "other" })]);
+  pinner.accept();
+
+  guard.reload(config);
+  assert.equal(guard.isDrifted("fixture", "echo"), false, "the accepted change is cleared");
+  assert.equal(guard.isDrifted("fixture", "other"), true, "the unaccepted one stays blocked");
+});
+
+test("a reload with an unreadable lockfile keeps every drift blocked", () => {
+  const { guard, dir } = guardWith();
+  const configPath = join(dir, "config.yaml");
+  guard.review("fixture", [tool()]);
+  guard.review("fixture", [tool({ description: "changed" })]);
+
+  writeFileSync(join(dir, LOCKFILE), "{ not json");
+  guard.reload(loadConfig(configPath).config);
+  assert.equal(guard.isDrifted("fixture", "echo"), true);
+  // Had the empty lockfile been believed, this review would re-pin the drifted tool as new.
+  const kinds = guard.review("fixture", [tool({ description: "changed" })]).map((c) => c.kind);
+  assert.deepEqual(kinds, ["drift"]);
+  assert.equal(guard.isDrifted("fixture", "echo"), true);
+});
+
+test("an oversized prompt is truncated in its last text message", () => {
+  const { guard } = guardWith("guard:\n  max_result_bytes: 300\n");
+  const { result, bytes, truncated } = guard.capPrompt({
+    messages: [
+      { role: "user", content: { type: "text", text: "keep me" } },
+      { role: "user", content: { type: "text", text: "x".repeat(5000) } },
+    ],
+  });
+  assert.equal(truncated, true);
+  assert.ok(bytes <= 300, `capped to ${bytes} bytes`);
+  assert.equal(result.messages.length, 2, "the structure survives");
+  const last = result.messages[1]?.content as { type: "text"; text: string };
+  assert.match(last.text, /\[truncated by mcp-gateway: \d+ bytes omitted\]$/);
+});
+
+test("oversized completions are cut to the values that fit, never given a marker value", () => {
+  const { guard } = guardWith("guard:\n  max_result_bytes: 200\n");
+  const values = Array.from({ length: 50 }, (_, i) => `value-${i}`);
+  const { result, truncated } = guard.capCompletion({ completion: { values } });
+  assert.equal(truncated, true);
+  assert.equal(result.completion.hasMore, true);
+  const kept = result.completion.values.length;
+  assert.ok(kept > 0 && kept < 50, `kept ${kept}`);
+  assert.deepEqual(result.completion.values, values.slice(0, kept));
+});
+
 test("pin_tools: false skips the whole mechanism", () => {
   const { guard } = guardWith("guard:\n  pin_tools: false\n");
   assert.deepEqual(guard.review("fixture", [tool()]), []);

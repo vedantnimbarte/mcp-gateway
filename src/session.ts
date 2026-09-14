@@ -45,6 +45,8 @@ export interface Session {
   transport: StreamableHTTPServerTransport;
   server: Server;
   lastSeen: number;
+  /** HTTP requests still streaming: a long call, or the client's GET stream. Busy is not idle. */
+  open: number;
   /** What was last shown to this client, to suppress no-op list_changed notifications. */
   visible: { tools: string; prompts: string; resources: string };
 }
@@ -101,6 +103,8 @@ function buildServer(pipeline: Pipeline, profile: string, sessionId: () => strin
     return {};
   });
 
+  // ponytail: pagination collapsed — every list returns the whole filtered set in one page, with
+  // no nextCursor. Upgrade: paginate the merged catalog when a profile gets large enough to hurt.
   server.setRequestHandler(ListToolsRequestSchema, () => ({
     tools: pipeline.visibleTools(profile),
   }));
@@ -155,7 +159,7 @@ export class SessionManager {
     readonly pipeline: Pipeline,
     private readonly audit: AuditLog,
   ) {
-    this.#sweeper = setInterval(() => this.#sweep(), 60_000);
+    this.#sweeper = setInterval(() => this.sweep(), 60_000);
     this.#sweeper.unref();
   }
 
@@ -167,6 +171,15 @@ export class SessionManager {
     const session = this.#sessions.get(id);
     if (session) session.lastSeen = Date.now();
     return session;
+  }
+
+  /** Counts a request as open until its response ends, however long it streams. */
+  track(session: Session, res: { once(event: "close", fn: () => void): unknown }): void {
+    session.open++;
+    res.once("close", () => {
+      session.open--;
+      session.lastSeen = Date.now();
+    });
   }
 
   hasProfile(profile: string): boolean {
@@ -192,6 +205,7 @@ export class SessionManager {
           transport,
           server,
           lastSeen: Date.now(),
+          open: 0,
           visible: this.#visible(profile),
         });
       },
@@ -262,10 +276,11 @@ export class SessionManager {
     };
   }
 
-  #sweep(): void {
-    const deadline = Date.now() - IDLE_MS;
+  /** Public so a test can pass a clock instead of waiting half an hour. */
+  sweep(now = Date.now()): void {
+    const deadline = now - IDLE_MS;
     for (const session of [...this.#sessions.values()]) {
-      if (session.lastSeen < deadline) void session.transport.close();
+      if (session.open === 0 && session.lastSeen < deadline) void session.transport.close();
     }
   }
 

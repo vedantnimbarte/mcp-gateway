@@ -125,11 +125,12 @@ invariant in the codebase.
 Backends may send `sampling/createMessage`, `elicitation/create`, or `roots/list` *to the
 client*. With a shared backend, "the client" is ambiguous.
 
-Rule: a reverse request is routed to the session that owns the in-flight call it arrives
-during, matched by the backend's `_meta.relatedRequestId` when present, otherwise by the
-backend's single outstanding request. If neither resolves — an unsolicited reverse request
-with nothing in flight — the gateway replies with an error, logs it, and does **not** guess.
-Guessing here would leak one client's prompt to another.
+Rule: a reverse request is routed to the one session with work outstanding on that backend —
+any number of its own calls, tool calls or otherwise. Nothing on the wire says which call a
+reverse request serves: `relatedRequestId` is an SDK transport option and is never serialized
+over stdio. So when no session, or more than one, has work outstanding, the gateway replies with
+an error, logs it, and does **not** guess. Guessing here would leak one client's prompt to
+another.
 
 Consequence: the gateway advertises `sampling`/`elicitation` capability to a backend only if
 *every* session currently attached could service it. In practice v1 advertises them
@@ -146,8 +147,9 @@ optimistically and errors on the rare unroutable case; simpler, and the failure 
    changed receives `notifications/tools/list_changed`. Sessions whose filtered view is
    unaffected are not woken — otherwise a chatty backend spams every client.
 
-`notifications/progress` is routed via the progress-token map, rewritten per session so
-tokens from different clients never collide.
+`notifications/progress` is not forwarded yet (SPEC §4.2). It does not need a token map when it
+is: the SDK routes a backend's progress to the one request that asked for it, so the handler
+for a call can rewrite the token back to the calling client's own.
 
 ### 3.4 Startup
 
@@ -232,7 +234,7 @@ backends directly. Defending that would require auth, which is explicitly out of
 
 | Layer | Choice | Why this and not the obvious alternative |
 |-------|--------|------------------------------------------|
-| Runtime | Node 24+ (LTS), TypeScript, ESM | Official MCP SDK is best-maintained here and the work is pure I/O — Go's concurrency edge would not pay for re-implementing the protocol |
+| Runtime | Node 22.13+ (LTS), TypeScript, ESM | Official MCP SDK is best-maintained here and the work is pure I/O — Go's concurrency edge would not pay for re-implementing the protocol |
 | Protocol | `@modelcontextprotocol/sdk` | Both server and client sides, all three transports, session handling. Hand-rolling JSON-RPC framing is the classic own-goal |
 | HTTP | `node:http` | The SDK transport takes raw `req`/`res`. Express would add a dependency to route three paths |
 | Config | `yaml` | Only real dep here |

@@ -2,11 +2,14 @@
 // non-tool paths, the HTTP doors that answer before the token check, and bringing a backend
 // back without restarting the daemon.
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
+import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "../src/config.js";
@@ -119,6 +122,18 @@ test("a browser tab cannot reach the control routes", async () => {
   }
 });
 
+test("with a token set, a LAN hostname is accepted: the token is the authority", async () => {
+  const status = await new Promise<number>((resolve, reject) => {
+    request(`${gateway.url}/healthz`, { headers: { host: "gateway.lan:8420", ...auth } }, (res) => {
+      res.resume();
+      resolve(res.statusCode ?? 0);
+    })
+      .on("error", reject)
+      .end();
+  });
+  assert.equal(status, 200);
+});
+
 test("restart brings one backend back and leaves the rest alone", async () => {
   const before = (await (await fetch(`${gateway.url}/healthz`, { headers: auth })).json()) as {
     backends: Record<string, { pid: number }>;
@@ -150,4 +165,19 @@ test("the token store notices a file another process wrote", () => {
   new TokenStore(path).set("srv", { tokens: { access_token: "fresh", token_type: "Bearer" } });
 
   assert.equal(daemon.get("srv").tokens?.access_token, "fresh", "the daemon held a stale store");
+});
+
+test("`mcpgw status` sends the token, so a guarded daemon still reports its backends", async () => {
+  // A copy of the config pointing at the ephemeral port, because the CLI reads listen.* from it.
+  // Async, not execFileSync: the daemon lives in this process and must keep answering.
+  const port = new URL(gateway.url).port;
+  const statusConfig = join(dir, "status.yaml");
+  writeFileSync(
+    statusConfig,
+    `version: 1\nlisten:\n  port: ${port}\n  token: ${TOKEN}\nservers: {}\nprofiles: {}\n`,
+  );
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  const args = [cli, "status", "--config", statusConfig];
+  const { stdout } = await promisify(execFile)(process.execPath, args);
+  assert.match(stdout, /up\s+alpha/);
 });

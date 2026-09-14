@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, before, test } from "node:test";
@@ -11,9 +11,10 @@ import {
   ResourceListChangedNotificationSchema,
   ResourceUpdatedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import type { AuditLine } from "../src/audit.js";
 import { namespaceUri, parseUri } from "../src/catalog.js";
 import { loadConfig } from "../src/config.js";
-import { assemble, startGateway, type Gateway } from "../src/server.js";
+import { assemble, startGateway, type Gateway, type Parts } from "../src/server.js";
 
 const fixture = fileURLToPath(new URL("./fixture-server.js", import.meta.url));
 const backend = (name: string) => `  ${name}:
@@ -42,6 +43,7 @@ profiles:
 );
 
 let gateway: Gateway;
+let parts: Parts;
 const clients: Client[] = [];
 const updates: string[] = [];
 
@@ -65,7 +67,7 @@ async function until(what: string, ok: () => boolean, ms = 10_000): Promise<void
 
 before(async () => {
   const { config } = loadConfig(configPath);
-  const parts = assemble(config, configPath);
+  parts = assemble(config, configPath);
   gateway = await startGateway(config, parts, { port: 0 });
   await parts.pool.start();
 });
@@ -121,6 +123,18 @@ test("a profile cannot read a resource from a server it does not have", async ()
     narrow.readResource({ uri: "mcpgw://bravo/fixture://note" }),
     (e: Error & { code?: number; data?: { reason?: string } }) =>
       e.code === -32004 && e.data?.reason === "server_not_in_profile",
+  );
+
+  // A refusal is a request like any other: it gets exactly one audit line (G4).
+  await parts.audit.flush();
+  const auditDir = join(dirname(configPath), "audit");
+  const refused = readdirSync(auditDir)
+    .flatMap((f) => readFileSync(join(auditDir, f), "utf8").split("\n").filter(Boolean))
+    .map((l) => JSON.parse(l) as AuditLine)
+    .filter((l) => l.method === "resources/read" && l.tool === "mcpgw://bravo/fixture://note");
+  assert.deepEqual(
+    refused.map((l) => [l.decision, l.status]),
+    [["server_not_in_profile", "denied"]],
   );
 });
 
