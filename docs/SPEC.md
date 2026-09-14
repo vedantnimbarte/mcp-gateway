@@ -20,6 +20,9 @@ listen:
   host: 127.0.0.1        # non-loopback requires `token`
   port: 8420
   # token: ${MCPGW_TOKEN}   # sent as `Authorization: Bearer <token>`
+  # tls: { cert: ~/certs/gw.pem, key: ~/certs/gw-key.pem }   # HTTPS, for use beyond loopback
+  # page_size: 100          # paginate listings; absent = one page
+  oauth_callback_port: 8419 # where `mcpgw auth` catches the OAuth redirect
 
 defaults:
   call_timeout_ms: 30000     # restarted by each progress note from the backend...
@@ -162,6 +165,9 @@ const Config = z.object({
     host:  z.string().default("127.0.0.1"),
     port:  z.number().int().min(1).max(65535).default(8420),
     token: z.string().optional(),
+    tls:   z.object({ cert: z.string(), key: z.string() }).optional(),
+    page_size: z.number().int().positive().optional(),
+    oauth_callback_port: z.number().int().min(1).max(65535).default(8419),
   }).default({}),
   defaults: z.object({
     call_timeout_ms:    z.number().int().positive().default(30000),
@@ -268,7 +274,7 @@ negotiates independently with each backend.
 | `initialize` | Terminated locally. Capabilities = union of the profile's reachable backends, intersected with what the gateway can proxy. Records client name/version for audit. |
 | `notifications/initialized` | Consumed |
 | `ping` | Answered locally, never forwarded |
-| `tools/list` | Served from the catalog; policy-filtered; renames applied. Pagination collapsed — the gateway returns the full filtered set in one page |
+| `tools/list` | Served from the catalog; policy-filtered; renames applied. One page by default. With `listen.page_size` every list (`tools`, `prompts`, `resources`, `resources/templates`) is paged; a cursor names an offset and a digest of the listing it came from, and a stale or malformed one is `-32602` |
 | `tools/call` | §5 pipeline |
 | `resources/list`, `resources/templates/list` | Merged, namespaced, filtered by profile server membership |
 | `resources/read` | URI de-namespaced, routed to owning backend |
@@ -489,14 +495,16 @@ not swallowed: original `code`/`message` land in `error.data.upstream`.
 
 | Aspect | Behaviour |
 |--------|-----------|
-| Path | `POST`/`GET`/`DELETE` `/mcp/<profile>`. Unknown profile → `404`. `POST /reload` re-reads the config; `POST /restart/<server>` reconnects one backend |
+| Path | `POST`/`GET`/`DELETE` `/mcp/<profile>`. Unknown profile → `404`. `POST /reload` re-reads the config; `POST /restart/<server>` reconnects one backend. `GET /audit/recent?n=&denied=1` returns the newest audit lines (token-gated, `n` ≤ 1000, tail of the newest file only) |
+| Status page | `GET /dashboard` and `/dashboard.js`: static, no data, no token needed, `Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'`. The page fetches `/healthz` and `/audit/recent` with a token the viewer types in, kept in `sessionStorage`. Nothing behind it writes |
+| TLS | With `listen.tls: { cert, key }` (PEM paths, `~` expanded) the listener is HTTPS. Binding beyond loopback without it logs `insecure_lan` at startup — allowed, since the token is required, but the token then crosses the network in the clear |
 | `/healthz` | `200 {status}` always; the `{uptime_s, sessions, pending_drift, backends}` detail only when the request is authorized, since it names backends and pids |
 | Session | `Mcp-Session-Id` response header on initialize; required on subsequent requests. Unknown/expired → `404`, client re-initializes |
 | SSE | `GET` opens the server→client stream. Resumable: every event carries an id, and a client that lost a stream reconnects with `Last-Event-ID` to receive what it missed. Kept per session in memory, the last 256 events or 4 MiB; an evicted or unknown id is `400` and the client re-initializes |
 | Termination | `DELETE` ends the session and releases its id-map entries |
 | Body limit | 4 MiB; exceeded → `413` |
 | Idle expiry | 30 min with no request open and none arriving → session dropped. An open GET stream or a long call is not idle |
-| Token | When `listen.token` is set, every request must carry `Authorization: Bearer <token>`; compared with `timingSafeEqual`. Missing/wrong → `401` |
+| Token | When `listen.token` is set, every request must carry `Authorization: Bearer <token>`; compared with `timingSafeEqual`. Missing/wrong → `401`, and an audit line `{ method: "unauthorized", path, remote }` |
 | Origin | `Origin` header, when present, must be `localhost` or `127.0.0.1` — blocks DNS-rebinding from a browser tab. Checked **first**, before the token and before `/healthz`, so no route answers a browser tab |
 | Host | Without `listen.token`, the `Host` header must name a loopback host, else `403`. Covers the rebinding case `Origin` cannot: a browser omits `Origin` on a same-origin GET, and a rebound page is same-origin with itself. With a token set any Host is accepted — LAN names are legitimate, and detail is token-gated |
 
@@ -520,6 +528,7 @@ mcpgw validate  [--config PATH]         # exit 1 on any config error
 mcpgw status    [--json]                # backends, uptime, restarts, drift, sessions
 mcpgw pin       [--yes] [--server NAME] # review + accept tool changes
 mcpgw tail      [--profile P] [--denied-only] [--follow]
+mcpgw query     SQL [--json]            # SQL over the audit log; table `audit`, see below
 mcpgw list      [--profile P]           # effective exposed tools after policy
 mcpgw reload                            # re-read the config in the running daemon
 mcpgw restart   SERVER                  # reconnect one backend in the running daemon
@@ -532,6 +541,17 @@ which is exactly those two cases.
 
 `mcpgw list` is the debugging workhorse: it answers "why can't the model see this tool"
 by printing each tool with its decision and the rule that produced it.
+
+`mcpgw query` runs one SQL statement over the audit log. It keeps `index.sqlite` in the audit
+directory, built with the built-in `node:sqlite` and caught up incrementally from each JSONL
+file's last complete line. Table `audit` has `id, ts, session, profile, client_name, method,
+server, tool, exposed_as, decision, status, dur_ms, result_bytes` and `line`, the original JSON,
+for `json_extract`. The statement runs on a read-only connection. The index is derived and
+disposable; the daemon never reads or writes it.
+
+`http`/`sse` servers with `auth: oauth` take `oauth_grant: authorization_code` (default; the
+browser flow, once, via `mcpgw auth`) or `client_credentials` (requires `client_id` and
+`client_secret`; the daemon fetches its own tokens and `mcpgw auth` has nothing to do).
 
 Signals: `SIGHUP` reloads config (restarting only servers whose definition changed);
 `SIGTERM`/`SIGINT` drain in-flight calls up to 5 s, then kill children and exit 0.

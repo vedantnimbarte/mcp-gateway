@@ -157,11 +157,14 @@ existing three dependencies only.
 
 **Exit:** an approve-listed call is refused unless the human accepts it in the client.
 
-## Phase 10 — Operator tooling and LAN
+## Phase 10 — Operator tooling and LAN · *done*
 
 - PRD amended to allow a read-only status page, token over TLS, and a CLI-only SQLite index
-- `mcpgw query` over a derived `node:sqlite` index of the JSONL; read-only `/dashboard`
-- `listen.tls`; configurable OAuth callback port and client-credentials grant; opt-in pagination
+- `mcpgw query` over a derived `node:sqlite` index of the JSONL; read-only `/dashboard` with a
+  token-gated `/audit/recent`
+- `listen.tls`, an `insecure_lan` warning without it, and an audit line per refused token
+- Configurable OAuth callback port and a `client_credentials` grant; opt-in `listen.page_size`
+- Device-code OAuth stays out: no SDK support and no trigger
 
 **Exit:** `mcpgw query` answers what one line of `jq` could not; runtime deps still three.
 
@@ -186,8 +189,9 @@ accommodates them. *(Done after cutover, as planned: the catalog took them witho
 
 | Item | Build it when |
 |------|---------------|
-| SQLite audit + `mcpgw query` | A `jq` invocation you want takes more than one line |
-| Read-only web dashboard | You check the log more than weekly |
+| ~~SQLite audit + `mcpgw query`~~ | *Done in Phase 10, as a derived index* |
+| ~~Read-only web dashboard~~ | *Done in Phase 10, at `/dashboard`* |
+| mTLS | A shared token over TLS stops being enough |
 | ~~Approval prompts for high-risk tools~~ | *Done in Phase 9, through MCP elicitation* |
 | ~~Content scanning for injected instructions~~ | *Done in Phase 9, as heuristics* |
 | ~~Response cache for idempotent tools~~ | *Done in Phase 8, opt-in per server* |
@@ -208,8 +212,9 @@ at the relevant code site so they surface later.
 | Rate limits persisted only on graceful shutdown | A crash resets the buckets | Write them periodically |
 | Best-effort audit writes by default | A crash can lose the last few lines | `audit.durable: true` (Phase 9) |
 | No session persistence | Restart forces clients to re-initialize | MCP already handles this; leave it |
-| `tools/list` pagination collapsed | A backend with 1000 tools returns one large page | Paginate the merged catalog |
-| Single process | One core ceiling | Multiple daemons on different ports |
+| Listings are one page by default | A backend with 1000 tools returns one large page | `listen.page_size` (Phase 10) |
+| Single process | One core ceiling | Several daemons, each with its own config directory and port (README) |
+| Status page's audit view reads today's file only | Just after midnight UTC it shows little | Walk back into the previous file |
 | Content scanning is regex heuristics | Catches careless injections, not careful ones | A model-based review |
 | Approval waits hold rate-limit slots | A human who walks away holds a slot for `approval_timeout_ms` | Release slots while waiting, re-acquire on yes |
 | Process trees are not cleaned up after a crash | A crashed launcher can leave its children | Own the spawn, detached, and signal the process group |

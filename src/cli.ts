@@ -10,8 +10,8 @@ import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { AuditLine } from "./audit.js";
-import { ConfigError, loadConfig, type Config } from "./config.js";
-import { BackendAuth, CALLBACK_PATH, CALLBACK_PORT, REDIRECT_URI, TokenStore } from "./oauth.js";
+import { ConfigError, isLoopback, loadConfig, type Config } from "./config.js";
+import { BackendAuth, CALLBACK_PATH, redirectUri, TokenStore } from "./oauth.js";
 import { assemble, startGateway } from "./server.js";
 
 /** SPEC §11: drain in-flight calls up to 5 s, then kill children and exit 0. */
@@ -30,6 +30,7 @@ Usage:
   mcpgw reload   [--config PATH]                         re-read the config in the running daemon
   mcpgw restart  SERVER [--config PATH]                  reconnect one backend in the running daemon
   mcpgw tail     [--config PATH] [--profile P] [--denied-only] [--follow]
+  mcpgw query    SQL [--config PATH] [--json]            SQL over the audit log (table: audit)
 
 Signals: SIGHUP reloads the config (POSIX only; on Windows use 'mcpgw reload').
          SIGTERM/SIGINT drain in-flight calls for up to 5 s, then exit.
@@ -67,6 +68,10 @@ async function start(
   // Bind before the backends connect: a slow `npx` cold start must never delay the port (NFR-6).
   const gateway = await startGateway(config, parts, { port, configPath });
   log("listening", { url: gateway.url, profiles: Object.keys(config.profiles) });
+  // Allowed, since the token is set (NFR-2), but the token then crosses the network in the clear.
+  if (!isLoopback(config.listen.host) && !config.listen.tls) {
+    log("insecure_lan", { host: config.listen.host, hint: "set listen.tls so the token is not sent in the clear" });
+  }
 
   const shutdown = (signal: string) => {
     log("draining", { signal, inflight: parts.pipeline.inflight });
@@ -206,7 +211,10 @@ function openBrowser(url: URL): void {
 }
 
 /** Catches the one redirect the authorization server sends back, then shuts itself down. */
-function awaitCallback(auth: BackendAuth): { code: Promise<string>; close: () => void } {
+function awaitCallback(
+  auth: BackendAuth,
+  port: number,
+): { code: Promise<string>; close: () => void } {
   let settle: (code: string) => void;
   let fail: (e: Error) => void;
   const code = new Promise<string>((ok, no) => {
@@ -215,7 +223,7 @@ function awaitCallback(auth: BackendAuth): { code: Promise<string>; close: () =>
   });
 
   const server = createServer((req, res) => {
-    const url = new URL(req.url ?? "/", REDIRECT_URI);
+    const url = new URL(req.url ?? "/", redirectUri(port));
     if (url.pathname !== CALLBACK_PATH) {
       res.writeHead(404).end();
       return;
@@ -248,7 +256,7 @@ function awaitCallback(auth: BackendAuth): { code: Promise<string>; close: () =>
     settle(granted);
   });
 
-  server.listen(CALLBACK_PORT, "127.0.0.1");
+  server.listen(port, "127.0.0.1");
   server.on("error", (e) => fail(e));
   return { code, close: () => server.close() };
 }
@@ -281,7 +289,12 @@ async function authorize(
     console.error(`${server} is not configured with \`auth: oauth\``);
     return 1;
   }
+  if (cfg.oauth_grant === "client_credentials") {
+    console.log(`${server} uses client_credentials: the daemon fetches its own token, nothing to do`);
+    return 0;
+  }
 
+  const port = config.listen.oauth_callback_port;
   const store = new TokenStore(TokenStore.pathFor(configPath));
   if (opts.reset) store.clear(server, "all");
 
@@ -289,6 +302,7 @@ async function authorize(
     scope: cfg.scope,
     clientId: cfg.client_id,
     clientSecret: cfg.client_secret,
+    callbackPort: port,
     onRedirect: (url) => {
       console.log(`
 authorize ${server} here:
@@ -321,7 +335,7 @@ authorize ${server} here:
     }
 
     // The redirect has been issued by now; catch the code it comes back with.
-    listener = awaitCallback(auth);
+    listener = awaitCallback(auth, port);
     console.log("waiting for the redirect (Ctrl-C to abandon)…");
     const code = await Promise.race([
       listener.code,
@@ -354,7 +368,7 @@ authorized ${server}: ${tools.length} tools reachable`);
         `
 ${server} appears to refuse dynamic client registration. Create an OAuth app with` +
           `
-redirect URI ${REDIRECT_URI}, then add its credentials to the server block:
+redirect URI ${redirectUri(port)}, then add its credentials to the server block:
 ` +
           `
   ${server}:
@@ -371,11 +385,34 @@ redirect URI ${REDIRECT_URI}, then add its credentials to the server block:
   }
 }
 
+/**
+ * SQL over the audit log. Loaded on demand: node:sqlite prints an experimental warning on some
+ * Node versions, and no other command should pay for it.
+ */
+async function runQuery(config: Config, sql: string | undefined, asJson?: boolean): Promise<number> {
+  if (!sql) {
+    console.error(
+      'which query? e.g. mcpgw query "select tool, count(*) from audit ' +
+        "where decision != 'allow' group by tool\"",
+    );
+    return 1;
+  }
+  const { query, renderRows } = await import("./query.js");
+  try {
+    const rows = query(config.audit.dir, sql);
+    console.log(asJson ? JSON.stringify(rows, null, 2) : renderRows(rows));
+    return 0;
+  } catch (e) {
+    console.error(`query failed: ${(e as Error).message}`);
+    return 1;
+  }
+}
+
 /** Where the running daemon listens, and the header every control route needs. */
 function daemon(config: Config): { base: string; headers: Record<string, string> } {
-  const { host, port, token } = config.listen;
+  const { host, port, token, tls } = config.listen;
   return {
-    base: `http://${host}:${port}`,
+    base: `${tls ? "https" : "http"}://${host}:${port}`,
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   };
 }
@@ -552,7 +589,9 @@ async function main(argv: string[]): Promise<number> {
   });
 
   const command = positionals[0];
-  const known = ["start", "validate", "list", "pin", "tail", "status", "reload", "restart", "auth"];
+  const known = [
+    "start", "validate", "list", "pin", "tail", "query", "status", "reload", "restart", "auth",
+  ];
 
   if (values.help || !command) {
     console.log(USAGE);
@@ -596,6 +635,8 @@ async function main(argv: string[]): Promise<number> {
         reset: values.reset,
         printUrl: values["print-url"],
       });
+    case "query":
+      return runQuery(config, positionals[1], values.json);
     case "tail":
       return tail(config, {
         profile: values.profile,

@@ -5,6 +5,9 @@ import {
   fsyncSync,
   mkdirSync,
   openSync,
+  readdirSync,
+  readSync,
+  statSync,
   writeSync,
   type WriteStream,
 } from "node:fs";
@@ -54,6 +57,54 @@ export interface AuditLine {
 
 /** What callers pass: the documented fields, plus whatever else an event carries. */
 export type AuditInput = Partial<AuditLine> & { method: string };
+
+/** How far back `recentLines` reads into the newest file: bounded, whatever the day's volume. */
+const RECENT_BYTES = 2 * 1024 * 1024;
+
+/**
+ * The last `n` lines of the newest audit file, newest last, optionally only the refusals and
+ * errors. Reads only the file's tail, so a busy day's log costs the same as a quiet one.
+ *
+ * ponytail: today's (newest) file only; just after midnight UTC it holds little. Upgrade: walk
+ * back into the previous file when this one runs short.
+ */
+export function recentLines(dir: string, n: number, deniedOnly = false): AuditLine[] {
+  let files: string[];
+  try {
+    files = readdirSync(dir).filter((f) => f.endsWith(".jsonl")).sort();
+  } catch {
+    return [];
+  }
+  const newest = files.at(-1);
+  if (!newest) return [];
+
+  const path = join(dir, newest);
+  const size = statSync(path).size;
+  const start = Math.max(0, size - RECENT_BYTES);
+  const buffer = Buffer.alloc(size - start);
+  const fd = openSync(path, "r");
+  try {
+    readSync(fd, buffer, 0, buffer.length, start);
+  } finally {
+    closeSync(fd);
+  }
+  const text = buffer.toString("utf8");
+  // Starting mid-file means the first line is a fragment.
+  const lines = text.split("\n").slice(start > 0 ? 1 : 0).filter(Boolean);
+
+  const parsed: AuditLine[] = [];
+  for (const line of lines) {
+    try {
+      parsed.push(JSON.parse(line) as AuditLine);
+    } catch {
+      // A line cut by a crash mid-write is skipped, not fatal.
+    }
+  }
+  const wanted = deniedOnly
+    ? parsed.filter((l) => (l.decision !== undefined && l.decision !== "allow") || l.status === "error")
+    : parsed;
+  return wanted.slice(-n);
+}
 
 let counter = 0;
 /** Short, sortable-ish, and unique enough for one process (SPEC §7 only needs an id). */
