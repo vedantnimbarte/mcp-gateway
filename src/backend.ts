@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { UnauthorizedError, type OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
+import { OAuthError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -41,7 +42,7 @@ import type {
 } from "@modelcontextprotocol/sdk/types.js";
 import { GATEWAY_INFO, type Config, type ServerConfig } from "./config.js";
 import { ERR, gwError } from "./errors.js";
-import { NeedsAuthorization } from "./oauth.js";
+import { BackendAuth, NeedsAuthorization } from "./oauth.js";
 
 export type BackendState = "connecting" | "up" | "down";
 
@@ -444,13 +445,24 @@ export class Backend {
     // An OAuth backend with nothing in the token store cannot be fixed by waiting: whatever
     // went wrong — a 401, or a server that advertises dynamic registration and then 403s it —
     // the next attempt does exactly the same thing.
-    const unauthorized = error instanceof UnauthorizedError || error instanceof NeedsAuthorization;
-    const needsAuth = unauthorized || (this.authProvider !== undefined && !this.#hasTokens());
+    // A client_credentials backend has no tokens until its first connect fetches one, and no
+    // `mcpgw auth` to run — so an empty store says nothing about it, and the advice differs.
+    const interactive = this.authProvider instanceof BackendAuth;
+    // An OAuthError is the authorization server's own refusal (invalid_client, invalid_grant…).
+    const unauthorized =
+      error instanceof UnauthorizedError ||
+      error instanceof NeedsAuthorization ||
+      error instanceof OAuthError;
+    const needsAuth = unauthorized || (interactive && !this.#hasTokens());
     this.needsAuth = needsAuth;
+    const message =
+      (error as Error).message || (error instanceof OAuthError ? error.errorCode : String(error));
     this.#fail(
-      needsAuth
-        ? `needs authorization: run \`mcpgw auth ${this.name}\``
-        : ((error as Error).message ?? String(error)),
+      !needsAuth
+        ? message
+        : interactive
+          ? `needs authorization: run \`mcpgw auth ${this.name}\``
+          : `authorization failed, check client_id and client_secret: ${message}`,
     );
     if (!needsAuth) this.#scheduleRestart();
   }

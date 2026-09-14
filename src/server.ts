@@ -1,9 +1,13 @@
 import { timingSafeEqual } from "node:crypto";
-import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import { readFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
+import type { AddressInfo, Server as NetServer } from "node:net";
 import { dirname } from "node:path";
+import { ClientCredentialsProvider } from "@modelcontextprotocol/sdk/client/auth-extensions.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { AuditLog } from "./audit.js";
+import { AuditLog, recentLines } from "./audit.js";
+import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard.js";
 import { ConfigError, isLoopback, loadConfig, type Config } from "./config.js";
 import { Guard } from "./guard.js";
 import { BackendAuth, TokenStore } from "./oauth.js";
@@ -49,10 +53,20 @@ export function assemble(
   const authFor = (server: string) => {
     const cfg = config.servers[server];
     if (!cfg || cfg.transport === "stdio" || cfg.auth !== "oauth") return undefined;
+    if (cfg.oauth_grant === "client_credentials") {
+      // Machine-to-machine: the SDK fetches a token itself whenever it has none, so there is no
+      // flow to run and nothing worth persisting.
+      return new ClientCredentialsProvider({
+        clientId: cfg.client_id!,
+        clientSecret: cfg.client_secret!,
+        scope: cfg.scope,
+      });
+    }
     return new BackendAuth(server, tokens, {
       scope: cfg.scope,
       clientId: cfg.client_id,
       clientSecret: cfg.client_secret,
+      callbackPort: config.listen.oauth_callback_port,
     });
   };
 
@@ -132,15 +146,30 @@ export async function startGateway(
   pool.onCatalogChange = () => sessions.notifyCatalogChanged();
   pool.onResourceUpdated = (server, uri) => sessions.notifyResourceUpdated(server, uri);
 
-  const http = createServer((req, res) => {
+  const listener = (req: IncomingMessage, res: ServerResponse) => {
     handle(req, res).catch((e: Error) => {
       if (!res.headersSent) rpcError(res, 500, -32603, e.message);
       else res.end();
     });
-  });
+  };
+  // TLS when configured: across a LAN the token would otherwise travel in the clear.
+  const tls = config.listen.tls;
+  const http = tls
+    ? createHttpsServer({ cert: readFileSync(tls.cert), key: readFileSync(tls.key) }, listener)
+    : createServer(listener);
+
+  /**
+   * A refused token is worth a line: on a LAN listener it is somebody probing. ponytail: one line
+   * per refusal, so a flood of them grows the log; rate-limit these if that ever happens.
+   */
+  const unauthorized = (req: IncomingMessage, res: ServerResponse, path: string) => {
+    audit.write({ method: "unauthorized", path, remote: req.socket.remoteAddress });
+    send(res, 401, { error: "unauthorized" });
+  };
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const path = new URL(req.url ?? "/", "http://localhost").pathname;
+    const url = new URL(req.url ?? "/", "http://localhost");
+    const path = url.pathname;
     const authorized = !token || tokenOk(token, req.headers.authorization);
 
     // Checked first, and for every route: a browser tab must not be able to reach any of them,
@@ -163,6 +192,21 @@ export async function startGateway(
       return;
     }
 
+    // The status page itself holds no data, so it needs no token; what it fetches does. The CSP
+    // keeps it to its own two files and its own origin.
+    if (path === "/dashboard" || path === "/dashboard.js") {
+      const html = path === "/dashboard";
+      res.writeHead(200, {
+        "content-type": html ? "text/html; charset=utf-8" : "text/javascript; charset=utf-8",
+        "content-security-policy":
+          "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+        "x-content-type-options": "nosniff",
+        "cache-control": "no-store",
+      });
+      res.end(html ? DASHBOARD_HTML : DASHBOARD_JS);
+      return;
+    }
+
     // Windows has no SIGHUP to deliver, so the reload has a door on the loopback listener too.
     // It reads config.yaml from disk; nothing in the request is trusted but the fact of it.
     if (path === "/reload") {
@@ -171,7 +215,7 @@ export async function startGateway(
         return;
       }
       if (!authorized) {
-        send(res, 401, { error: "unauthorized" });
+        unauthorized(req, res, path);
         return;
       }
       if (!opts.configPath) {
@@ -198,7 +242,7 @@ export async function startGateway(
         return;
       }
       if (!authorized) {
-        send(res, 401, { error: "unauthorized" });
+        unauthorized(req, res, path);
         return;
       }
       const server = decodeURIComponent(path.slice("/restart/".length));
@@ -213,7 +257,15 @@ export async function startGateway(
     }
 
     if (!authorized) {
-      send(res, 401, { error: "unauthorized" });
+      unauthorized(req, res, path);
+      return;
+    }
+
+    // What the status page shows below its backends. Read-only, and token-gated like the detail.
+    if (path === "/audit/recent") {
+      const n = Math.min(Math.max(Number(url.searchParams.get("n")) || 100, 1), 1000);
+      const deniedOnly = url.searchParams.get("denied") === "1";
+      send(res, 200, { lines: recentLines(audit.dir, n, deniedOnly) });
       return;
     }
 
@@ -288,7 +340,7 @@ export async function startGateway(
 
   const gateway: Gateway = {
     port,
-    url: `http://${host}:${port}`,
+    url: `${tls ? "https" : "http"}://${host}:${port}`,
     sessions,
     async reload(next: Config) {
       parts.guard.reload(next);
@@ -303,7 +355,7 @@ export async function startGateway(
 }
 
 async function closeAll(
-  http: HttpServer,
+  http: NetServer,
   sessions: SessionManager,
   parts: Parts,
   drainMs: number,

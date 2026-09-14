@@ -75,7 +75,7 @@ export async function startFakeProvider(options: FakeOptions = {}): Promise<Fake
         token_endpoint: `${origin()}/token`,
         registration_endpoint: `${origin()}/register`,
         response_types_supported: ["code"],
-        grant_types_supported: ["authorization_code", "refresh_token"],
+        grant_types_supported: ["authorization_code", "refresh_token", "client_credentials"],
         code_challenge_methods_supported: ["S256"],
         token_endpoint_auth_methods_supported: required
           ? ["client_secret_post", "client_secret_basic"]
@@ -127,6 +127,16 @@ export async function startFakeProvider(options: FakeOptions = {}): Promise<Fake
           json(res, 401, { error: "invalid_client" });
           return;
         }
+      }
+
+      // Machine-to-machine: only a confidential client, already checked above, may use it.
+      if (grant === "client_credentials") {
+        if (!required) {
+          json(res, 400, { error: "unauthorized_client" });
+          return;
+        }
+        json(res, 200, issue());
+        return;
       }
 
       if (grant === "refresh_token") {

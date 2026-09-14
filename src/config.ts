@@ -60,6 +60,11 @@ const Server = z.discriminatedUnion("transport", [
      */
     client_id: z.string().optional(),
     client_secret: z.string().optional(),
+    /**
+     * `client_credentials` is machine-to-machine: no browser and no `mcpgw auth`, the daemon
+     * fetches its own token with client_id and client_secret.
+     */
+    oauth_grant: z.enum(["authorization_code", "client_credentials"]).default("authorization_code"),
     restart: Restart,
     limits: ServerLimits,
     cache: Cache,
@@ -88,6 +93,12 @@ const ConfigSchema = z.object({
       host: z.string().default("127.0.0.1"),
       port: z.number().int().min(1).max(65535).default(8420),
       token: z.string().optional(),
+      // PEM files. Serves HTTPS, so a token sent across a LAN is not sent in the clear.
+      tls: z.object({ cert: z.string(), key: z.string() }).optional(),
+      // Absent: every list is one page, as clients mostly expect. Set it for very large profiles.
+      page_size: z.number().int().positive().optional(),
+      // Where `mcpgw auth` catches the OAuth redirect (see oauth.ts).
+      oauth_callback_port: z.number().int().min(1).max(65535).default(8419),
     })
     .default({}),
   defaults: z
@@ -208,6 +219,12 @@ function crossCheck(cfg: Config): string[] {
     if (server.auth !== "oauth" && (server.client_id || server.scope)) {
       problems.push(`servers.${key}: client_id/scope need \`auth: oauth\``);
     }
+    const machine = server.oauth_grant === "client_credentials";
+    if (machine && (server.auth !== "oauth" || !server.client_id || !server.client_secret)) {
+      problems.push(
+        `servers.${key}: client_credentials needs \`auth: oauth\`, client_id and client_secret`,
+      );
+    }
   }
 
   for (const field of ["redact", "scan_patterns"] as const) {
@@ -315,10 +332,12 @@ export function loadConfig(explicit?: string): { config: Config; path: string } 
   }
 
   const config = parsed.data;
+  const home = (p: string) => (p.startsWith("~") ? homedir() + p.slice(1) : p);
   for (const server of Object.values(config.servers)) {
-    if (server.transport === "stdio" && server.cwd?.startsWith("~")) {
-      server.cwd = homedir() + server.cwd.slice(1);
-    }
+    if (server.transport === "stdio" && server.cwd) server.cwd = home(server.cwd);
+  }
+  if (config.listen.tls) {
+    config.listen.tls = { cert: home(config.listen.tls.cert), key: home(config.listen.tls.key) };
   }
 
   const problems = crossCheck(config);

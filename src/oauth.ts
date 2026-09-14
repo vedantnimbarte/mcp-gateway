@@ -12,13 +12,13 @@ export const TOKENFILE = "tokens.json";
 
 /**
  * The redirect URI is registered with the authorization server on first use, so it has to be
- * the same string on every later run — which rules out an ephemeral port.
- *
- * ponytail: fixed port, no config knob. Add one when the port actually collides with something.
+ * the same string on every later run — which rules out an ephemeral port. `listen.
+ * oauth_callback_port` moves it when this one is taken; an OAuth app registered by hand must then
+ * be given the new URI too.
  */
 export const CALLBACK_PORT = 8419;
 export const CALLBACK_PATH = "/callback";
-export const REDIRECT_URI = `http://127.0.0.1:${CALLBACK_PORT}${CALLBACK_PATH}`;
+export const redirectUri = (port = CALLBACK_PORT) => `http://127.0.0.1:${port}${CALLBACK_PATH}`;
 
 interface Entry {
   client?: OAuthClientInformationMixed;
@@ -127,18 +127,19 @@ export class BackendAuth implements OAuthClientProvider {
       scope?: string;
       clientId?: string;
       clientSecret?: string;
+      callbackPort?: number;
       onRedirect?: (url: URL) => void;
     } = {},
   ) {}
 
   get redirectUrl(): string {
-    return REDIRECT_URI;
+    return redirectUri(this.opts.callbackPort);
   }
 
   get clientMetadata(): OAuthClientMetadata {
     return {
       client_name: `mcp-gateway (${this.server})`,
-      redirect_uris: [REDIRECT_URI],
+      redirect_uris: [this.redirectUrl],
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       token_endpoint_auth_method: this.opts.clientSecret ? "client_secret_post" : "none",

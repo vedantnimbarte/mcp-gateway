@@ -226,7 +226,7 @@ to documentation.
 | Credential leakage into logs | Env-var-only secrets, regex redaction, error scrubbing |
 | Runaway/looping agent | Per-profile rpm + concurrency caps |
 | Oversized/hostile payloads | Result size cap, JSON body limit |
-| Remote access to an unauthenticated daemon | Loopback-only bind, enforced at startup |
+| Remote access to an unauthenticated daemon | Loopback-only bind unless a token is set, enforced at startup; `listen.tls` so that token is not sent in the clear, a startup warning when it is, and an audit line for every refused token |
 
 Non-goals: an attacker with local shell access already has your env vars and can call the
 backends directly. Defending that would require auth, which is explicitly out of scope.
@@ -281,7 +281,7 @@ the rest are I/O wiring.
 |----------|---------------------|--------|
 | One shared connection per backend | Connection per session | Defeats P2, the main point of the gateway |
 | No database | Postgres + Redis | Single process, single user. A DB is an operational burden buying nothing |
-| JSONL audit | SQLite | `jq` is the query engine. Revisit when it stops answering questions |
+| JSONL audit | SQLite | `jq` is the query engine; `mcpgw query` builds a derived SQLite index from the JSONL for what `jq` cannot answer, and never replaces it |
 | Full protocol termination | Transparent byte-forwarding | You cannot filter, rename, or audit what you do not parse |
 | Config file + SIGHUP | Runtime admin API | No UI, no second user. An API would be its own attack surface with no auth to protect it |
 | Namespace `server__tool` | Bare names with collision resolution | Deterministic, debuggable, obvious in the audit log |

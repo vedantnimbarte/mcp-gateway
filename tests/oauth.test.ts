@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, before, test } from "node:test";
@@ -9,6 +9,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { loadConfig } from "../src/config.js";
 import { BackendAuth, NeedsAuthorization, TokenStore } from "../src/oauth.js";
 import { Pool } from "../src/pool.js";
+import { assemble } from "../src/server.js";
 import { startFakeProvider, type FakeProvider } from "./oauth-server.js";
 
 const dir = mkdtempSync(join(tmpdir(), "mcpgw-oauth-"));
@@ -230,4 +231,89 @@ test("the wrong client secret is rejected, not silently downgraded", async () =>
   } finally {
     await strict.close();
   }
+});
+
+/** A daemon's whole object graph over one client_credentials backend. */
+async function machineGateway(provider: FakeProvider, secret: string) {
+  // Its own directory: tokens.json lives beside the config, and the tests above share theirs.
+  const path = join(mkdtempSync(join(tmpdir(), "mcpgw-m2m-")), "config.yaml");
+  writeFileSync(
+    path,
+    `version: 1
+audit:
+  dir: ${JSON.stringify(join(dir, "audit-m2m"))}
+servers:
+  machine:
+    transport: http
+    url: ${JSON.stringify(provider.mcpUrl)}
+    auth: oauth
+    oauth_grant: client_credentials
+    client_id: robot
+    client_secret: ${secret}
+profiles:
+  default:
+    servers: ["*"]
+`,
+  );
+  const { config } = loadConfig(path);
+  return { parts: assemble(config, path), path };
+}
+
+test("a client_credentials backend comes up by itself, with no browser and no stored tokens", async () => {
+  const provider = await startFakeProvider({ requireClient: { id: "robot", secret: "beep" } });
+  const { parts, path } = await machineGateway(provider, "beep");
+  try {
+    await parts.pool.start();
+    const backend = parts.pool.backends.get("machine")!;
+    assert.equal(backend.state, "up", backend.lastError ?? "");
+    assert.deepEqual(await backend.callTool("secret", { of: "a robot" }), {
+      content: [{ type: "text", text: "secret of a robot" }],
+    });
+    assert.equal(existsSync(TokenStore.pathFor(path)), false, "nothing to persist");
+  } finally {
+    await parts.pool.close();
+    await parts.audit.close();
+    await provider.close();
+  }
+});
+
+test("a client_credentials backend with a wrong secret says so, instead of sending you to mcpgw auth", async () => {
+  const provider = await startFakeProvider({ requireClient: { id: "robot", secret: "beep" } });
+  const { parts } = await machineGateway(provider, "boop");
+  try {
+    await parts.pool.start();
+    const backend = parts.pool.backends.get("machine")!;
+    assert.equal(backend.state, "down");
+    assert.match(backend.lastError ?? "", /check client_id and client_secret/);
+    assert.doesNotMatch(backend.lastError ?? "", /mcpgw auth/);
+  } finally {
+    await parts.pool.close();
+    await parts.audit.close();
+    await provider.close();
+  }
+});
+
+test("the callback port is configurable, and the redirect URI follows it", () => {
+  const auth = new BackendAuth("p", store, { callbackPort: 9123 });
+  assert.equal(auth.redirectUrl, "http://127.0.0.1:9123/callback");
+  assert.deepEqual(auth.clientMetadata.redirect_uris, ["http://127.0.0.1:9123/callback"]);
+  assert.equal(new BackendAuth("p", store).redirectUrl, "http://127.0.0.1:8419/callback");
+});
+
+test("client_credentials without a secret is a config error", () => {
+  const path = join(dir, "m2m-bad.yaml");
+  writeFileSync(
+    path,
+    `version: 1
+servers:
+  machine:
+    transport: http
+    url: https://example.com/mcp
+    auth: oauth
+    oauth_grant: client_credentials
+    client_id: robot
+profiles: {}
+`,
+  );
+  assert.throws(() => loadConfig(path), /client_credentials needs/);
 });

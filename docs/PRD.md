@@ -31,7 +31,9 @@ Explicitly out of scope. Do not build these; do not leave hooks for them.
 - **Client authentication.** No OAuth, no OIDC, no API keys, no users, no roles, no RBAC.
   The trust boundary is the local machine (see NFR-2).
 - Multi-tenancy, orgs, billing, licensing, public positioning.
-- Admin web UI. YAML file + CLI only.
+- An admin web UI that changes anything. Configuration is the YAML file + CLI only. *(Amended
+  2026-09-14: a read-only status page served by the daemon is allowed — it shows what `/healthz`
+  and the audit log already show, behind the same token, and has no route that writes.)*
 - SIEM export, SOC 2 / HIPAA audit shaping, hash-chained tamper-evident logs.
 - A secrets vault. Backend credentials come from environment variables.
 - Kubernetes, Helm, horizontal scaling, clustering.
@@ -97,7 +99,7 @@ Design consequence: optimise for *edit-a-file-and-restart*, not for runtime API-
 
 | ID | Requirement |
 |----|-------------|
-| NFR-1 | Single Node process. No database, no Redis, no external services. |
+| NFR-1 | Single Node process. No database server, no Redis, no external services. *(Amended 2026-09-14: `mcpgw query` may build a derived, deletable SQLite index with the built-in `node:sqlite`. JSONL stays the source of truth, and the daemon never touches the index.)* |
 | NFR-2 | **Bind `127.0.0.1` by default. Refuse to bind any non-loopback address unless `listen.token` is set.** Without client auth, port reachability *is* full authority over every configured credential — this interlock is what makes "no auth" safe, and it is not optional. |
 | NFR-3 | Backend credentials come from environment variables via `${VAR}` interpolation. Never written to config, never logged, redacted from error messages. |
 | NFR-4 | Gateway overhead ≤ 15 ms p95 on top of backend latency for `tools/call`. |
@@ -128,9 +130,9 @@ Ordered by likely regret. Nothing here blocks v1.
 
 | Deferred | Add when |
 |----------|----------|
-| SQLite-backed audit | JSONL + `jq` stops answering your questions |
-| Read-only web dashboard | You want to look at the log more than once a week |
+| ~~SQLite-backed audit~~ | *Built in Phase 10 as a derived index behind `mcpgw query` (NFR-1 amended)* |
+| ~~Read-only web dashboard~~ | *Built in Phase 10 (§3 amended)* |
 | ~~Human-in-the-loop approval for high-risk tools~~ | *Built in Phase 9 (ROADMAP), through MCP elicitation* |
 | ~~Content-based prompt-injection scanning~~ | *Built as heuristics in Phase 9 (ROADMAP)* |
 | Response caching for idempotent tools | Latency becomes annoying |
-| Shared token / mTLS for LAN exposure | You genuinely need it from another machine |
+| mTLS for LAN exposure | A shared token over TLS stops being enough. *(The token existed from v1; TLS for it was built in Phase 10.)* |

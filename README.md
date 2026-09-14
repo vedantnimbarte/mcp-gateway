@@ -184,6 +184,7 @@ hanging on the first tool call.
 | `mcpgw reload` | Re-read the config in the running daemon (what SIGHUP does) |
 | `mcpgw restart <server>` | Reconnect one backend without touching the others or the daemon |
 | `mcpgw tail --denied-only` | Stream the audit log |
+| `mcpgw query "<SQL>"` | SQL over the audit log, for what one line of `jq` cannot answer |
 
 `mcpgw list` is the one to reach for when a tool isn't showing up — it prints the decision and
 the exact rule that produced it.
@@ -227,7 +228,8 @@ authorization only burns backoff until a human acts.
 
 **Servers that refuse dynamic registration.** Many commercial servers advertise a registration
 endpoint and then reject it, because they expect an OAuth app you created by hand. Figma is one.
-Create the app with redirect URI `http://127.0.0.1:8419/callback`, then:
+Create the app with redirect URI `http://127.0.0.1:8419/callback` (or another port, set as
+`listen.oauth_callback_port`, if 8419 is taken), then:
 
 ```yaml
 servers:
@@ -242,6 +244,23 @@ servers:
 
 The credentials come from the environment like every other secret. With `client_id` set, no
 registration is attempted at all.
+
+**Machine-to-machine servers.** A server that issues tokens to a client ID and secret, with no
+user in the loop, needs no browser at all:
+
+```yaml
+servers:
+  internal:
+    transport: http
+    url: https://mcp.internal.example/mcp
+    auth: oauth
+    oauth_grant: client_credentials
+    client_id: ${INTERNAL_CLIENT_ID}
+    client_secret: ${INTERNAL_CLIENT_SECRET}
+```
+
+The daemon fetches its own token and fetches another when it expires. A wrong secret leaves the
+backend DOWN with `authorization failed, check client_id and client_secret`, not retrying.
 
 ## Policy
 
@@ -321,6 +340,28 @@ jq 'select(.decision != "allow")' audit/*.jsonl
 Arguments are hashed by default. Set `log_args: full` to record them, or `none` to record
 nothing — either way, configured regex patterns are redacted before anything is written.
 
+When a question outgrows one line of `jq`, ask it in SQL:
+
+```bash
+mcpgw query "select tool, count(*) as refused from audit where decision != 'allow' group by tool"
+mcpgw query "select server, count(*) as calls, max(dur_ms) as slowest from audit
+             where method = 'tools/call' and ts >= date('now', '-7 days') group by server"
+mcpgw query "select json_extract(line, '$.error.message') as error, count(*) from audit
+             where status = 'error' group by error" --json
+```
+
+It keeps an index, `audit/index.sqlite`, built with Node's own SQLite and caught up from the JSONL
+on every query. The JSONL stays the record: delete the index and the next query rebuilds it. The
+table is `audit`, with the common fields as columns and the whole original line in `line`.
+Queries run on a read-only connection.
+
+## Status page
+
+`http://127.0.0.1:8420/dashboard` shows the backends, pending pinning changes, and the most recent
+refusals and errors, refreshing every five seconds. It is read-only — nothing behind it changes
+anything — and it shows only what `/healthz` and the audit log already show. With `listen.token`
+set, it asks for the token and keeps it for that browser tab only.
+
 ## Tool pinning
 
 The first time a tool or prompt is seen, a hash of what it tells the model — name, description,
@@ -353,14 +394,17 @@ Deliberate, and each one is marked in the code:
 - **Rate limits survive only a graceful restart.** A crash resets the buckets.
 - **Audit writes are best-effort by default.** A hard crash can lose the last few lines;
   `audit.durable: true` fsyncs every line, at the cost of a synchronous write per request.
-- **`tools/list` pagination is collapsed** into a single page.
+- **Listings are one page by default.** Set `listen.page_size` for a profile with a very large
+  catalog; many clients never follow a cursor, which is why it is not the default.
 - **SSE resumption is in memory.** A client that drops its stream can resume with
   `Last-Event-ID` from the last 256 events (4 MiB) of its session; after a daemon restart, or a
   longer gap, it re-initializes.
 - **Approvals hold their slot.** A call waiting on a human keeps its rate-limit slots for up to
   `approval_timeout_ms`.
-- **OAuth is authorization-code only.** Client-credentials and device-code flows are not wired,
-  and the callback listens on a fixed `127.0.0.1:8419`.
+- **No device-code OAuth.** Authorization code (with a browser, once) and client credentials are
+  supported; the device flow is not.
+- **One process.** To use more cores, or to keep two sets of credentials apart, run several
+  daemons — see below.
 
 ## Security
 
@@ -371,9 +415,36 @@ address** unless you explicitly set `listen.token`. Reaching the port means inhe
 credential the gateway holds — the interlock is enforced at startup, not left to convention.
 
 Two smaller rules follow from the same reasoning. The `Origin` check runs before everything
-else, so no route — not even `/healthz` — answers a browser tab. And `/healthz` returns bare
-liveness to an unauthorized caller: backend names, pids and error strings are detail, and detail
-needs the token. The bridge only ever needed the liveness half.
+else, and without a token the `Host` header must be loopback too, so no route — not even
+`/healthz` — answers a browser tab or a DNS-rebound page. And `/healthz` returns bare liveness to
+an unauthorized caller: backend names, pids and error strings are detail, and detail needs the
+token. The bridge only ever needed the liveness half.
+
+**Reaching it from another machine.** Set a token, a non-loopback host, and TLS, so the token is
+not sent across the network in the clear:
+
+```yaml
+listen:
+  host: 0.0.0.0
+  token: ${MCPGW_TOKEN}
+  tls: { cert: ~/certs/gateway.pem, key: ~/certs/gateway-key.pem }
+```
+
+Without `tls` the daemon still starts, and logs `insecure_lan` to say so. Every refused token is
+written to the audit log with the address it came from. A client that must trust a self-signed
+certificate — the bridge, or `mcpgw status` — can be pointed at it with `NODE_EXTRA_CA_CERTS`.
+
+## Running several daemons
+
+One daemon is one process. To spread load, or to keep one set of credentials away from another,
+give each daemon its own directory: its own `config.yaml` with its own `listen.port`, and with it
+its own `tools.lock.json`, `tokens.json`, rate-limit state and `audit/`, all of which live beside
+the config. Point each client at the port of the daemon it belongs to.
+
+```bash
+mcpgw start --config ~/gateways/work/config.yaml       # listen.port: 8420
+mcpgw start --config ~/gateways/personal/config.yaml   # listen.port: 8430
+```
 
 ## Logo
 

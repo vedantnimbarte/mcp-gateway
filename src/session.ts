@@ -1,9 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   CompleteRequestSchema,
+  ErrorCode,
+  McpError,
   SetLevelRequestSchema,
   GetPromptRequestSchema,
   ListPromptsRequestSchema,
@@ -130,7 +132,49 @@ export interface Session {
  * `Server` correlates each session's ids, the SDK's `Client` allocates its own per backend, and
  * a reply resolves through the promise that issued it (SPEC §4.3).
  */
-function buildServer(pipeline: Pipeline, profile: string, sessionId: () => string | undefined): Server {
+/**
+ * One page of a listing (SPEC §4.1). The cursor carries an offset and a digest of the whole
+ * listing it was cut from: if the listing changed in between, the cursor is refused and the client
+ * starts over, rather than silently skipping or repeating entries.
+ */
+export function page<T>(
+  all: T[],
+  keyOf: (item: T) => string,
+  size: number | undefined,
+  cursor: string | undefined,
+): { items: T[]; nextCursor?: string } {
+  const refuse = (why: string) => new McpError(ErrorCode.InvalidParams, why);
+  if (!size) {
+    if (cursor !== undefined) throw refuse("this listing has no pages");
+    return { items: all };
+  }
+  const digest = createHash("sha256").update(all.map(keyOf).join("\n")).digest("base64url");
+  const encode = (o: number) => Buffer.from(JSON.stringify({ o, d: digest })).toString("base64url");
+
+  let offset = 0;
+  if (cursor !== undefined) {
+    let parsed: { o?: unknown; d?: unknown } = {};
+    try {
+      parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    } catch {
+      // falls through to the refusal below
+    }
+    const valid = parsed.d === digest && Number.isInteger(parsed.o) && (parsed.o as number) >= 0;
+    if (!valid) throw refuse("stale or invalid cursor: list again from the start");
+    offset = parsed.o as number;
+  }
+  const end = offset + size;
+  return end < all.length
+    ? { items: all.slice(offset, end), nextCursor: encode(end) }
+    : { items: all.slice(offset) };
+}
+
+function buildServer(
+  pipeline: Pipeline,
+  profile: string,
+  sessionId: () => string | undefined,
+  pageSize: () => number | undefined,
+): Server {
   const server = new Server(
     { ...GATEWAY_INFO },
     {
@@ -189,31 +233,54 @@ function buildServer(pipeline: Pipeline, profile: string, sessionId: () => strin
     return {};
   });
 
-  // ponytail: pagination collapsed — every list returns the whole filtered set in one page, with
-  // no nextCursor. Upgrade: paginate the merged catalog when a profile gets large enough to hurt.
-  server.setRequestHandler(ListToolsRequestSchema, () => ({
-    tools: pipeline.visibleTools(profile),
-  }));
+  // One page unless `listen.page_size` is set: many clients never follow a cursor.
+  server.setRequestHandler(ListToolsRequestSchema, (request) => {
+    const { items, nextCursor } = page(
+      pipeline.visibleTools(profile),
+      (t) => t.name,
+      pageSize(),
+      request.params?.cursor,
+    );
+    return { tools: items, nextCursor };
+  });
 
   server.setRequestHandler(CallToolRequestSchema, (request, extra) =>
     pipeline.callTool(ctx(extra), request.params.name, request.params.arguments),
   );
 
-  server.setRequestHandler(ListPromptsRequestSchema, () => ({
-    prompts: pipeline.visiblePrompts(profile),
-  }));
+  server.setRequestHandler(ListPromptsRequestSchema, (request) => {
+    const { items, nextCursor } = page(
+      pipeline.visiblePrompts(profile),
+      (p) => p.name,
+      pageSize(),
+      request.params?.cursor,
+    );
+    return { prompts: items, nextCursor };
+  });
 
   server.setRequestHandler(GetPromptRequestSchema, (request, extra) =>
     pipeline.getPrompt(ctx(extra), request.params.name, request.params.arguments),
   );
 
-  server.setRequestHandler(ListResourcesRequestSchema, () => ({
-    resources: pipeline.visibleResources(profile),
-  }));
+  server.setRequestHandler(ListResourcesRequestSchema, (request) => {
+    const { items, nextCursor } = page(
+      pipeline.visibleResources(profile),
+      (r) => r.uri,
+      pageSize(),
+      request.params?.cursor,
+    );
+    return { resources: items, nextCursor };
+  });
 
-  server.setRequestHandler(ListResourceTemplatesRequestSchema, () => ({
-    resourceTemplates: pipeline.visibleTemplates(profile),
-  }));
+  server.setRequestHandler(ListResourceTemplatesRequestSchema, (request) => {
+    const { items, nextCursor } = page(
+      pipeline.visibleTemplates(profile),
+      (t) => t.uriTemplate,
+      pageSize(),
+      request.params?.cursor,
+    );
+    return { resourceTemplates: items, nextCursor };
+  });
 
   server.setRequestHandler(ReadResourceRequestSchema, (request, extra) =>
     pipeline.readResource(ctx(extra), request.params.uri),
@@ -298,7 +365,12 @@ export class SessionManager {
       },
       onsessionclosed: (id) => this.#forget(id),
     });
-    const server = buildServer(this.pipeline, profile, () => transport.sessionId);
+    const server = buildServer(
+      this.pipeline,
+      profile,
+      () => transport.sessionId,
+      () => this.config.listen.page_size,
+    );
     // Fires after the handshake, which is when the client has actually named itself.
     server.oninitialized = () => {
       this.audit.write({
