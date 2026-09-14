@@ -31,6 +31,7 @@ import type {
   GetPromptResult,
   ListRootsRequest,
   ListRootsResult,
+  Progress,
   Prompt,
   ReadResourceResult,
   Resource,
@@ -58,10 +59,12 @@ export interface ReverseTarget {
   log(params: LoggingMessageNotification["params"]): void;
 }
 
-/** Who a request is on behalf of: the session to route reverse requests to, and its abort. */
+/** Who a request is on behalf of: where reverse requests and progress go, and its abort. */
 export interface Caller {
   caller?: ReverseTarget;
   signal?: AbortSignal;
+  /** Set only when the client asked for progress by sending a token. */
+  onprogress?: (progress: Progress) => void;
 }
 
 function makeTransport(cfg: ServerConfig, authProvider?: OAuthClientProvider): Transport {
@@ -240,8 +243,20 @@ export class Backend {
     }
   }
 
-  #opts(signal?: AbortSignal) {
-    return { timeout: this.defaults.call_timeout_ms, signal };
+  /**
+   * Aborting `signal` makes the SDK send notifications/cancelled to the backend (SPEC 4.3).
+   * `onprogress` is registered under the request's own id, so the SDK hands each progress note to
+   * the call that asked for it — no token map, and no chance of one client seeing another's.
+   * Progress also proves the call alive: it restarts `call_timeout_ms`, up to `max_call_ms`.
+   */
+  #opts(from: Caller = {}): RequestOptions {
+    return {
+      timeout: this.defaults.call_timeout_ms,
+      signal: from.signal,
+      onprogress: from.onprogress,
+      resetTimeoutOnProgress: true,
+      maxTotalTimeout: this.defaults.max_call_ms,
+    };
   }
 
   /** Walks nextCursor to the end and returns everything as one list. */
@@ -268,11 +283,11 @@ export class Backend {
       "tools/call",
       tool,
       (client) =>
-        client.callTool({ name: tool, arguments: args }, CallToolResultSchema, {
-          timeout: this.defaults.call_timeout_ms,
-          // Aborting this makes the SDK send notifications/cancelled to the backend (SPEC 4.3).
-          signal: from.signal,
-        }) as Promise<CallToolResult>,
+        client.callTool(
+          { name: tool, arguments: args },
+          CallToolResultSchema,
+          this.#opts(from),
+        ) as Promise<CallToolResult>,
       from.caller,
     );
   }
@@ -281,7 +296,7 @@ export class Backend {
     return this.#request(
       "resources/read",
       uri,
-      (client) => client.readResource({ uri }, this.#opts(from.signal)),
+      (client) => client.readResource({ uri }, this.#opts(from)),
       from.caller,
     );
   }
@@ -294,7 +309,7 @@ export class Backend {
     return this.#request(
       "prompts/get",
       name,
-      (client) => client.getPrompt({ name, arguments: args }, this.#opts(from.signal)),
+      (client) => client.getPrompt({ name, arguments: args }, this.#opts(from)),
       from.caller,
     );
   }
@@ -315,7 +330,7 @@ export class Backend {
     return this.#request(
       "completion/complete",
       params.ref.type,
-      (client) => client.complete(params, this.#opts(from.signal)),
+      (client) => client.complete(params, this.#opts(from)),
       from.caller,
     );
   }

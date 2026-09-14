@@ -147,9 +147,9 @@ optimistically and errors on the rare unroutable case; simpler, and the failure 
    changed receives `notifications/tools/list_changed`. Sessions whose filtered view is
    unaffected are not woken — otherwise a chatty backend spams every client.
 
-`notifications/progress` is not forwarded yet (SPEC §4.2). It does not need a token map when it
-is: the SDK routes a backend's progress to the one request that asked for it, so the handler
-for a call can rewrite the token back to the calling client's own.
+`notifications/progress` needs no token map: the SDK routes a backend's progress to the one
+request that asked for it, and that request's handler rewrites the token back to the calling
+client's own and sends it on that request's stream (SPEC §4.2).
 
 ### 3.4 Startup
 

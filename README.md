@@ -315,9 +315,9 @@ Deliberate, and each one is marked in the code:
 - **Rate limits are in memory.** Restarting the daemon resets them.
 - **Audit writes are best-effort.** A hard crash can lose the last few lines.
 - **`tools/list` pagination is collapsed** into a single page.
-- **`notifications/progress` is not forwarded.** It needs the same correlation as a reverse
-  request, and unlike a request there is no error code to return when the correlation fails.
-- **The SSE stream is not resumable.** A dropped connection is recovered by re-initializing.
+- **SSE resumption is in memory.** A client that drops its stream can resume with
+  `Last-Event-ID` from the last 256 events (4 MiB) of its session; after a daemon restart, or a
+  longer gap, it re-initializes.
 - **Prompts are not pinned.** The guard covers tools; a prompt has no `inputSchema` to hash
   alongside its text.
 - **OAuth is authorization-code only.** Client-credentials and device-code flows are not wired,

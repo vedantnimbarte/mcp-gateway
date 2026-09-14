@@ -68,6 +68,8 @@ const ConfigSchema = z.object({
     .object({
       call_timeout_ms: z.number().int().positive().default(30000),
       connect_timeout_ms: z.number().int().positive().default(10000),
+      // Progress restarts call_timeout_ms; this caps how long progress can keep a call alive.
+      max_call_ms: z.number().int().positive().default(600000),
     })
     .default({}),
   servers: z.record(z.string(), Server),
@@ -147,6 +149,13 @@ export function isLoopback(host: string): boolean {
 /** SPEC §1.4 cross-checks. Collects every problem rather than throwing on the first. */
 function crossCheck(cfg: Config): string[] {
   const problems: string[] = [];
+
+  if (cfg.defaults.max_call_ms < cfg.defaults.call_timeout_ms) {
+    problems.push(
+      `defaults.max_call_ms (${cfg.defaults.max_call_ms}) is below defaults.call_timeout_ms ` +
+        `(${cfg.defaults.call_timeout_ms}); no call could ever run as long as its own timeout`,
+    );
+  }
 
   if (!isLoopback(cfg.listen.host) && !cfg.listen.token) {
     problems.push(

@@ -124,12 +124,13 @@ existing three dependencies only.
 
 **Exit:** each fix has a test that fails without it.
 
-## Phase 7 — Long-running calls
+## Phase 7 — Long-running calls · *done*
 
 - Forward `notifications/progress`: the SDK's per-request `onprogress` already correlates exactly,
-  so this is *not* blocked on reverse-request routing as the deferred table below assumed
-- `resetTimeoutOnProgress` with a new `defaults.max_call_ms` ceiling
-- Resumable SSE via a bounded in-memory event store
+  so this was *not* blocked on reverse-request routing as the deferred table below assumed
+- Progress restarts `call_timeout_ms`, up to a new `defaults.max_call_ms` (default 10 min). The
+  gateway asks every backend call for progress, so this works for clients that never ask for it
+- Resumable SSE via a per-session event store, bounded by count and bytes
 
 **Exit:** a long tool shows progress through the gateway and completes past `call_timeout_ms`.
 
@@ -186,8 +187,8 @@ accommodates them. *(Done after cutover, as planned: the catalog took them witho
 | Response cache for idempotent tools | Latency becomes annoying enough to measure |
 | Per-server concurrency limits | One backend starts starving the others |
 | Config hot-reload without SIGHUP | Restarting becomes a genuine irritation — *done in Phase 5: Windows has no SIGHUP, so `POST /reload` and `mcpgw reload` exist* |
-| Forwarding `notifications/progress` | A long-running backend tool leaves a client visibly stuck. Blocked on the same correlation problem as reverse requests, with no `-32006` to fall back on |
-| SSE resumability (`Last-Event-ID`) | A dropped stream costs something. On loopback it costs a re-initialize, which clients already do |
+| ~~Forwarding `notifications/progress`~~ | *Done in Phase 7. It was never blocked on reverse-request correlation: the SDK routes progress by its own request id* |
+| ~~SSE resumability (`Last-Event-ID`)~~ | *Done in Phase 7, in memory and bounded* |
 | `mcpgw start --verbose` | The structured stderr log stops being enough |
 | ~~OAuth for `http`/`sse` backends~~ | *Done: `auth: oauth`, `mcpgw auth <server>`, refresh on expiry, and pre-registered clients for servers like Figma that refuse dynamic registration* |
 

@@ -22,8 +22,9 @@ listen:
   # token: ${MCPGW_TOKEN}   # sent as `Authorization: Bearer <token>`
 
 defaults:
-  call_timeout_ms: 30000
+  call_timeout_ms: 30000     # restarted by each progress note from the backend...
   connect_timeout_ms: 10000
+  max_call_ms: 600000        # ...up to this ceiling, which must be >= call_timeout_ms
 
 servers:
   github:
@@ -138,6 +139,7 @@ const Config = z.object({
   defaults: z.object({
     call_timeout_ms:    z.number().int().positive().default(30000),
     connect_timeout_ms: z.number().int().positive().default(10000),
+    max_call_ms:        z.number().int().positive().default(600000),
   }).default({}),
   servers:  z.record(Server),
   profiles: z.record(Profile),
@@ -247,10 +249,15 @@ number of its own calls, of any method. Unroutable reverse requests (no session,
 sessions) get `-32006` and an audit line with `decision: "unroutable"`. A routed request carries
 the backend's cancellation and is bounded by `call_timeout_ms`.
 
-`notifications/progress` is **not** forwarded. Routing it needs the same
-call-in-flight correlation as a reverse request, and unlike a request there is no `-32006` to
-return when the correlation fails — a misrouted progress note would surface one client's work
-inside another's. See the deferred table in ROADMAP.md.
+`notifications/progress` is forwarded for `tools/call`, `resources/read`, `prompts/get` and
+`completion/complete`. Unlike a reverse request it needs no guess: the gateway registers a
+progress handler on each backend request, the SDK delivers the backend's progress to that
+request's handler by its own id, and the handler re-sends it under the client's own
+`progressToken` on the client request's stream. The gateway asks every backend call for
+progress, whether or not the client did; a client that sent no token receives none.
+
+Progress also proves a call alive: each note restarts `call_timeout_ms`, up to
+`defaults.max_call_ms` in total. Either expiring is `-32002`.
 
 ### 4.3 ID remapping (normative)
 
@@ -383,7 +390,7 @@ session had already released.
 | `-32600` | Invalid request | Malformed JSON-RPC |
 | `-32601` | Method not found | Unproxied method, or unknown tool/alias |
 | `-32602` | Invalid params | Args fail the backend's `inputSchema` |
-| `-32002` | Request timeout | `call_timeout_ms` elapsed |
+| `-32002` | Request timeout | `call_timeout_ms` elapsed without progress, or `max_call_ms` elapsed |
 | `-32003` | Backend unavailable | Server DOWN, or died mid-call |
 | `-32004` | Blocked by policy | Any DENY from §3.1 steps 2–5 |
 | `-32005` | Rate limited | Bucket or semaphore exhausted |
@@ -402,7 +409,7 @@ not swallowed: original `code`/`message` land in `error.data.upstream`.
 | Path | `POST`/`GET`/`DELETE` `/mcp/<profile>`. Unknown profile → `404`. `POST /reload` re-reads the config; `POST /restart/<server>` reconnects one backend |
 | `/healthz` | `200 {status}` always; the `{uptime_s, sessions, pending_drift, backends}` detail only when the request is authorized, since it names backends and pids |
 | Session | `Mcp-Session-Id` response header on initialize; required on subsequent requests. Unknown/expired → `404`, client re-initializes |
-| SSE | `GET` opens the server→client stream. Not resumable: no event store is configured, so a dropped stream is re-established by the client re-initializing |
+| SSE | `GET` opens the server→client stream. Resumable: every event carries an id, and a client that lost a stream reconnects with `Last-Event-ID` to receive what it missed. Kept per session in memory, the last 256 events or 4 MiB; an evicted or unknown id is `400` and the client re-initializes |
 | Termination | `DELETE` ends the session and releases its id-map entries |
 | Body limit | 4 MiB; exceeded → `413` |
 | Idle expiry | 30 min with no request open and none arriving → session dropped. An open GET stream or a long call is not idle |

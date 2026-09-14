@@ -4,6 +4,7 @@ import type {
   CompleteRequest,
   CompleteResult,
   GetPromptResult,
+  Progress,
   Prompt,
   ReadResourceResult,
   Resource,
@@ -39,6 +40,8 @@ export interface CallContext {
   caller?: ReverseTarget;
   /** Aborted when the client cancels; carried through to the backend (SPEC 4.3). */
   signal?: AbortSignal;
+  /** Where the backend's progress for this call goes (SPEC 4.2). */
+  onprogress?: (progress: Progress) => void;
 }
 
 /** SPEC §3.3: under `on_drift: warn` a changed tool is still listed, but flagged. */

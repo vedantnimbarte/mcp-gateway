@@ -109,3 +109,12 @@ test("invalid redact pattern", () => {
   assert.equal(problems.length, 1);
   assert.match(problems[0]!, /guard\.redact\[1\]/);
 });
+
+test("max_call_ms below call_timeout_ms is refused", () => {
+  const problems = problemsOf(
+    "max-call",
+    `${base}defaults:\n  call_timeout_ms: 5000\n  max_call_ms: 1000\nprofiles:\n  default: {}\n`,
+  );
+  assert.equal(problems.length, 1);
+  assert.match(problems[0]!, /max_call_ms \(1000\) is below defaults\.call_timeout_ms \(5000\)/);
+});
