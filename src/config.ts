@@ -34,6 +34,9 @@ const Cache = z
   })
   .optional();
 
+/** Validated like any other server, then left out of everything the daemon runs (see loadConfig). */
+const Disabled = z.boolean().default(false);
+
 const Server = z.discriminatedUnion("transport", [
   z.object({
     transport: z.literal("stdio"),
@@ -44,6 +47,7 @@ const Server = z.discriminatedUnion("transport", [
     restart: Restart,
     limits: ServerLimits,
     cache: Cache,
+    disabled: Disabled,
   }),
   z.object({
     transport: z.enum(["http", "sse"]),
@@ -68,6 +72,7 @@ const Server = z.discriminatedUnion("transport", [
     restart: Restart,
     limits: ServerLimits,
     cache: Cache,
+    disabled: Disabled,
   }),
 ]);
 
@@ -135,7 +140,8 @@ const ConfigSchema = z.object({
     .default({}),
 });
 
-export type Config = z.infer<typeof ConfigSchema>;
+/** `disabled` names the servers loadConfig dropped from `servers` because they say `disabled: true`. */
+export type Config = z.infer<typeof ConfigSchema> & { disabled?: string[] };
 export type ServerConfig = z.infer<typeof Server>;
 export type ProfileConfig = z.infer<typeof Profile>;
 
@@ -308,7 +314,11 @@ export function loadConfig(explicit?: string): { config: Config; path: string } 
   } catch (e) {
     throw new ConfigError([`cannot read ${path}: ${(e as Error).message}`]);
   }
+  return { config: parseConfig(raw, path), path };
+}
 
+/** Everything loadConfig checks, on text that has not been written anywhere yet. */
+export function parseConfig(raw: string, path: string): Config {
   let doc: unknown;
   try {
     doc = YAML.parse(raw);
@@ -343,5 +353,9 @@ export function loadConfig(explicit?: string): { config: Config; path: string } 
   const problems = crossCheck(config);
   if (problems.length > 0) throw new ConfigError(problems);
 
-  return { config, path };
+  // Dropped only after the cross-checks, so a profile naming a disabled server is still valid.
+  // From here on a disabled server is simply absent: no process, no tools, nothing to route to.
+  const disabled = Object.keys(config.servers).filter((name) => config.servers[name]!.disabled);
+  for (const name of disabled) delete config.servers[name];
+  return { ...config, disabled };
 }

@@ -11,8 +11,8 @@ import {
   ElicitRequestSchema,
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { loadConfig } from "../src/config.js";
-import type { Pool } from "../src/pool.js";
+import { loadConfig, parseConfig } from "../src/config.js";
+import { Pool } from "../src/pool.js";
 import { assemble, startGateway, type Gateway } from "../src/server.js";
 
 const fixture = fileURLToPath(new URL("./fixture-server.js", import.meta.url));
@@ -205,4 +205,32 @@ test("a reverse request with nothing in flight is refused, not guessed", async (
     events.some((e) => e.event === "unroutable"),
   );
   assert.equal(events.find((e) => e.event === "unroutable")?.fields.server, "bravo");
+});
+
+test("a server that arrives by reload is authorized from the config that brought it", async () => {
+  const text = (servers: string) => `version: 1
+servers:
+${servers}
+profiles:
+  all: { servers: ["*"] }
+`;
+  const empty = parseConfig(text("  {}"), "first.yaml");
+  const later = parseConfig(
+    text(`  echo:\n    transport: stdio\n    command: ${JSON.stringify(process.execPath)}\n    args: [${JSON.stringify(fixture)}]`),
+    "later.yaml",
+  );
+  const seen: Array<[string, unknown]> = [];
+  const pool = new Pool(empty, () => {}, undefined, (server, config) => {
+    seen.push([server, config]);
+    return undefined;
+  });
+  try {
+    await pool.reload(later);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0]![0], "echo");
+    // Before, the lookup read the startup config, where an enabled-later server does not exist.
+    assert.equal(seen[0]![1], later);
+  } finally {
+    await pool.close();
+  }
 });

@@ -26,6 +26,8 @@ export const DASHBOARD_HTML = `<!doctype html>
   td button { padding: 2px 8px; }
   #controls { margin-top: 16px; display: flex; gap: 8px; flex-wrap: wrap; }
   #message { margin-top: 8px; white-space: pre-wrap; }
+  td button + button { margin-left: 4px; }
+  h2 select { font: inherit; font-weight: normal; margin-left: 8px; }
 </style>
 </head>
 <body>
@@ -43,6 +45,11 @@ export const DASHBOARD_HTML = `<!doctype html>
   <div id="message" role="status"></div>
   <h2>Backends</h2>
   <div class="scroll"><table><thead><tr><th>Server</th><th>State</th><th>Tools</th><th>Restarts</th><th>PID</th><th>Error</th><th></th></tr></thead><tbody id="backends"></tbody></table></div>
+  <section id="tools-section" hidden>
+    <h2>Tools <select id="profile" aria-label="Profile"></select></h2>
+    <p class="muted">Disable adds the tool to this profile's <code>deny</code> list in config.yaml and reloads. Tools covered by a deny glob or missing from an allow list are changed in the YAML.</p>
+    <div class="scroll"><table><thead><tr><th>Tool</th><th>Decision</th><th>Rule</th><th></th></tr></thead><tbody id="tools"></tbody></table></div>
+  </section>
   <h2>Recent refusals and errors</h2>
   <div class="scroll"><table><thead><tr><th>Time</th><th>Profile</th><th>Decision</th><th>Tool</th><th>Error</th></tr></thead><tbody id="audit"></tbody></table></div>
 </main>
@@ -94,12 +101,55 @@ async function act(button, path, done) {
   }
 }
 
+function button(parent, label, onClick) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.textContent = label;
+  b.addEventListener("click", () => onClick(b));
+  parent.appendChild(b);
+}
+
+/** The answer to a config edit: saved and reloaded, or why the file was left as it was. */
+function saved(what) {
+  return (r) => r.status === 200
+    ? say(what + " — saved to config.yaml and reloaded")
+    : say(what + " failed, config.yaml unchanged:\\n" +
+        ((r.body && (r.body.problems || [r.body.error]).join("\\n")) || r.status), true);
+}
+
+async function refreshTools(h) {
+  $("tools-section").hidden = !h.manage;
+  if (!h.manage) return;
+  const select = $("profile");
+  if ([...select.options].map((o) => o.value).join() !== h.profiles.join()) {
+    const keep = select.value;
+    select.replaceChildren(...h.profiles.map((p) => new Option(p, p, false, p === keep)));
+  }
+  const profile = select.value;
+  if (!profile) return;
+  const list = await get("/profiles/" + encodeURIComponent(profile) + "/tools");
+  const tools = $("tools");
+  tools.replaceChildren();
+  for (const t of (list.body && list.body.tools) || []) {
+    const row = tools.insertRow();
+    cell(row, t.tool === t.canonical ? t.tool : t.tool + " (" + t.canonical + ")");
+    cell(row, t.allow ? "allow" : t.reason, t.allow ? "ok" : "bad");
+    cell(row, t.rule, "muted");
+    const actions = row.insertCell();
+    if (!t.toggle) continue;
+    const path = "/profiles/" + encodeURIComponent(profile) + "/tools/" + encodeURIComponent(t.canonical) + "/" + t.toggle;
+    button(actions, t.toggle === "disable" ? "Disable" : "Enable", (b) =>
+      act(b, path, saved((t.toggle === "disable" ? "deny " : "allow ") + t.canonical + " in " + profile)));
+  }
+}
+
 async function refresh() {
   const health = await get("/healthz");
   const detail = health.body && health.body.backends;
   $("login").hidden = Boolean(detail);
   $("controls").hidden = !(detail && health.body.manage);
   if (!detail) {
+    $("tools-section").hidden = true;
     $("summary").textContent = health.body ? "up — enter the token to see detail" : "not answering";
     return;
   }
@@ -115,17 +165,26 @@ async function refresh() {
     cell(row, b.state, b.state === "up" ? "ok" : "bad");
     cell(row, b.tools); cell(row, b.restarts); cell(row, b.pid); cell(row, b.error, "bad");
     const actions = row.insertCell();
-    if (h.manage) {
-      const restart = document.createElement("button");
-      restart.type = "button";
-      restart.textContent = "Restart";
-      restart.addEventListener("click", () => act(restart, "/restart/" + encodeURIComponent(name), (r) =>
-        r.status === 200
-          ? say(name + " restarted: " + r.body.status + (r.body.error ? " — " + r.body.error : ""), r.body.status !== "up")
-          : say("restart failed: " + ((r.body && r.body.error) || r.status), true)));
-      actions.appendChild(restart);
-    }
+    if (!h.manage) continue;
+    button(actions, "Restart", (b) => act(b, "/restart/" + encodeURIComponent(name), (r) =>
+      r.status === 200
+        ? say(name + " restarted: " + r.body.status + (r.body.error ? " — " + r.body.error : ""), r.body.status !== "up")
+        : say("restart failed: " + ((r.body && r.body.error) || r.status), true)));
+    button(actions, "Disable", (b) => {
+      if (!confirm("Disable " + name + "? Its process stops and its tools disappear from every profile.")) return;
+      act(b, "/servers/" + encodeURIComponent(name) + "/disable", saved("disable " + name));
+    });
   }
+  for (const name of h.disabled || []) {
+    const row = backends.insertRow();
+    cell(row, name);
+    cell(row, "disabled", "muted");
+    cell(row, ""); cell(row, ""); cell(row, ""); cell(row, "");
+    const actions = row.insertCell();
+    if (h.manage) button(actions, "Enable", (b) => act(b, "/servers/" + encodeURIComponent(name) + "/enable", saved("enable " + name)));
+  }
+
+  await refreshTools(h);
 
   const recent = await get("/audit/recent?n=100&denied=1");
   const audit = $("audit");
@@ -141,6 +200,7 @@ async function refresh() {
 }
 
 $("login").addEventListener("submit", (e) => { e.preventDefault(); store.set($("token").value); refresh(); });
+$("profile").addEventListener("change", () => refresh().catch(() => {}));
 $("reload").addEventListener("click", () => act($("reload"), "/reload", (r) =>
   r.status === 200
     ? say("config reloaded")

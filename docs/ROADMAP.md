@@ -175,8 +175,10 @@ Approved 2026-09-15, in three PRs. Management needs `listen.token`; PRD §3 amen
 - **A (buttons):** reload, restart a backend, and `POST /stop` from `/dashboard`; the page's own
   LAN origin may POST; a `manage` audit line per action
 - **B (toggles):** `disabled: true` on a server, per-profile tool deny toggles, written to
-  `config.yaml` with comments kept, a hash check against concurrent edits, and a `.bak`
-- **C (editor):** raw YAML editor with validate and save-and-reload, loopback requests only,
+  `config.yaml` by splicing text (a yaml round-trip drops comments), verified to mean exactly
+  the intended change, with a `.bak`
+- **C (editor):** raw YAML editor with validate and save-and-reload, a hash check against
+  concurrent edits, loopback requests only,
   since writing `command:` is running a program as you
 
 **Exit:** a backend can be restarted, a tool switched off and the config edited without a shell.

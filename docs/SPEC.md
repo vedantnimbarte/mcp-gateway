@@ -125,6 +125,7 @@ const Server = z.discriminatedUnion("transport", [
     restart: Restart,
     limits: ServerLimits,
     cache: Cache,
+    disabled: z.boolean().default(false), // validated, then dropped: no process, no tools
   }),
   z.object({
     transport: z.enum(["http", "sse"]),
@@ -133,6 +134,7 @@ const Server = z.discriminatedUnion("transport", [
     restart: Restart,
     limits: ServerLimits,
     cache: Cache,
+    disabled: z.boolean().default(false),
   }),
 ]);
 
@@ -446,7 +448,7 @@ append-only.
 
 Also logged, with `method` set accordingly: `initialize` (session open), `session_close`,
 `backend_up`, `backend_down`, `drift`, `pinned`, `suspicious`, and `manage` for every reload,
-restart or stop requested over HTTP — `{ action, status: ok|error, remote, server?, problems? }`. A refusal is a request too: a
+restart, stop or config change requested over HTTP — `{ action, status: ok|error, remote, server?, profile?, tool?, problems? }`, where `action` is `reload`, `restart`, `stop`, `disable_server`, `enable_server`, `disable_tool` or `enable_tool`. A refusal is a request too: a
 resource URI that is malformed or outside the profile gets its line like a denied tool call.
 Writes go through a stream and are never awaited by the request path. Under `audit.durable`
 each line is instead appended and fsynced synchronously, surviving a crash at the cost of a
@@ -496,8 +498,8 @@ not swallowed: original `code`/`message` land in `error.data.upstream`.
 
 | Aspect | Behaviour |
 |--------|-----------|
-| Path | `POST`/`GET`/`DELETE` `/mcp/<profile>`. Unknown profile → `404`. `POST /reload` re-reads the config; `POST /restart/<server>` reconnects one backend. `POST /stop` answers `202` and then drains and exits like `SIGTERM`; it needs `listen.token` to be set (else `403`) as well as the token itself. `GET /audit/recent?n=&denied=1` returns the newest audit lines (token-gated, `n` ≤ 1000, tail of the newest file only) |
-| Status page | `GET /dashboard` and `/dashboard.js`: static, no data, no token needed, `Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'`. The page fetches `/healthz` and `/audit/recent` with a token the viewer types in, kept in `sessionStorage`. When the authorized `/healthz` reports `manage: true` (a token is set), it offers reload, per-backend restart and stop, calling the routes above |
+| Path | `POST`/`GET`/`DELETE` `/mcp/<profile>`. Unknown profile → `404`. `POST /reload` re-reads the config; `POST /restart/<server>` reconnects one backend. `POST /stop` answers `202` and then drains and exits like `SIGTERM`; it needs `listen.token` to be set (else `403`) as well as the token itself. So do `POST /servers/<name>/disable|enable` (sets `disabled: true|false`), `GET /profiles/<p>/tools` (each tool's decision, rule and `toggle`: `disable`, `enable` or `null`) and `POST /profiles/<p>/tools/<server>__<tool>/disable|enable` (adds or removes that exact entry in the profile's `deny`). Those two write `config.yaml` and reload: the edit is spliced into the text so comments and layout survive, re-parsed and checked to mean exactly the intended change, validated like a load, and written via a temp file and rename with the previous file kept as `config.yaml.bak`. Invalid result → `400` with `problems`; a layout the splice cannot change safely → `409`; either way the file is untouched. Config changes and reloads run one at a time. `GET /audit/recent?n=&denied=1` returns the newest audit lines (token-gated, `n` ≤ 1000, tail of the newest file only) |
+| Status page | `GET /dashboard` and `/dashboard.js`: static, no data, no token needed, `Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'`. The page fetches `/healthz` and `/audit/recent` with a token the viewer types in, kept in `sessionStorage`. When the authorized `/healthz` reports `manage: true` (a token is set), it offers reload, per-backend restart, disable and enable, per-profile tool toggles, and stop, calling the routes above |
 | TLS | With `listen.tls: { cert, key }` (PEM paths, `~` expanded) the listener is HTTPS. Binding beyond loopback without it logs `insecure_lan` at startup — allowed, since the token is required, but the token then crosses the network in the clear |
 | `/healthz` | `200 {status}` always; the `{uptime_s, sessions, pending_drift, backends}` detail only when the request is authorized, since it names backends and pids |
 | Session | `Mcp-Session-Id` response header on initialize; required on subsequent requests. Unknown/expired → `404`, client re-initializes |

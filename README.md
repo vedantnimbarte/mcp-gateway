@@ -380,6 +380,20 @@ Once you have entered the token, the page can also manage the gateway: **Reload 
 without one the page stays read-only. Every action leaves a `manage` line in the audit log.
 Nothing on the page can start a stopped gateway again — that is `mcpgw start`.
 
+It can also switch things off without you opening the YAML, and what it switches off is written
+to `config.yaml`, so a later reload or restart keeps it:
+
+- **Disable / Enable** on a backend sets `disabled: true` (or `false`) on that server. A disabled
+  server is validated but never started, and its tools disappear from every profile.
+- **Tools**, per profile, lists every tool with the rule that decided it. **Disable** adds that
+  exact tool to the profile's `deny` list; **Enable** removes the entry again. A tool covered by a
+  deny glob or missing from an allow list has no button — change those in the YAML.
+
+Each change is spliced into the file where it belongs, so your comments and layout stay as they
+were, and the previous file is kept as `config.yaml.bak`. A change that would make the config
+invalid is refused and the file is left alone. Saving reloads the file as it is on disk, so an edit
+you made by hand and had not reloaded yet is picked up too.
+
 ## Tool pinning
 
 The first time a tool or prompt is seen, a hash of what it tells the model — name, description,

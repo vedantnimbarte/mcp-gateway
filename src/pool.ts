@@ -22,14 +22,16 @@ export class Pool {
     config: Config,
     private readonly log: (event: string, fields: Record<string, unknown>) => void = () => {},
     private readonly guard?: Guard,
-    private readonly authFor: (server: string) => OAuthClientProvider | undefined = () => undefined,
+    /** Handed the config being applied: a server that arrives by reload is not in the first one. */
+    private readonly authFor: (server: string, config: Config) => OAuthClientProvider | undefined = () =>
+      undefined,
   ) {
     this.#config = config;
     for (const name of Object.keys(config.servers)) this.#add(name, config);
   }
 
   #add(name: string, config: Config): Backend {
-    const backend = new Backend(name, config.servers[name]!, config.defaults, this.authFor(name));
+    const backend = new Backend(name, config.servers[name]!, config.defaults, this.authFor(name, config));
     backend.onChange = () => this.#rebuild();
     backend.onEvent = this.log;
     backend.onResourceUpdated = (server, uri) => this.onResourceUpdated?.(server, uri);
