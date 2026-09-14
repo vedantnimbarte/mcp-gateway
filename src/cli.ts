@@ -66,14 +66,23 @@ async function start(
   if (opts.verbose) parts.audit.onWrite = (line) => process.stderr.write(`${renderAudit(line)}\n`);
 
   // Bind before the backends connect: a slow `npx` cold start must never delay the port (NFR-6).
-  const gateway = await startGateway(config, parts, { port, configPath });
+  const gateway = await startGateway(config, parts, {
+    port,
+    configPath,
+    onStop: () => shutdown("dashboard"),
+  });
   log("listening", { url: gateway.url, profiles: Object.keys(config.profiles) });
   // Allowed, since the token is set (NFR-2), but the token then crosses the network in the clear.
   if (!isLoopback(config.listen.host) && !config.listen.tls) {
     log("insecure_lan", { host: config.listen.host, hint: "set listen.tls so the token is not sent in the clear" });
   }
 
+  let stopping = false;
+  // `signal` is "dashboard" when the status page's stop button asked. Ctrl+C during that drain
+  // must not start a second one.
   const shutdown = (signal: string) => {
+    if (stopping) return;
+    stopping = true;
     log("draining", { signal, inflight: parts.pipeline.inflight });
     void gateway.close(DRAIN_MS).then(() => process.exit(0));
   };
