@@ -6,8 +6,9 @@ listen:
   # token: ${MCPGW_TOKEN}   # sent as `Authorization: Bearer <token>`
 
 defaults:
-  call_timeout_ms: 30000
+  call_timeout_ms: 30000     # restarted by each progress note from the backend...
   connect_timeout_ms: 10000
+  max_call_ms: 600000        # ...up to this, however much progress it reports
 
 servers:
   github:

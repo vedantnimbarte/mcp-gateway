@@ -14,12 +14,24 @@ import {
   SubscribeRequestSchema,
   UnsubscribeRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import type { LoggingLevel, LoggingMessageNotification } from "@modelcontextprotocol/sdk/types.js";
+import type {
+  EventId,
+  EventStore,
+  StreamId,
+} from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type {
+  JSONRPCMessage,
+  LoggingLevel,
+  LoggingMessageNotification,
+  ServerNotification,
+  ServerRequest,
+} from "@modelcontextprotocol/sdk/types.js";
 import type { ReverseTarget } from "./backend.js";
 import type { AuditLog } from "./audit.js";
 import { namespaceUri } from "./catalog.js";
 import { GATEWAY_INFO, type Config } from "./config.js";
-import type { Pipeline } from "./pipeline.js";
+import type { CallContext, Pipeline } from "./pipeline.js";
 
 /** SPEC §10.1. */
 const IDLE_MS = 30 * 60 * 1000;
@@ -38,6 +50,68 @@ const LEVELS: LoggingLevel[] = [
 
 /** Until a client says otherwise, debug is noise and everything else is worth forwarding. */
 const DEFAULT_LEVEL: LoggingLevel = "info";
+
+interface StoredEvent {
+  streamId: StreamId;
+  message: JSONRPCMessage;
+  bytes: number;
+}
+
+/**
+ * What lets a client that lost its SSE stream reconnect with `Last-Event-ID` instead of
+ * re-initializing (SPEC §10.1). One per session, so it goes when the session does.
+ *
+ * ponytail: in memory, and capped by count and by bytes (tool results can each be as large as
+ * `max_result_bytes`), so a daemon restart or a long enough disconnect still means
+ * re-initializing — which clients already do.
+ */
+export class RecentEvents implements EventStore {
+  readonly #events = new Map<EventId, StoredEvent>();
+  #next = 0;
+  #bytes = 0;
+
+  constructor(
+    private readonly limit = 256,
+    private readonly maxBytes = 4 * 1024 * 1024,
+  ) {}
+
+  async storeEvent(streamId: StreamId, message: JSONRPCMessage): Promise<EventId> {
+    const id = String(this.#next++);
+    const bytes = JSON.stringify(message).length;
+    this.#events.set(id, { streamId, message, bytes });
+    this.#bytes += bytes;
+    // Never evict the event just stored: its id is about to be handed to the client.
+    const over = () => this.#events.size > this.limit || this.#bytes > this.maxBytes;
+    while (this.#events.size > 1 && over()) {
+      const [oldest, event] = this.#events.entries().next().value!;
+      this.#events.delete(oldest);
+      this.#bytes -= event.bytes;
+    }
+    return id;
+  }
+
+  async getStreamIdForEventId(id: EventId): Promise<StreamId | undefined> {
+    return this.#events.get(id)?.streamId;
+  }
+
+  async replayEventsAfter(
+    lastEventId: EventId,
+    { send }: { send: (id: EventId, message: JSONRPCMessage) => Promise<void> },
+  ): Promise<StreamId> {
+    const last = this.#events.get(lastEventId);
+    if (!last) return "";
+    let after = false;
+    // A Map iterates in insertion order, which is event order.
+    for (const [id, event] of this.#events) {
+      if (id === lastEventId) after = true;
+      // Priming events are stored as `{}`: they mark a position and are not messages to resend.
+      else if (after && event.streamId === last.streamId && "jsonrpc" in event.message) {
+        await send(id, event.message);
+      }
+    }
+    return last.streamId;
+  }
+}
 
 export interface Session {
   id: string;
@@ -90,13 +164,24 @@ function buildServer(pipeline: Pipeline, profile: string, sessionId: () => strin
     },
   };
 
-  const ctx = (signal?: AbortSignal) => ({
-    profile,
-    session: sessionId(),
-    client: server.getClientVersion(),
-    caller,
-    signal,
-  });
+  const ctx = (extra?: RequestHandlerExtra<ServerRequest, ServerNotification>): CallContext => {
+    const token = extra?._meta?.progressToken;
+    return {
+      profile,
+      session: sessionId(),
+      client: server.getClientVersion(),
+      caller,
+      signal: extra?.signal,
+      // Always registered, so every backend call carries a token and its progress keeps the call
+      // alive; forwarded only when this client asked, under the token it chose. `extra` sends on
+      // the stream of the request it belongs to.
+      onprogress: (progress) => {
+        if (token === undefined) return;
+        const params = { ...progress, progressToken: token };
+        extra!.sendNotification({ method: "notifications/progress", params }).catch(() => {});
+      },
+    };
+  };
 
   server.setRequestHandler(SetLevelRequestSchema, (request) => {
     level = request.params.level;
@@ -110,7 +195,7 @@ function buildServer(pipeline: Pipeline, profile: string, sessionId: () => strin
   }));
 
   server.setRequestHandler(CallToolRequestSchema, (request, extra) =>
-    pipeline.callTool(ctx(extra.signal), request.params.name, request.params.arguments),
+    pipeline.callTool(ctx(extra), request.params.name, request.params.arguments),
   );
 
   server.setRequestHandler(ListPromptsRequestSchema, () => ({
@@ -118,7 +203,7 @@ function buildServer(pipeline: Pipeline, profile: string, sessionId: () => strin
   }));
 
   server.setRequestHandler(GetPromptRequestSchema, (request, extra) =>
-    pipeline.getPrompt(ctx(extra.signal), request.params.name, request.params.arguments),
+    pipeline.getPrompt(ctx(extra), request.params.name, request.params.arguments),
   );
 
   server.setRequestHandler(ListResourcesRequestSchema, () => ({
@@ -130,7 +215,7 @@ function buildServer(pipeline: Pipeline, profile: string, sessionId: () => strin
   }));
 
   server.setRequestHandler(ReadResourceRequestSchema, (request, extra) =>
-    pipeline.readResource(ctx(extra.signal), request.params.uri),
+    pipeline.readResource(ctx(extra), request.params.uri),
   );
 
   server.setRequestHandler(SubscribeRequestSchema, async (request) => {
@@ -144,7 +229,7 @@ function buildServer(pipeline: Pipeline, profile: string, sessionId: () => strin
   });
 
   server.setRequestHandler(CompleteRequestSchema, (request, extra) =>
-    pipeline.complete(ctx(extra.signal), request.params),
+    pipeline.complete(ctx(extra), request.params),
   );
 
   return server;
@@ -198,6 +283,7 @@ export class SessionManager {
   async create(profile: string): Promise<StreamableHTTPServerTransport> {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: randomUUID,
+      eventStore: new RecentEvents(),
       onsessioninitialized: (id) => {
         this.#sessions.set(id, {
           id,

@@ -75,16 +75,36 @@ let cancellations = 0;
 
 server.registerTool(
   "sleep",
-  { description: "Returns after a delay.", inputSchema: { ms: z.number() } },
-  async ({ ms }, extra) => {
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(resolve, Math.min(ms, 5000));
-      extra.signal.addEventListener("abort", () => {
-        clearTimeout(timer);
-        cancellations++;
-        reject(new Error("cancelled"));
+  {
+    description: "Returns after a delay, reporting progress every `progress_ms` if given.",
+    inputSchema: { ms: z.number(), progress_ms: z.number().optional(), tag: z.string().optional() },
+  },
+  async ({ ms, progress_ms, tag }, extra) => {
+    const token = extra._meta?.progressToken;
+    let ticks = 0;
+    const ticker =
+      progress_ms && token !== undefined
+        ? setInterval(() => {
+            void extra
+              .sendNotification({
+                method: "notifications/progress",
+                params: { progressToken: token, progress: ++ticks, message: tag },
+              })
+              .catch(() => {});
+          }, progress_ms)
+        : undefined;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, Math.min(ms, 5000));
+        extra.signal.addEventListener("abort", () => {
+          clearTimeout(timer);
+          cancellations++;
+          reject(new Error("cancelled"));
+        });
       });
-    });
+    } finally {
+      clearInterval(ticker);
+    }
     return { content: [{ type: "text", text: `slept ${ms}ms` }] };
   },
 );
