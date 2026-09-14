@@ -103,11 +103,16 @@ function tokenOk(expected: string, header: string | undefined): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-/** Blocks DNS-rebinding from a browser tab (SPEC §10.1). */
-function originOk(origin: string | undefined): boolean {
+/**
+ * Blocks DNS-rebinding from a browser tab (SPEC §10.1). `self` is the request's own `Host`, passed
+ * only when a token is set: the status page served over a LAN name POSTs with that name as its
+ * Origin. A rebound page can match it too, but it holds no token, and everything that acts needs one.
+ */
+function originOk(origin: string | undefined, self?: string): boolean {
   if (!origin) return true;
   try {
-    return isLoopback(new URL(origin).hostname);
+    const url = new URL(origin);
+    return isLoopback(url.hostname) || url.host === self;
   } catch {
     return false;
   }
@@ -129,7 +134,8 @@ function hostOk(host: string | undefined): boolean {
 export async function startGateway(
   config: Config,
   parts: Parts,
-  opts: { port?: number; configPath?: string } = {},
+  /** `onStop` is what `POST /stop` asks for; the CLI drains and exits, which a library must not. */
+  opts: { port?: number; configPath?: string; onStop?: () => void } = {},
 ): Promise<Gateway> {
   const { pool, pipeline, audit } = parts;
   const { host, token } = config.listen;
@@ -166,6 +172,9 @@ export async function startGateway(
     audit.write({ method: "unauthorized", path, remote: req.socket.remoteAddress });
     send(res, 401, { error: "unauthorized" });
   };
+  /** Who reloaded, restarted or stopped the gateway, and whether it worked. */
+  const manage = (req: IncomingMessage, action: string, status: "ok" | "error", fields = {}) =>
+    audit.write({ method: "manage", action, status, remote: req.socket.remoteAddress, ...fields });
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://localhost");
@@ -174,7 +183,7 @@ export async function startGateway(
 
     // Checked first, and for every route: a browser tab must not be able to reach any of them,
     // including the ones that answer before the token check (SPEC 10.1).
-    if (!originOk(req.headers.origin)) {
+    if (!originOk(req.headers.origin, token ? req.headers.host : undefined)) {
       send(res, 403, { error: "forbidden origin" });
       return;
     }
@@ -225,11 +234,40 @@ export async function startGateway(
       try {
         const { config: next } = loadConfig(opts.configPath);
         await gateway.reload(next);
+        manage(req, "reload", "ok");
         send(res, 200, { status: "reloaded", config: opts.configPath });
       } catch (e) {
         const problems = e instanceof ConfigError ? e.problems : [(e as Error).message];
+        manage(req, "reload", "error", { problems });
         send(res, 400, { status: "unchanged", problems });
       }
+      return;
+    }
+
+    // The status page's stop button. Management beyond reload and restart needs a token set at
+    // all: with none, loopback reachability would be the only thing between a local process and
+    // taking the gateway down.
+    if (path === "/stop") {
+      if (req.method !== "POST") {
+        send(res, 405, { error: "POST only" });
+        return;
+      }
+      if (!token) {
+        send(res, 403, { error: "management requires listen.token" });
+        return;
+      }
+      if (!authorized) {
+        unauthorized(req, res, path);
+        return;
+      }
+      if (!opts.onStop) {
+        send(res, 404, { error: "this gateway cannot be stopped over HTTP" });
+        return;
+      }
+      manage(req, "stop", "ok");
+      // Answer before draining: the listener stops accepting as the drain begins.
+      res.once("finish", opts.onStop);
+      send(res, 202, { status: "stopping" });
       return;
     }
 
@@ -252,6 +290,7 @@ export async function startGateway(
       }
       await pool.restart(server);
       const backend = pool.backends.get(server)!;
+      manage(req, "restart", backend.state === "up" ? "ok" : "error", { server });
       send(res, 200, { status: backend.state, server, tools: backend.tools.length, error: backend.lastError });
       return;
     }
@@ -326,6 +365,8 @@ export async function startGateway(
   function health() {
     return {
       status: "ok",
+      // Whether the status page may offer its buttons: management needs a token set.
+      manage: Boolean(token),
       uptime_s: Math.round(process.uptime()),
       sessions: sessions.size,
       pending_drift: parts.guard.pending().length,

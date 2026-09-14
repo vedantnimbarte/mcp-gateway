@@ -227,6 +227,7 @@ to documentation.
 | Runaway/looping agent | Per-profile rpm + concurrency caps |
 | Oversized/hostile payloads | Result size cap, JSON body limit |
 | Remote access to an unauthenticated daemon | Loopback-only bind unless a token is set, enforced at startup; `listen.tls` so that token is not sent in the clear, a startup warning when it is, and an audit line for every refused token |
+| Someone stopping or reconfiguring the gateway from a browser | Stop needs `listen.token` set and presented; the status page offers controls only then; Origin must be loopback or the page's own host; every reload, restart and stop leaves a `manage` audit line |
 
 Non-goals: an attacker with local shell access already has your env vars and can call the
 backends directly. Defending that would require auth, which is explicitly out of scope.

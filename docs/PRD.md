@@ -34,6 +34,9 @@ Explicitly out of scope. Do not build these; do not leave hooks for them.
 - An admin web UI that changes anything. Configuration is the YAML file + CLI only. *(Amended
   2026-09-14: a read-only status page served by the daemon is allowed — it shows what `/healthz`
   and the audit log already show, behind the same token, and has no route that writes.)*
+  *(Amended 2026-09-15: the status page may manage the gateway — reload, restart a backend, stop
+  — but only when `listen.token` is set, and every action is audited. Without a token it stays
+  read-only. Configuration still lives in the YAML file.)*
 - SIEM export, SOC 2 / HIPAA audit shaping, hash-chained tamper-evident logs.
 - A secrets vault. Backend credentials come from environment variables.
 - Kubernetes, Helm, horizontal scaling, clustering.

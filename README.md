@@ -371,9 +371,14 @@ Queries run on a read-only connection.
 ## Status page
 
 `http://127.0.0.1:8420/dashboard` shows the backends, pending pinning changes, and the most recent
-refusals and errors, refreshing every five seconds. It is read-only — nothing behind it changes
-anything — and it shows only what `/healthz` and the audit log already show. With `listen.token`
-set, it asks for the token and keeps it for that browser tab only.
+refusals and errors, refreshing every five seconds. It shows only what `/healthz` and the audit
+log already show. With `listen.token` set, it asks for the token and keeps it for that browser
+tab only.
+
+Once you have entered the token, the page can also manage the gateway: **Reload config**,
+**Restart** on each backend, and **Stop gateway**. These appear only when `listen.token` is set;
+without one the page stays read-only. Every action leaves a `manage` line in the audit log.
+Nothing on the page can start a stopped gateway again — that is `mcpgw start`.
 
 ## Tool pinning
 

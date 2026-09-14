@@ -445,7 +445,8 @@ append-only.
 | `error` | `{ code, message }` on failure, redacted |
 
 Also logged, with `method` set accordingly: `initialize` (session open), `session_close`,
-`backend_up`, `backend_down`, `drift`, `pinned`, `suspicious`. A refusal is a request too: a
+`backend_up`, `backend_down`, `drift`, `pinned`, `suspicious`, and `manage` for every reload,
+restart or stop requested over HTTP — `{ action, status: ok|error, remote, server?, problems? }`. A refusal is a request too: a
 resource URI that is malformed or outside the profile gets its line like a denied tool call.
 Writes go through a stream and are never awaited by the request path. Under `audit.durable`
 each line is instead appended and fsynced synchronously, surviving a crash at the cost of a
@@ -495,8 +496,8 @@ not swallowed: original `code`/`message` land in `error.data.upstream`.
 
 | Aspect | Behaviour |
 |--------|-----------|
-| Path | `POST`/`GET`/`DELETE` `/mcp/<profile>`. Unknown profile → `404`. `POST /reload` re-reads the config; `POST /restart/<server>` reconnects one backend. `GET /audit/recent?n=&denied=1` returns the newest audit lines (token-gated, `n` ≤ 1000, tail of the newest file only) |
-| Status page | `GET /dashboard` and `/dashboard.js`: static, no data, no token needed, `Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'`. The page fetches `/healthz` and `/audit/recent` with a token the viewer types in, kept in `sessionStorage`. Nothing behind it writes |
+| Path | `POST`/`GET`/`DELETE` `/mcp/<profile>`. Unknown profile → `404`. `POST /reload` re-reads the config; `POST /restart/<server>` reconnects one backend. `POST /stop` answers `202` and then drains and exits like `SIGTERM`; it needs `listen.token` to be set (else `403`) as well as the token itself. `GET /audit/recent?n=&denied=1` returns the newest audit lines (token-gated, `n` ≤ 1000, tail of the newest file only) |
+| Status page | `GET /dashboard` and `/dashboard.js`: static, no data, no token needed, `Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'`. The page fetches `/healthz` and `/audit/recent` with a token the viewer types in, kept in `sessionStorage`. When the authorized `/healthz` reports `manage: true` (a token is set), it offers reload, per-backend restart and stop, calling the routes above |
 | TLS | With `listen.tls: { cert, key }` (PEM paths, `~` expanded) the listener is HTTPS. Binding beyond loopback without it logs `insecure_lan` at startup — allowed, since the token is required, but the token then crosses the network in the clear |
 | `/healthz` | `200 {status}` always; the `{uptime_s, sessions, pending_drift, backends}` detail only when the request is authorized, since it names backends and pids |
 | Session | `Mcp-Session-Id` response header on initialize; required on subsequent requests. Unknown/expired → `404`, client re-initializes |
@@ -505,7 +506,7 @@ not swallowed: original `code`/`message` land in `error.data.upstream`.
 | Body limit | 4 MiB; exceeded → `413` |
 | Idle expiry | 30 min with no request open and none arriving → session dropped. An open GET stream or a long call is not idle |
 | Token | When `listen.token` is set, every request must carry `Authorization: Bearer <token>`; compared with `timingSafeEqual`. Missing/wrong → `401`, and an audit line `{ method: "unauthorized", path, remote }` |
-| Origin | `Origin` header, when present, must be `localhost` or `127.0.0.1` — blocks DNS-rebinding from a browser tab. Checked **first**, before the token and before `/healthz`, so no route answers a browser tab |
+| Origin | `Origin` header, when present, must be `localhost` or `127.0.0.1` — blocks DNS-rebinding from a browser tab. With `listen.token` set, an `Origin` whose host equals the request's own `Host` is accepted too, so the status page served under a LAN name can POST; a rebound page could match it, but holds no token. Checked **first**, before the token and before `/healthz`, so no route answers a browser tab |
 | Host | Without `listen.token`, the `Host` header must name a loopback host, else `403`. Covers the rebinding case `Origin` cannot: a browser omits `Origin` on a same-origin GET, and a rebound page is same-origin with itself. With a token set any Host is accepted — LAN names are legitimate, and detail is token-gated |
 
 ### 10.2 stdio bridge
