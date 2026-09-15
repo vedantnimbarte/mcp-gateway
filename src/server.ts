@@ -8,11 +8,18 @@ import { ClientCredentialsProvider } from "@modelcontextprotocol/sdk/client/auth
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { AuditLog, recentLines } from "./audit.js";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard.js";
-import { ConfigError, isLoopback, loadConfig, type Config } from "./config.js";
-import { LayoutError, setServerDisabled, setToolDenied } from "./configfile.js";
+import { ConfigError, isLoopback, loadConfig, parseConfig, type Config } from "./config.js";
+import {
+  ConflictError,
+  LayoutError,
+  readConfigText,
+  saveConfigText,
+  setServerDisabled,
+  setToolDenied,
+} from "./configfile.js";
 import { globMatch } from "./glob.js";
+import { canonicalJson, Guard } from "./guard.js";
 import { serverOf } from "./policy.js";
-import { Guard } from "./guard.js";
 import { BackendAuth, TokenStore } from "./oauth.js";
 import { Pipeline } from "./pipeline.js";
 import { Pool } from "./pool.js";
@@ -122,6 +129,15 @@ function originOk(origin: string | undefined, self?: string): boolean {
 }
 
 /**
+ * The config editor's boundary, on top of the token: writing `command:` runs a program as whoever
+ * runs the daemon, so a token stolen on the LAN must not be enough. ponytail: a reverse proxy on
+ * this machine makes every request look local; the editor would then answer the LAN behind it.
+ */
+export function fromThisMachine(req: Pick<IncomingMessage, "socket">): boolean {
+  return isLoopback((req.socket.remoteAddress ?? "").replace(/^::ffff:/, ""));
+}
+
+/**
  * The half of DNS-rebinding that `Origin` misses: browsers omit `Origin` on same-origin GETs, and
  * a rebound `evil.com:8420` page is same-origin with itself. Its `Host` still says `evil.com`.
  */
@@ -207,19 +223,24 @@ export async function startGateway(
       try {
         next = write(file);
       } catch (e) {
-        const known = e instanceof ConfigError || e instanceof LayoutError;
+        const known = e instanceof ConfigError || e instanceof LayoutError || e instanceof ConflictError;
         if (!known) throw e;
         const problems = e instanceof ConfigError ? e.problems : [e.message];
         manage(req, action, "error", { ...fields, problems });
-        // 409 for a layout the splice will not touch: the edit itself was fine, the YAML is the obstacle.
-        send(res, e instanceof LayoutError ? 409 : 400, { status: "unchanged", problems });
+        // 409 when the edit was fine but the file is the obstacle: a layout the splice will not
+        // touch, or a change on disk the editor never saw.
+        send(res, e instanceof ConfigError ? 400 : 409, { status: "unchanged", problems });
         return;
       }
+      const restartNeeded = listenChanged(next);
       await gateway.reload(next);
       manage(req, action, "ok", fields);
-      send(res, 200, { status: "saved", ...fields });
+      send(res, 200, { status: "saved", ...fields, hash: readConfigText(file).hash, restart_needed: restartNeeded });
     });
   }
+
+  /** The port is bound once: a changed `listen` block is saved, but only a daemon restart applies it. */
+  const listenChanged = (next: Config) => canonicalJson(next.listen) !== canonicalJson(current.listen);
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://localhost");
@@ -242,7 +263,7 @@ export async function startGateway(
     // The bridge probes this without a token, so an unauthorized caller still gets a liveness
     // answer — but backend names, pids and error strings are detail, and detail needs the token.
     if (path === "/healthz") {
-      send(res, 200, authorized ? health() : { status: "ok" });
+      send(res, 200, authorized ? health(fromThisMachine(req)) : { status: "ok" });
       return;
     }
 
@@ -297,7 +318,7 @@ export async function startGateway(
      * with none, loopback reachability would be the only thing between any local process and
      * stopping or rewriting the gateway. Answers the refusal itself and returns false.
      */
-    const gated = (method: "GET" | "POST"): boolean => {
+    const gated = (method: "GET" | "POST" | "PUT"): boolean => {
       if (req.method !== method) {
         send(res, 405, { error: `${method} only` });
       } else if (!token) {
@@ -415,6 +436,55 @@ export async function startGateway(
       return;
     }
 
+    // The raw YAML editor: the file as written, a dry run, and a save guarded by the hash the
+    // editor loaded. Loopback only, on top of the token (see fromThisMachine).
+    if (path === "/config" || path === "/config/validate") {
+      const validate = path === "/config/validate";
+      if (!gated(validate ? "POST" : req.method === "PUT" ? "PUT" : "GET")) return;
+      if (!fromThisMachine(req)) {
+        send(res, 403, { error: "the config editor answers requests from this machine only" });
+        return;
+      }
+      const file = opts.configPath;
+      if (!file) {
+        send(res, 404, { error: "this gateway was not started from a config file" });
+        return;
+      }
+      if (req.method === "GET") {
+        send(res, 200, { path: file, ...readConfigText(file) });
+        return;
+      }
+      const raw = await readBody(req);
+      if (raw === null) {
+        send(res, 413, { error: "request body too large" });
+        return;
+      }
+      let body: { text?: unknown; base_hash?: unknown };
+      try {
+        body = JSON.parse(raw) as typeof body;
+      } catch {
+        send(res, 400, { error: "body must be JSON" });
+        return;
+      }
+      const { text, base_hash: baseHash } = body;
+      if (typeof text !== "string" || (!validate && typeof baseHash !== "string")) {
+        send(res, 400, { error: validate ? "expected { text }" : "expected { text, base_hash }" });
+        return;
+      }
+      if (validate) {
+        try {
+          const next = parseConfig(text, file);
+          send(res, 200, { status: "valid", restart_needed: listenChanged(next) });
+        } catch (e) {
+          if (!(e instanceof ConfigError)) throw e;
+          send(res, 400, { status: "invalid", problems: e.problems });
+        }
+        return;
+      }
+      await saveAndReload(req, res, "edit_config", {}, (f) => saveConfigText(f, text, baseHash as string));
+      return;
+    }
+
     if (!authorized) {
       unauthorized(req, res, path);
       return;
@@ -481,12 +551,14 @@ export async function startGateway(
 
   const port = (http.address() as AddressInfo).port;
 
-  /** What `/healthz` and `mcpgw status` both report (SPEC §10.1, §11). */
-  function health() {
+  /** What `/healthz` and `mcpgw status` both report (SPEC §10.1, §11). `local`: asked from this machine. */
+  function health(local: boolean) {
     return {
       status: "ok",
       // Whether the status page may offer its buttons: management needs a token set.
       manage: Boolean(token),
+      // The config editor also needs the request to come from this machine.
+      editor: Boolean(token) && local,
       uptime_s: Math.round(process.uptime()),
       sessions: sessions.size,
       pending_drift: parts.guard.pending().length,

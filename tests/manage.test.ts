@@ -9,7 +9,7 @@ import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { recentLines } from "../src/audit.js";
 import { loadConfig } from "../src/config.js";
-import { assemble, startGateway, type Gateway, type Parts } from "../src/server.js";
+import { assemble, fromThisMachine, startGateway, type Gateway, type Parts } from "../src/server.js";
 
 const TOKEN = "manage-test-token";
 const fixture = fileURLToPath(new URL("./fixture-server.js", import.meta.url));
@@ -228,4 +228,83 @@ test("the status page ships its controls, and they call the gated routes", async
   const page = await (await fetch(`${managed.gateway.url}/dashboard`)).text();
   assert.match(page, /\[hidden\]\s*\{\s*display:\s*none\s*!important/);
   assert.match(page, /<div id="controls" hidden>/);
+});
+
+test("the config editor loads, validates, and saves only over the text it loaded", async () => {
+  const g = await launch(TOKEN);
+  try {
+    const url = g.gateway.url;
+    const json = { ...auth, "content-type": "application/json" };
+    const health = (await (await fetch(`${url}/healthz`, { headers: auth })).json()) as { editor: boolean };
+    assert.equal(health.editor, true, "a loopback request with the token should get the editor");
+
+    const loaded = (await (await fetch(`${url}/config`, { headers: auth })).json()) as { text: string; hash: string };
+    assert.equal(loaded.text, readFileSync(g.configPath, "utf8"));
+
+    const invalid = await fetch(`${url}/config/validate`, {
+      method: "POST", headers: json, body: JSON.stringify({ text: "version: 2\n" }),
+    });
+    assert.equal(invalid.status, 400);
+    const valid = await fetch(`${url}/config/validate`, {
+      method: "POST", headers: json, body: JSON.stringify({ text: loaded.text }),
+    });
+    assert.deepEqual(await valid.json(), { status: "valid", restart_needed: false });
+
+    // Invalid text: refused, file untouched.
+    const bad = await fetch(`${url}/config`, {
+      method: "PUT", headers: json, body: JSON.stringify({ text: "servers: nope\n", base_hash: loaded.hash }),
+    });
+    assert.equal(bad.status, 400);
+    assert.equal(readFileSync(g.configPath, "utf8"), loaded.text);
+
+    // A good save: written, reloaded, and the answer carries the new hash.
+    const edited = loaded.text.replace("  renamed:\n", "  extra:\n    servers: [alpha]\n  renamed:\n");
+    const ok = await fetch(`${url}/config`, {
+      method: "PUT", headers: json, body: JSON.stringify({ text: edited, base_hash: loaded.hash }),
+    });
+    assert.equal(ok.status, 200);
+    const saved = (await ok.json()) as { hash: string; restart_needed: boolean };
+    assert.equal(saved.restart_needed, false);
+    assert.equal(readFileSync(g.configPath, "utf8"), edited);
+    assert.equal(readFileSync(`${g.configPath}.bak`, "utf8"), loaded.text);
+    const after = (await (await fetch(`${url}/healthz`, { headers: auth })).json()) as { profiles: string[] };
+    assert.ok(after.profiles.includes("extra"), "the save was not reloaded");
+
+    // The stale hash from the first load: someone else's save must not be overwritten.
+    const stale = await fetch(`${url}/config`, {
+      method: "PUT", headers: json, body: JSON.stringify({ text: loaded.text, base_hash: loaded.hash }),
+    });
+    assert.equal(stale.status, 409);
+    assert.equal(readFileSync(g.configPath, "utf8"), edited);
+
+    // A listen change is saved, but flagged: the port is only bound at start.
+    const moved = edited.replace(`token: ${TOKEN}`, `token: ${TOKEN}\n  port: 8499`);
+    const listen = await fetch(`${url}/config`, {
+      method: "PUT", headers: json, body: JSON.stringify({ text: moved, base_hash: saved.hash }),
+    });
+    assert.equal(listen.status, 200);
+    assert.equal(((await listen.json()) as { restart_needed: boolean }).restart_needed, true);
+
+    const actions = (await manageLines(g.parts)).map((l) => `${l.action}:${l.status}`);
+    assert.deepEqual(actions, ["edit_config:error", "edit_config:ok", "edit_config:error", "edit_config:ok"]);
+  } finally {
+    await g.gateway.close();
+  }
+});
+
+test("the config editor needs a token configured and presented", async () => {
+  assert.equal((await fetch(`${open.gateway.url}/config`)).status, 403);
+  assert.equal((await fetch(`${managed.gateway.url}/config`)).status, 401);
+  const off = (await (await fetch(`${open.gateway.url}/healthz`)).json()) as { editor?: boolean };
+  assert.notEqual(off.editor, true);
+});
+
+test("only a request from this machine counts as local for the editor", () => {
+  const from = (remoteAddress: string | undefined) => fromThisMachine({ socket: { remoteAddress } } as never);
+  assert.equal(from("127.0.0.1"), true);
+  assert.equal(from("::1"), true);
+  assert.equal(from("::ffff:127.0.0.1"), true);
+  assert.equal(from("192.168.1.20"), false);
+  assert.equal(from("::ffff:10.0.0.5"), false);
+  assert.equal(from(undefined), false);
 });

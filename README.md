@@ -394,6 +394,13 @@ were, and the previous file is kept as `config.yaml.bak`. A change that would ma
 invalid is refused and the file is left alone. Saving reloads the file as it is on disk, so an edit
 you made by hand and had not reloaded yet is picked up too.
 
+For everything else — adding a server, writing a profile, changing globs — the page has a
+**config.yaml** editor: the file exactly as written, with **Validate** and **Save & reload**. It is
+shown only when you open the page on the machine running the gateway; from anywhere else it is
+refused even with the token, because editing a server's `command` means running a program as you.
+A save is refused if the file changed on disk since the editor loaded it, and a change under
+`listen` is saved but needs `mcpgw start` again to take effect.
+
 ## Tool pinning
 
 The first time a tool or prompt is seen, a hash of what it tells the model — name, description,

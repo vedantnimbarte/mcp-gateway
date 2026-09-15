@@ -28,6 +28,8 @@ export const DASHBOARD_HTML = `<!doctype html>
   #message { margin-top: 8px; white-space: pre-wrap; }
   td button + button { margin-left: 4px; }
   h2 select { font: inherit; font-weight: normal; margin-left: 8px; }
+  textarea { box-sizing: border-box; width: 100%; min-height: 24em; font: 13px/1.4 ui-monospace, Consolas, monospace; padding: 8px; tab-size: 2; }
+  .row { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
 </style>
 </head>
 <body>
@@ -49,6 +51,16 @@ export const DASHBOARD_HTML = `<!doctype html>
     <h2>Tools <select id="profile" aria-label="Profile"></select></h2>
     <p class="muted">Disable adds the tool to this profile's <code>deny</code> list in config.yaml and reloads. Tools covered by a deny glob or missing from an allow list are changed in the YAML.</p>
     <div class="scroll"><table><thead><tr><th>Tool</th><th>Decision</th><th>Rule</th><th></th></tr></thead><tbody id="tools"></tbody></table></div>
+  </section>
+  <section id="editor-section" hidden>
+    <h2>config.yaml</h2>
+    <p class="muted" id="editor-path"></p>
+    <textarea id="editor" spellcheck="false" aria-label="config.yaml"></textarea>
+    <div class="row">
+      <button id="editor-load" type="button">Load from disk</button>
+      <button id="editor-validate" type="button">Validate</button>
+      <button id="editor-save" type="button">Save &amp; reload</button>
+    </div>
   </section>
   <h2>Recent refusals and errors</h2>
   <div class="scroll"><table><thead><tr><th>Time</th><th>Profile</th><th>Decision</th><th>Tool</th><th>Error</th></tr></thead><tbody id="audit"></tbody></table></div>
@@ -117,6 +129,38 @@ function saved(what) {
         ((r.body && (r.body.problems || [r.body.error]).join("\\n")) || r.status), true);
 }
 
+async function sendJson(method, path, body) {
+  const token = store.get();
+  const headers = { "content-type": "application/json" };
+  if (token) headers.authorization = "Bearer " + token;
+  const res = await fetch(path, { method, headers, body: JSON.stringify(body) });
+  return { status: res.status, body: await res.json().catch(() => null) };
+}
+
+function problems(r) {
+  return (r.body && (r.body.problems || [r.body.error]).join("\\n")) || String(r.status);
+}
+
+/** The hash of the text the editor last loaded; a save is refused if the file has moved on. */
+let editorHash = null;
+
+async function loadEditor() {
+  const r = await get("/config");
+  if (r.status !== 200) {
+    say("could not load config.yaml: " + r.status, true);
+    return;
+  }
+  $("editor").value = r.body.text;
+  $("editor-path").textContent = r.body.path;
+  editorHash = r.body.hash;
+}
+
+/** Never re-fills the text on the page's own refresh: that would throw away what is being typed. */
+function refreshEditor(h) {
+  $("editor-section").hidden = !h.editor;
+  if (h.editor && editorHash === null) loadEditor().catch(() => say("could not load config.yaml", true));
+}
+
 async function refreshTools(h) {
   $("tools-section").hidden = !h.manage;
   if (!h.manage) return;
@@ -150,6 +194,7 @@ async function refresh() {
   $("controls").hidden = !(detail && health.body.manage);
   if (!detail) {
     $("tools-section").hidden = true;
+    $("editor-section").hidden = true;
     $("summary").textContent = health.body ? "up — enter the token to see detail" : "not answering";
     return;
   }
@@ -184,6 +229,7 @@ async function refresh() {
     if (h.manage) button(actions, "Enable", (b) => act(b, "/servers/" + encodeURIComponent(name) + "/enable", saved("enable " + name)));
   }
 
+  refreshEditor(h);
   await refreshTools(h);
 
   const recent = await get("/audit/recent?n=100&denied=1");
@@ -201,6 +247,38 @@ async function refresh() {
 
 $("login").addEventListener("submit", (e) => { e.preventDefault(); store.set($("token").value); refresh(); });
 $("profile").addEventListener("change", () => refresh().catch(() => {}));
+$("editor-load").addEventListener("click", () => {
+  if (!confirm("Replace the text below with config.yaml as it is on disk? Unsaved edits are lost.")) return;
+  loadEditor().then(() => say("loaded config.yaml")).catch(() => say("could not load config.yaml", true));
+});
+$("editor-validate").addEventListener("click", async () => {
+  try {
+    const r = await sendJson("POST", "/config/validate", { text: $("editor").value });
+    r.status === 200
+      ? say("valid" + (r.body.restart_needed ? " — the listen block changed, which needs mcpgw start again" : ""))
+      : say("invalid:\\n" + problems(r), true);
+  } catch {
+    say("the gateway did not answer", true);
+  }
+});
+$("editor-save").addEventListener("click", async () => {
+  const b = $("editor-save");
+  b.disabled = true;
+  try {
+    const r = await sendJson("PUT", "/config", { text: $("editor").value, base_hash: editorHash });
+    if (r.status === 200) {
+      editorHash = r.body.hash;
+      say("saved and reloaded" + (r.body.restart_needed ? " — the listen block changed; restart the gateway to apply it" : ""));
+    } else {
+      say("not saved, config.yaml unchanged:\\n" + problems(r), true);
+    }
+  } catch {
+    say("the gateway did not answer", true);
+  } finally {
+    b.disabled = false;
+    refresh().catch(() => {});
+  }
+});
 $("reload").addEventListener("click", () => act($("reload"), "/reload", (r) =>
   r.status === 200
     ? say("config reloaded")

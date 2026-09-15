@@ -168,7 +168,7 @@ existing three dependencies only.
 
 **Exit:** `mcpgw query` answers what one line of `jq` could not; runtime deps still three.
 
-## Phase 11 — Managing from the status page · *in progress*
+## Phase 11 — Managing from the status page · *done*
 
 Approved 2026-09-15, in three PRs. Management needs `listen.token`; PRD §3 amended.
 
