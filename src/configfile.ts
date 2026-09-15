@@ -3,6 +3,7 @@
 // an edit splices text at the offsets the parser reports, touching only the lines it changes, and
 // is then re-parsed and compared with what the edit was meant to mean. A layout the splice gets
 // wrong is refused, never written.
+import { createHash } from "node:crypto";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import YAML, { isMap, isScalar, isSeq, type Node, type YAMLMap, type YAMLSeq } from "yaml";
@@ -10,6 +11,27 @@ import { ConfigError, parseConfig, type Config } from "./config.js";
 
 /** The edit was valid, but this file's layout is not one the splice can change safely. */
 export class LayoutError extends Error {}
+
+/** The file changed on disk after the editor loaded it; saving would overwrite that change. */
+export class ConflictError extends Error {}
+
+export function hashOf(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+/** The whole file, as the editor shows it: nothing interpolated, comments and all. */
+export function readConfigText(path: string): { text: string; hash: string } {
+  const text = readFileSync(path, "utf8");
+  return { text, hash: hashOf(text) };
+}
+
+/** The editor's save: `text` replaces the file only if the file is still the one it loaded. */
+export function saveConfigText(path: string, text: string, baseHash: string): Config {
+  if (readConfigText(path).hash !== baseHash) {
+    throw new ConflictError("config.yaml changed since the editor loaded it; load it again");
+  }
+  return writeConfig(path, text);
+}
 
 /**
  * Validates `text` exactly as a load would, then replaces the file: previous version to
