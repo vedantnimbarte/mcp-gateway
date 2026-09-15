@@ -222,6 +222,11 @@ test("the status page ships its controls, and they call the gated routes", async
   const script = await (await fetch(`${managed.gateway.url}/dashboard.js`)).text();
   for (const route of ['"/reload"', '"/stop"', '"/restart/"']) assert.ok(script.includes(route), route);
   assert.match(script, /body\.manage/, "controls must depend on the manage flag");
+  // Found in the browser: a stopped gateway kept reading "up", a slow load could overwrite typing,
+  // and a button's save left the editor on the old file.
+  assert.match(script, /get\("\/healthz"\)\.catch\(/, "a failed refresh must show the gateway as down");
+  assert.match(script, /readOnly = true/, "the editor must be locked while it loads");
+  assert.match(script, /!== editorText/, "a button's save must re-sync an untouched editor");
 
   // The controls and the login form are display:flex, which beats the `hidden` attribute unless
   // the page says otherwise: logged out, the stop button showed.
