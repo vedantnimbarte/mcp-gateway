@@ -181,7 +181,7 @@ export class Backend {
       await client.connect(transport, { timeout: this.defaults.connect_timeout_ms });
     } catch (e) {
       // A slow `npx` that timed out has usually already started its grandchild.
-      await closeTree(client, transport instanceof StdioClientTransport ? transport.pid : null);
+      await this.#closeTree(client, transport instanceof StdioClientTransport ? transport.pid : null);
       this.#failAndRetry(e);
       throw e;
     }
@@ -193,7 +193,7 @@ export class Backend {
     try {
       await this.refresh();
     } catch (e) {
-      await closeTree(client, this.pid);
+      await this.#closeTree(client, this.pid);
       this.#failAndRetry(e);
       throw e;
     }
@@ -514,7 +514,14 @@ export class Backend {
     const client = this.#client;
     this.#client = undefined;
     this.#transport = undefined;
-    if (client) await closeTree(client, orphan);
+    if (client) await this.#closeTree(client, orphan);
+  }
+
+  /** closeTree, with a listing that failed said out loud: it means a process may have leaked. */
+  #closeTree(client: Client, pid: number | null | undefined): Promise<void> {
+    return closeTree(client, pid, (error) =>
+      this.onEvent?.("tree_unlisted", { server: this.name, pid, error }),
+    );
   }
 }
 
@@ -528,8 +535,17 @@ export class Backend {
  * stale listing could name a pid the OS has since reused. Upgrade: own the spawn, detached, and
  * signal the process group.
  */
-async function closeTree(client: Client, pid: number | null | undefined): Promise<void> {
-  const tree = pid ? await descendants(pid) : [];
+async function closeTree(
+  client: Client,
+  pid: number | null | undefined,
+  unlisted: (error: string) => void,
+): Promise<void> {
+  let tree: number[] = [];
+  if (pid) {
+    const found = await descendants(pid);
+    if (typeof found === "string") unlisted(found);
+    else tree = found;
+  }
   await client.close().catch(() => {});
   for (const child of tree) {
     try {
@@ -540,14 +556,14 @@ async function closeTree(client: Client, pid: number | null | undefined): Promis
   }
 }
 
-let listing: Promise<Map<number, number[]>> | undefined;
+let listing: Promise<Map<number, number[]> | string> | undefined;
 
 /**
  * pid → child pids, from one OS listing. A shutdown closes every backend at once and PowerShell
  * takes most of a second to answer on Windows, so closes that overlap share the listing in flight.
  * Only in flight: a finished one predates any process started since, which is what it must find.
  */
-function processTable(): Promise<Map<number, number[]>> {
+function processTable(): Promise<Map<number, number[]> | string> {
   if (listing) return listing;
   const [command, args] =
     process.platform === "win32"
@@ -561,7 +577,10 @@ function processTable(): Promise<Map<number, number[]>> {
           ],
         ]
       : ["ps", ["-A", "-o", "pid=,ppid="]];
-  const table = promisify(execFile)(command, args, { timeout: 5000, windowsHide: true })
+  // ponytail: a long timeout, because a busy Windows box took 4–24 s to start PowerShell and a
+  // listing that gives up leaks the tree; the cost is a slow close under load. Upgrade: own the
+  // spawn in a job object (Windows) or process group (POSIX) and stop listing altogether.
+  const table = promisify(execFile)(command, args, { timeout: 60_000, windowsHide: true })
     .then(({ stdout }) => {
       const children = new Map<number, number[]>();
       for (const line of stdout.split("\n")) {
@@ -571,7 +590,8 @@ function processTable(): Promise<Map<number, number[]>> {
       }
       return children;
     })
-    .catch(() => new Map<number, number[]>()) // no listing: fall back to the SDK's own kill
+    // No listing: fall back to the SDK's own kill, and say why, since the tree may now leak.
+    .catch((e: Error) => e.message)
     .finally(() => {
       listing = undefined;
     });
@@ -579,8 +599,10 @@ function processTable(): Promise<Map<number, number[]>> {
   return table;
 }
 
-async function descendants(root: number): Promise<number[]> {
+/** The error message instead, when the OS would not list its processes. */
+async function descendants(root: number): Promise<number[] | string> {
   const children = await processTable();
+  if (typeof children === "string") return children;
   const found: number[] = [];
   const walk = (pid: number): void => {
     for (const child of children.get(pid) ?? []) {
