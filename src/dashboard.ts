@@ -123,10 +123,17 @@ function button(parent, label, onClick) {
 
 /** The answer to a config edit: saved and reloaded, or why the file was left as it was. */
 function saved(what) {
-  return (r) => r.status === 200
-    ? say(what + " — saved to config.yaml and reloaded")
-    : say(what + " failed, config.yaml unchanged:\\n" +
-        ((r.body && (r.body.problems || [r.body.error]).join("\\n")) || r.status), true);
+  return (r) => {
+    if (r.status !== 200) {
+      say(what + " failed, config.yaml unchanged:\\n" + problems(r), true);
+      return;
+    }
+    // The file just changed under the editor. Untouched, it follows; edited, a save would be refused.
+    const edited = editorHash !== null && $("editor").value !== editorText;
+    if (editorHash !== null && !edited) loadEditor().catch(() => {});
+    say(what + " — saved to config.yaml and reloaded" +
+      (edited ? ". The editor below has unsaved edits and no longer matches the file." : ""));
+  };
 }
 
 async function sendJson(method, path, body) {
@@ -143,16 +150,24 @@ function problems(r) {
 
 /** The hash of the text the editor last loaded; a save is refused if the file has moved on. */
 let editorHash = null;
+/** The text as loaded or saved, to tell whether what is on screen has been edited since. */
+let editorText = "";
 
+/** Read-only while it loads, so nothing typed meanwhile is overwritten by the answer. */
 async function loadEditor() {
-  const r = await get("/config");
-  if (r.status !== 200) {
-    say("could not load config.yaml: " + r.status, true);
-    return;
+  $("editor").readOnly = true;
+  try {
+    const r = await get("/config");
+    if (r.status !== 200) {
+      say("could not load config.yaml: " + r.status, true);
+      return;
+    }
+    $("editor").value = editorText = r.body.text;
+    $("editor-path").textContent = r.body.path;
+    editorHash = r.body.hash;
+  } finally {
+    $("editor").readOnly = false;
   }
-  $("editor").value = r.body.text;
-  $("editor-path").textContent = r.body.path;
-  editorHash = r.body.hash;
 }
 
 /** Never re-fills the text on the page's own refresh: that would throw away what is being typed. */
@@ -188,14 +203,16 @@ async function refreshTools(h) {
 }
 
 async function refresh() {
-  const health = await get("/healthz");
+  // A gateway that stopped must not go on looking up: a failed fetch is an answer too.
+  const health = await get("/healthz").catch(() => ({ status: 0, body: null }));
   const detail = health.body && health.body.backends;
-  $("login").hidden = Boolean(detail);
+  $("login").hidden = Boolean(detail) || !health.body;
   $("controls").hidden = !(detail && health.body.manage);
   if (!detail) {
     $("tools-section").hidden = true;
     $("editor-section").hidden = true;
     $("summary").textContent = health.body ? "up — enter the token to see detail" : "not answering";
+    if (!health.body) $("backends").replaceChildren();
     return;
   }
   const h = health.body;
@@ -268,6 +285,7 @@ $("editor-save").addEventListener("click", async () => {
     const r = await sendJson("PUT", "/config", { text: $("editor").value, base_hash: editorHash });
     if (r.status === 200) {
       editorHash = r.body.hash;
+      editorText = $("editor").value;
       say("saved and reloaded" + (r.body.restart_needed ? " — the listen block changed; restart the gateway to apply it" : ""));
     } else {
       say("not saved, config.yaml unchanged:\\n" + problems(r), true);
