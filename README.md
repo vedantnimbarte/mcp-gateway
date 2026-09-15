@@ -375,6 +375,14 @@ refusals and errors, refreshing every five seconds. It shows only what `/healthz
 log already show. With `listen.token` set, it asks for the token and keeps it for that browser
 tab only.
 
+<p align="center">
+  <img src="assets/dashboard-backends.png" width="780" alt="Status page: gateway uptime and sessions, Reload config and Stop gateway buttons, and a backends table listing fs (14 tools) and memory (9 tools), both up, each with Restart and Disable">
+</p>
+
+<p align="center">
+  <img src="assets/dashboard-refusals.png" width="780" alt="Recent refusals and errors: fs__write_file and memory__delete_entities refused as not_allowed in the readonly profile, fs__move_file denied_by_policy in the coding profile">
+</p>
+
 Once you have entered the token, the page can also manage the gateway: **Reload config**,
 **Restart** on each backend, and **Stop gateway**. These appear only when `listen.token` is set;
 without one the page stays read-only. Every action leaves a `manage` line in the audit log.
@@ -389,6 +397,10 @@ to `config.yaml`, so a later reload or restart keeps it:
   exact tool to the profile's `deny` list; **Enable** removes the entry again. A tool covered by a
   deny glob or missing from an allow list has no button — change those in the YAML.
 
+<p align="center">
+  <img src="assets/dashboard-tools.png" width="780" alt="Tools for the readonly profile: fs__read_* and fs__list_* tools allowed by their allow globs with a Disable button each, while fs__write_file, fs__move_file and other tools are not_allowed because they match no allow glob, and have no button">
+</p>
+
 Each change is spliced into the file where it belongs, so your comments and layout stay as they
 were, and the previous file is kept as `config.yaml.bak`. A change that would make the config
 invalid is refused and the file is left alone. Saving reloads the file as it is on disk, so an edit
@@ -400,6 +412,13 @@ shown only when you open the page on the machine running the gateway; from anywh
 refused even with the token, because editing a server's `command` means running a program as you.
 A save is refused if the file changed on disk since the editor loaded it, and a change under
 `listen` is saved but needs `mcpgw start` again to take effect.
+
+<p align="center">
+  <img src="assets/dashboard-editor.png" width="780" alt="The config.yaml editor showing the file as written, with the token as ${MCPGW_TOKEN} and two npx servers, above Load from disk, Validate and Save & reload buttons">
+</p>
+
+*Screenshots: the official filesystem and memory MCP servers behind two profiles, `coding` and
+`readonly`.*
 
 ## Tool pinning
 
