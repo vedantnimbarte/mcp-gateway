@@ -227,6 +227,7 @@ test("the status page ships its controls, and they call the gated routes", async
   assert.match(script, /get\("\/healthz"\)\.catch\(/, "a failed refresh must show the gateway as down");
   assert.match(script, /readOnly = true/, "the editor must be locked while it loads");
   assert.match(script, /!== editorText/, "a button's save must re-sync an untouched editor");
+  assert.match(script, /line\.rpc_method \|\| line\.method/, "a refused reverse request must not render as `server__`");
 
   // The controls and the login form are display:flex, which beats the `hidden` attribute unless
   // the page says otherwise: logged out, the stop button showed.

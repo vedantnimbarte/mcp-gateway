@@ -257,7 +257,9 @@ async function refresh() {
     cell(row, (line.ts || "").replace("T", " ").slice(0, 19));
     cell(row, line.profile);
     cell(row, line.decision || line.status, "bad");
-    cell(row, line.exposed_as || (line.server ? line.server + "__" + (line.tool || "") : line.method));
+    // A tool call names its tool; anything else (a refused reverse request, say) names what it was.
+    cell(row, line.exposed_as || (line.tool ? line.server + "__" + line.tool
+      : [line.server, line.rpc_method || line.method].filter(Boolean).join(" ")));
     cell(row, line.error && line.error.message);
   }
 }
