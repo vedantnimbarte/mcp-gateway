@@ -447,7 +447,7 @@ append-only.
 | `error` | `{ code, message }` on failure, redacted |
 
 Also logged, with `method` set accordingly: `initialize` (session open), `session_close`,
-`backend_up`, `backend_down`, `drift`, `pinned`, `suspicious`, and `manage` for every reload,
+`backend_up`, `backend_down`, `drift`, `pinned`, `suspicious`, `tree_unlisted` (closing a backend could not list its child processes, so one may have leaked), and `manage` for every reload,
 restart, stop or config change requested over HTTP — `{ action, status: ok|error, remote, server?, profile?, tool?, problems? }`, where `action` is `reload`, `restart`, `stop`, `disable_server`, `enable_server`, `disable_tool`, `enable_tool` or `edit_config`. A refusal is a request too: a
 resource URI that is malformed or outside the profile gets its line like a denied tool call.
 Writes go through a stream and are never awaited by the request path. Under `audit.durable`
