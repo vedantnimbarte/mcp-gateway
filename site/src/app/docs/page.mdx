@@ -26,10 +26,13 @@ Every call passes the same checks, in order: the policy for that profile, the ra
 
 ## What you get
 
+- **An easy move.** `mcpgw init` imports the servers your clients already run, keeps their secrets out of the config, and points the clients at the gateway.
 - **One config, not one per client.** Add a server once and every client sees it.
 - **One process per backend.** Three connected clients still means one GitHub server.
 - **Fewer, better tools.** A profile exposes the dozen tools a client needs, renamed if you like.
-- **Rules that hold.** A denied tool is hidden and refused, even when a model guesses its name. Risky tools can wait for your approval.
+- **Rules that hold.** A denied tool is hidden and refused, even when a model guesses its name. Rules can limit what a call is given, such as which folders a write may touch, and risky tools wait for your yes, in the client or on the status page.
+- **A key per client.** Each client can get its own token that opens only its own profiles, and every call says which client made it.
+- **Always running.** `mcpgw service install` starts the gateway at login, without admin rights.
 - **A small context.** Profiles can load tool schemas on demand, keep large results out of the context, and let a script chain calls in a sandbox. See [Keeping context small](/docs/context).
 - **Tools that can't change under you.** Tool descriptions are pinned; a server that rewrites one is blocked until you review the diff.
 - **Everything on record.** One line of JSON per call, queryable with `jq` or SQL, and a live [status page](/docs/dashboard).
@@ -41,5 +44,5 @@ Every call passes the same checks, in order: the policy for that profile, the ra
 
 ## Where to go next
 
-- [Install it](/docs/installation), then follow the [quick start](/docs/quick-start) to have a client using the gateway in about five minutes.
+- [Install it](/docs/installation), then follow the [quick start](/docs/quick-start) to have a client using the gateway in about five minutes. If your clients already run MCP servers, `mcpgw init` does most of it for you.
 - Read [The config file](/docs/configuration) for every option, with its default.

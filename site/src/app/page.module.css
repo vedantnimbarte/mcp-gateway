@@ -64,6 +64,7 @@
 .shot { width: 100%; border-radius: 12px; border: 1px solid var(--rule); box-shadow: 0 20px 40px -24px color-mix(in srgb, var(--ink) 40%, transparent); }
 
 .start { padding-top: clamp(64px, 9vw, 112px); padding-bottom: clamp(64px, 9vw, 112px); }
+.startNote { color: var(--muted); margin: -6px 0 0; max-width: 60ch; }
 .steps { list-style: none; counter-reset: step; padding: 0; margin: 28px 0 36px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 48px; }
 .steps li { counter-increment: step; position: relative; padding: 22px 0 0 54px; border-top: 1px solid var(--rule-soft); }
 .steps li::before {

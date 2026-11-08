@@ -4,6 +4,17 @@ export const metadata = { title: "Adding servers" }
 
 A backend is any MCP server: one the gateway starts as a local process, or a remote one it reaches over HTTP. Add it once under `servers`, and every profile that includes it can use its tools.
 
+## Importing the servers your clients run
+
+If a server is already set up in Claude Desktop, Cursor, Claude Code or Windsurf, you don't need to retype it:
+
+```bash
+mcpgw init          # see what it found
+mcpgw init --yes    # add them to config.yaml
+```
+
+New servers are merged into your existing `config.yaml`, which keeps its comments. A server you already have is not added twice. Their `env` and header values move into `.env` beside the config as `${NAME}` references. See [Importing your clients' servers](/docs/cli#importing-your-clients-servers). The rest of this page covers adding servers by hand.
+
 ## A local server (stdio)
 
 Most MCP servers are commands you run. The gateway starts each one once and talks to it over stdin and stdout.
@@ -23,7 +34,7 @@ servers:
 |-----|---------|---------|
 | `command` | required | The program to run. |
 | `args` | `[]` | Its arguments. |
-| `env` | `{}` | Extra environment variables. Use `${NAME}` for secrets. |
+| `env` | `{}` | Extra environment variables. Use `${NAME}` for secrets, set in the environment or in [`.env`](/docs/configuration#keeping-secrets-in-env). |
 | `cwd` | the gateway's | Working folder. A leading `~` is your home folder. |
 | `restart` | `{ max_retries: 5, backoff_ms: 1000 }` | Restarts after a crash. The wait doubles each attempt, up to 30 seconds. |
 

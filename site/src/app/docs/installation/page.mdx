@@ -55,4 +55,20 @@ echo "$(npm root -g)/mcp-gateway/dist/src/bridge.js"
 
 Run the same install command again; npm fetches the latest `main` and rebuilds. Then restart the daemon. Your `config.yaml`, `tools.lock.json`, `tokens.json` and audit log live beside your config, not in the package, so they are untouched.
 
-Next: [Quick start](/docs/quick-start).
+## After installing
+
+Two commands do most of the setup:
+
+```bash
+mcpgw init --clients --yes
+```
+
+imports the servers Claude Desktop, Cursor, Claude Code and Windsurf already run, and points those clients at the gateway. Run it without `--yes` first to see what it would change. See [Importing your clients' servers](/docs/cli#importing-your-clients-servers).
+
+```bash
+mcpgw service install
+```
+
+starts the gateway now and at every login. See [Starting at login](/docs/cli#starting-at-login).
+
+Or set it up by hand, step by step: [Quick start](/docs/quick-start).

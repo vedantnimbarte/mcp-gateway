@@ -15,6 +15,28 @@ const COMPARISON = [
 
 const FEATURES: { title: string; body: string; file: string; code: string; more: string }[] = [
   {
+    title: "Bring the servers you already have",
+    body:
+      "You don't start from a blank file. mcpgw init reads what Claude Desktop, Cursor, Claude Code and Windsurf already run, imports each server once, moves their secrets into .env, and points every client at the gateway. It shows you the plan first and backs up every file it changes.",
+    file: "terminal",
+    code: `$ mcpgw init --clients
+Client configs found:
+  claude-desktop  3 server(s)  ~/Library/Application Support/Claude/...
+  cursor          2 server(s)  ~/.cursor/mcp.json
+
+Create ~/gateway/config.yaml:
+  github      npx -y @modelcontextprotocol/server-github   from claude-desktop, cursor
+  linear      http https://mcp.linear.app/mcp              from cursor
+  filesystem  npx -y @modelcontextprotocol/server-filesystem /code
+  and a "default" profile with every server
+
+Move 2 secret(s) into ~/gateway/.env, referenced as \${NAME}:
+  GITHUB_PERSONAL_ACCESS_TOKEN, LINEAR_AUTHORIZATION
+
+Nothing has been written. Re-run with --yes to apply.`,
+    more: "/docs/cli#importing-your-clients-servers",
+  },
+  {
     title: "Give each client the tools it should have",
     body:
       "Declare your servers once, then compose profiles from them. A profile picks servers and filters their tools with globs, so your editor sees the twelve tools it needs instead of a hundred and twenty. Tools are namespaced by server, and you can rename them to whatever reads clearly to the model.",
@@ -34,17 +56,21 @@ const FEATURES: { title: string; body: string; file: string; code: string; more:
   {
     title: "Rules that hold, even when the model guesses",
     body:
-      "Deny always beats allow, and a tool the model never saw is still refused if it guesses the name. Risky tools can wait for a yes in the client that asked, and rate limits keep one busy profile or backend from starving the rest.",
+      "Deny always beats allow, and a tool the model never saw is still refused if it guesses the name. Rules can limit what a call is given, such as which folders a write may touch. Risky tools wait for your yes, in the client or on the status page, and each client can get its own key that opens only its own profiles.",
     file: "config.yaml",
     code: `profiles:
   coding:
-    approve: ["github__create_pull_request", "fs__write_file"]
-    limits: { rpm: 60, concurrent: 4 }
+    approve: ["github__create_pull_request"]
+    arguments:
+      - tools: ["fs__write_file"]
+        name: path
+        allow: ["/Users/you/code/*"]
+        as: path
 
-servers:
-  fs:
-    limits: { concurrent: 2 }`,
-    more: "/docs/profiles#approvals",
+listen:
+  clients:
+    - { name: agent, token: \${AGENT_TOKEN}, profiles: [readonly] }`,
+    more: "/docs/profiles#rules-on-arguments",
   },
   {
     title: "Keep the model's context small",
@@ -97,27 +123,19 @@ ask_later       25`,
 const STEPS: { title: string; body: string; code: string; file?: string }[] = [
   { title: "Install it", body: "Node 22.13 or newer. npm clones the repository and builds it.", code: INSTALL },
   {
-    title: "Declare your servers",
-    body: "Write config.yaml. Credentials come from the environment, never the file.",
-    file: "config.yaml",
-    code: `version: 1
-servers:
-  github:
-    transport: stdio
-    command: npx
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: \${GITHUB_TOKEN}
-profiles:
-  default:
-    servers: ["*"]`,
+    title: "Bring your servers",
+    body: "Import what your clients already run and point them at the gateway. Leave off --yes to see the plan first.",
+    code: "mcpgw init --clients --yes",
   },
-  { title: "Start the gateway", body: "It connects each backend once and serves every profile.", code: "mcpgw start" },
   {
-    title: "Point a client at a profile",
-    body: "Replace the client's own server entries with one gateway entry.",
-    file: "~/.claude.json",
-    code: `{ "mcpServers": { "gateway": { "type": "http", "url": "http://127.0.0.1:8420/mcp/default" } } }`,
+    title: "Keep it running",
+    body: "Starts the gateway now and at every login, without admin rights.",
+    code: "mcpgw service install",
+  },
+  {
+    title: "Watch it work",
+    body: "Restart your clients, then check every backend is up, or open http://127.0.0.1:8420/.",
+    code: "mcpgw status",
   },
 ];
 
@@ -230,8 +248,11 @@ export default function Home() {
 
         <section className={`wrap ${styles.start}`} aria-labelledby="start">
           <h2 id="start" className={styles.h2}>
-            From nothing to a working gateway
+            Four commands to a working gateway
           </h2>
+          <p className={styles.startNote}>
+            No servers set up yet? The quick start shows how to write <code>config.yaml</code> yourself.
+          </p>
           <ol className={styles.steps}>
             {STEPS.map((s) => (
               <li key={s.title}>
