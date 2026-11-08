@@ -143,12 +143,15 @@ test("reload and restart leave a manage line, failures included", async () => {
 test("the config-writing routes need a token configured and presented", async () => {
   for (const [method, path] of [
     ["POST", "/servers/alpha/disable"],
-    ["GET", "/profiles/default/tools"],
     ["POST", "/profiles/default/tools/alpha__echo/disable"],
   ] as const) {
     assert.equal((await fetch(`${open.gateway.url}${path}`, { method })).status, 403, path);
     assert.equal((await fetch(`${managed.gateway.url}${path}`, { method })).status, 401, path);
   }
+  // Reading the tool list is detail, like /healthz: loopback alone is enough without a token,
+  // and with one it must be presented.
+  assert.equal((await fetch(`${open.gateway.url}/profiles/default/tools`)).status, 200);
+  assert.equal((await fetch(`${managed.gateway.url}/profiles/default/tools`)).status, 401);
   const url = managed.gateway.url;
   assert.equal((await fetch(`${url}/servers/nope/disable`, { method: "POST", headers: auth })).status, 404);
   assert.equal((await fetch(`${url}/profiles/nope/tools`, { headers: auth })).status, 404);
@@ -231,7 +234,7 @@ test("the status page ships its controls, and they call the gated routes", async
 
   // The controls and the login form are display:flex, which beats the `hidden` attribute unless
   // the page says otherwise: logged out, the stop button showed.
-  const page = await (await fetch(`${managed.gateway.url}/dashboard`)).text();
+  const page = await (await fetch(`${managed.gateway.url}/`)).text();
   assert.match(page, /\[hidden\]\s*\{\s*display:\s*none\s*!important/);
   assert.match(page, /<div id="controls" hidden>/);
 });

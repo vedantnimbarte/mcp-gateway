@@ -475,11 +475,12 @@ export class Guard {
 
 
   /** FR-17: never forward an unbounded payload; truncate with a marker instead. */
-  capResult(result: CallToolResult): Capped<CallToolResult> {
+  capResult(result: CallToolResult, max = this.cfg.max_result_bytes): Capped<CallToolResult> {
     const content = [...(result.content ?? [])];
     const last = content.map((c) => c.type).lastIndexOf("text");
     const block = last < 0 ? undefined : (content[last] as { type: "text"; text: string });
     return this.#cap(
+      max,
       result,
       block?.text,
       (text) => {
@@ -500,6 +501,7 @@ export class Guard {
     const last = contents.map((c) => "text" in c).lastIndexOf(true);
     const block = last < 0 ? undefined : (contents[last] as { uri: string; text: string });
     return this.#cap(
+      this.cfg.max_result_bytes,
       result,
       block?.text,
       (text) => {
@@ -518,6 +520,7 @@ export class Guard {
     const message = last < 0 ? undefined : messages[last]!;
     const text = message?.content.type === "text" ? message.content.text : undefined;
     return this.#cap(
+      this.cfg.max_result_bytes,
       result,
       text,
       (text) => {
@@ -553,12 +556,12 @@ export class Guard {
    * computing a budget it cannot know.
    */
   #cap<T>(
+    max: number,
     result: T,
     text: string | undefined,
     withText: (text: string) => T,
     replace: (text: string) => T,
   ): Capped<T> {
-    const max = this.cfg.max_result_bytes;
     const bytes = Buffer.byteLength(JSON.stringify(result));
     if (bytes <= max) return { result, bytes, truncated: false };
 

@@ -183,6 +183,39 @@ Approved 2026-09-15, in three PRs. Management needs `listen.token`; PRD §3 amen
 
 **Exit:** a backend can be restarted, a tool switched off and the config edited without a shell.
 
+## Phase 12 — Context economy · *done*
+
+Profiles shrink the tool list ahead of time; this phase keeps the context small while it runs.
+All of it is in `context.ts` and goes through `Pipeline.callTool`, so nothing bypasses policy.
+
+- `context.tools: lazy`: `search_tools` / `describe_tool` / `call_tool` instead of every schema
+- `context.handle_bytes`: oversized results kept per session behind a handle, with shape and
+  preview; `query_result` with path, where, contains, fields and paging, bounded by the same size
+- `context.code`: `run_code` in a `node --permission` child with an empty environment, tool calls
+  back over IPC, killed at `code_timeout_ms` or on cancel, one `run_code` audit line per script
+- Gateway tool names are reserved: a rename cannot take one
+
+**Exit:** a 173 KB result comes back under 4 KB, and filtering it in `run_code` returns one
+number. The sandbox cannot read the config, spawn processes, or see the daemon's environment.
+
+## Phase 13 — Status page as a dashboard · *done*
+
+- Served at `/`; `/dashboard` redirects
+- A live track diagram: backends into the gate, out to profiles, lit by state, weighted by traffic
+- `/audit/stats` over 1h, 24h or 7d, counted from the JSONL (the daemon still never opens the
+  SQLite index), bounded at 32 MB per read and cached for 4 s
+- Traffic ledger and chart, busiest tools, refusal reasons, clients, per-backend latency, and an
+  activity log with a refusals-only filter
+- `handle` audit lines, so the page can say how much stayed out of the model's context
+- Split into six views behind a tab bar (overview, traffic, backends, tools, activity, config),
+  each at its own fragment and fetching only what it shows; the tools view groups by backend
+  with search and an allowed/blocked filter, so a large catalog stays readable
+- Reading `/profiles/<p>/tools` is detail like `/healthz`: no longer refused when no token is
+  configured. Switching a tool still needs one
+
+**Exit:** every section fills from a demo gateway's traffic, and the page has no horizontal
+scroll at phone width.
+
 ---
 
 ## Sequencing notes
@@ -234,3 +267,7 @@ at the relevant code site so they surface later.
 | Approval waits hold rate-limit slots | A human who walks away holds a slot for `approval_timeout_ms` | Release slots while waiting, re-acquire on yes |
 | Process trees are not cleaned up after a crash | A crashed launcher can leave its children | Own the spawn, detached, and signal the process group |
 | Response cache evicts oldest-first | A hot key can be evicted | True LRU |
+| Result handles live in memory, per session | A handle dies with its session or a restart | Spill to disk beside the audit log |
+| `run_code` can reach the network | A script can call out like its client could | `--allow-net` on Node 25+, or a container |
+| `/audit/stats` re-reads the log, at most 32 MB | A very busy window is counted from its recent end, marked `partial` | Aggregate as lines are written |
+| A cache hit is cut at `max_result_bytes` even for a handle | A cached large result is truncated before it is kept | Cache uncapped results for handle profiles |

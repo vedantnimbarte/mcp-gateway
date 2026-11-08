@@ -89,7 +89,22 @@ const Profile = z.object({
       concurrent: z.number().int().positive().default(8),
     })
     .default({}),
+  /** What keeps the model's context small (context.ts). Absent: tools are listed and returned whole. */
+  context: z
+    .object({
+      // `lazy` lists only search_tools / describe_tool / call_tool; schemas load on demand.
+      tools: z.enum(["full", "lazy"]).default("full"),
+      // A result larger than this is kept by the gateway and returned as a handle + preview.
+      handle_bytes: z.number().int().positive().optional(),
+      // Adds run_code: the model's script calls tools in a sandbox and only its output returns.
+      code: z.boolean().default(false),
+      code_timeout_ms: z.number().int().positive().default(30000),
+    })
+    .default({}),
 });
+
+/** The gateway's own tools in a profile with `context` set; nothing a backend provides may take one. */
+export const META_TOOLS = ["search_tools", "describe_tool", "call_tool", "query_result", "run_code"];
 
 const ConfigSchema = z.object({
   version: z.literal(1),
@@ -265,6 +280,9 @@ function crossCheck(cfg: Config): string[] {
       const where = `profiles.${name}.rename.${canonical}`;
       if (!ALIAS.test(alias)) {
         problems.push(`${where}: alias "${alias}" must match ${ALIAS.source}`);
+      }
+      if (META_TOOLS.includes(alias)) {
+        problems.push(`${where}: alias "${alias}" is reserved for the gateway's own tools`);
       }
 
       const server = serverOf(canonical);

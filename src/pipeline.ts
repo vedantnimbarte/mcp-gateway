@@ -46,6 +46,11 @@ export interface CallContext {
   onprogress?: (progress: Progress) => void;
   /** Whether this client declared it can answer `elicitation/create` — what approval needs. */
   canElicit?: boolean;
+  /**
+   * Overrides `guard.max_result_bytes` for this call. Set by context.ts, which keeps a large
+   * result out of the model's context itself rather than forwarding it, so it may hold more.
+   */
+  maxResultBytes?: number;
 }
 
 /** SPEC §3.3: under `on_drift: warn` a changed tool is still listed, but flagged. */
@@ -316,9 +321,15 @@ export class Pipeline {
         throw error;
       }
 
-      // 6. guard-out: redact, then cap.
-      const { result, bytes, truncated } = this.guard.capResult(this.guard.redact(raw));
-      if (cacheKey !== undefined) this.#cache.set(cacheKey, entry.server, result);
+      // 6. guard-out: redact, then cap. The cache holds what an ordinary caller would get, so a
+      //    larger cap for one caller never leaks a larger payload to another.
+      //    ponytail: so a cache hit for a larger-cap caller is cut at max_result_bytes too.
+      const redacted = this.guard.redact(raw);
+      const { result, bytes, truncated } = this.guard.capResult(redacted, ctx.maxResultBytes);
+      if (cacheKey !== undefined) {
+        const shared = ctx.maxResultBytes === undefined ? result : this.guard.capResult(redacted).result;
+        this.#cache.set(cacheKey, entry.server, shared);
+      }
 
       // 7. audit — exactly one line, whatever happened.
       this.audit.write({

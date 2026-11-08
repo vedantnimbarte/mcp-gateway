@@ -8,7 +8,8 @@ import { ClientCredentialsProvider } from "@modelcontextprotocol/sdk/client/auth
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { AuditLog, recentLines } from "./audit.js";
 import { DASHBOARD_HTML, DASHBOARD_JS } from "./dashboard.js";
-import { ConfigError, isLoopback, loadConfig, parseConfig, type Config } from "./config.js";
+import { ConfigError, GATEWAY_INFO, isLoopback, loadConfig, parseConfig, type Config } from "./config.js";
+import { auditStats, WINDOWS, type Window } from "./stats.js";
 import {
   ConflictError,
   LayoutError,
@@ -267,10 +268,17 @@ export async function startGateway(
       return;
     }
 
+    // The status page lives at the root; its old address still finds it.
+    if (path === "/dashboard") {
+      res.writeHead(308, { location: "/" });
+      res.end();
+      return;
+    }
+
     // The status page itself holds no data, so it needs no token; what it fetches does. The CSP
     // keeps it to its own two files and its own origin.
-    if (path === "/dashboard" || path === "/dashboard.js") {
-      const html = path === "/dashboard";
+    if (path === "/" || path === "/dashboard.js") {
+      const html = path === "/";
       res.writeHead(200, {
         "content-type": html ? "text/html; charset=utf-8" : "text/javascript; charset=utf-8",
         "content-security-policy":
@@ -387,10 +395,18 @@ export async function startGateway(
 
     // What `mcpgw list` prints for one profile, plus which tools the page can switch: an exact
     // deny entry can be removed, and a tool no deny glob covers can be given one. Globs and allow
-    // lists are left to the YAML.
+    // lists are left to the YAML. Reading it is detail like /healthz's, so it needs only what
+    // detail needs; the switches themselves are the gated routes below.
     const toolList = /^\/profiles\/([^/]+)\/tools$/.exec(path);
     if (toolList) {
-      if (!gated("GET")) return;
+      if (req.method !== "GET") {
+        send(res, 405, { error: "GET only" });
+        return;
+      }
+      if (!authorized) {
+        unauthorized(req, res, path);
+        return;
+      }
       const name = decodeURIComponent(toolList[1]!);
       const profile = current.profiles[name];
       if (!profile) {
@@ -498,6 +514,18 @@ export async function startGateway(
       return;
     }
 
+    // The status page's charts: the same audit log, counted over a window.
+    if (path === "/audit/stats") {
+      const window = url.searchParams.get("window") ?? "24h";
+      if (!(window in WINDOWS)) {
+        send(res, 400, { error: `window must be one of ${Object.keys(WINDOWS).join(", ")}` });
+        return;
+      }
+      await audit.flush();
+      send(res, 200, auditStats(audit.dir, window as Window));
+      return;
+    }
+
     const profile = path.startsWith("/mcp/") ? path.slice(5) : undefined;
     if (!profile || !sessions.hasProfile(profile)) {
       send(res, 404, { error: `unknown profile "${profile ?? ""}"` });
@@ -560,14 +588,40 @@ export async function startGateway(
       // The config editor also needs the request to come from this machine.
       editor: Boolean(token) && local,
       uptime_s: Math.round(process.uptime()),
+      version: GATEWAY_INFO.version,
+      node: process.version,
+      pid: process.pid,
+      memory_mb: Math.round(process.memoryUsage().rss / 1048576),
+      listen: `${tls ? "https" : "http"}://${host}:${port}`,
       sessions: sessions.size,
       pending_drift: parts.guard.pending().length,
       profiles: Object.keys(current.profiles),
+      // What each profile exposes and to how many clients: the right-hand side of the diagram.
+      profile_detail: Object.fromEntries(
+        Object.entries(current.profiles).map(([name, p]) => [
+          name,
+          {
+            servers: p.servers,
+            tools: parts.pipeline.visibleTools(name).length,
+            sessions: sessions.countFor(name),
+            context: p.context.tools === "lazy" || p.context.handle_bytes !== undefined || p.context.code
+              ? p.context
+              : undefined,
+          },
+        ]),
+      ),
       disabled: current.disabled ?? [],
       backends: Object.fromEntries(
         [...pool.backends].map(([name, b]) => [
           name,
-          { state: b.state, tools: b.tools.length, restarts: b.restarts, pid: b.pid, error: b.lastError },
+          {
+            state: b.state,
+            transport: current.servers[name]?.transport,
+            tools: b.tools.length,
+            restarts: b.restarts,
+            pid: b.pid,
+            error: b.lastError,
+          },
         ]),
       ),
     };

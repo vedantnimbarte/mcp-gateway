@@ -77,8 +77,12 @@ test("with listen.tls the daemon serves HTTPS, and the token still guards the de
 });
 
 test("the status page is served to anyone, locked down, and carries no data of its own", async () => {
-  const page = await get("/dashboard");
+  const page = await get("/");
   assert.equal(page.status, 200);
+  // The old address still finds it.
+  const old = await get("/dashboard");
+  assert.equal(old.status, 308);
+  assert.equal(old.headers.location, "/");
   assert.match(String(page.headers["content-type"]), /text\/html/);
   assert.match(String(page.headers["content-security-policy"]), /default-src 'none'/);
   assert.match(String(page.headers["content-security-policy"]), /frame-ancestors 'none'/);
@@ -105,6 +109,17 @@ test("the audit tail needs the token, and a refused token is itself audited", as
   const body = JSON.parse(allowed.body) as { lines: AuditLine[] };
   assert.ok(body.lines.length <= 5);
   assert.ok(body.lines.every((l) => l.decision !== "allow" || l.status === "error"));
+});
+
+test("the status page's stats need the token and name their window", async () => {
+  assert.equal((await get("/audit/stats")).status, 401);
+  assert.equal((await get("/audit/stats?window=2y", TOKEN)).status, 400);
+  const stats = JSON.parse((await get("/audit/stats?window=1h", TOKEN)).body);
+  assert.equal(stats.window, "1h");
+  assert.equal(stats.series.length, 12);
+  const health = JSON.parse((await get("/healthz", TOKEN)).body);
+  assert.equal(health.profile_detail.default.sessions, 0);
+  assert.equal(health.backends.alpha.transport, "stdio");
 });
 
 test("recentLines reads only the newest file's tail and survives a torn line", () => {

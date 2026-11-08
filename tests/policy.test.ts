@@ -12,6 +12,7 @@ const profile = (over: Partial<ProfileConfig> = {}): ProfileConfig => ({
   approve: [],
   rename: {},
   limits: { rpm: 120, concurrent: 8 },
+  context: { tools: "full", code: false, code_timeout_ms: 30000 },
   ...over,
 });
 

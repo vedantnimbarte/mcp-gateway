@@ -159,6 +159,24 @@ if (process.env.FIXTURE_PAYLOADS) {
   );
 }
 
+// A result far larger than a model's context should take, for the context suite. Off by default
+// so other suites' tool listings stay as they are.
+if (process.env.FIXTURE_ROWS) {
+  server.registerTool(
+    "rows",
+    { description: "Lists every row in the table, as JSON.", inputSchema: {} },
+    () => {
+      const rows = Array.from({ length: 2000 }, (_, i) => ({
+        id: i,
+        name: `item ${i}`,
+        status: i % 3 === 0 ? "open" : "closed",
+        owner: { login: i % 2 === 0 ? "ana" : "bo" },
+      }));
+      return { content: [{ type: "text", text: JSON.stringify(rows) }] };
+    },
+  );
+}
+
 server.registerResource(
   "page",
   new ResourceTemplate("fixture://page/{id}", { list: undefined }),

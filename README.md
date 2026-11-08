@@ -299,6 +299,47 @@ The gateway asks through MCP elicitation, showing the tool and its (redacted) ar
 decline, a dismissal, or no answer within `guard.approval_timeout_ms` refuses the call. So does
 a client that cannot elicit at all — an approval that cannot be asked for is never assumed.
 
+## Keeping the model's context small
+
+Profiles cut 120 tools down to the 12 you picked in advance. A profile's `context` goes further,
+for a model that needs everything reachable without paying for all of it up front:
+
+```yaml
+profiles:
+  lean:
+    servers: ["*"]
+    context:
+      tools: lazy          # full (default) | lazy
+      handle_bytes: 8192   # absent: results are returned whole, up to max_result_bytes
+      code: true           # adds run_code
+      code_timeout_ms: 30000
+```
+
+Each switch works on its own:
+
+- **`tools: lazy`.** `tools/list` returns `search_tools`, `describe_tool` and `call_tool` instead of
+  every schema. The model searches by keyword, loads only the schemas it needs, then calls. Search
+  and describe only ever show tools the profile allows.
+- **`handle_bytes`.** A result larger than this stays in the gateway. The model gets a handle, the
+  result's shape and a short preview, then reads just what it needs with `query_result`: a `path`
+  into it, `where` equality filters, `contains`, `fields`, `offset` and `limit`. A JSON text
+  result is queried as JSON, and other text as a list of lines. What `query_result` returns never
+  exceeds `handle_bytes`. In the test suite, a 173 KB tool result comes back as a summary under
+  4 KB. Handles belong to their session and are kept in memory, up to 64 per session.
+- **`code: true`.** Adds `run_code`. The model sends the body of an async function, which calls
+  `await tools.call(name, args)` and `await tools.search(query)`. Intermediate results stay in
+  the sandbox, and only what the script logs or returns comes back.
+
+None of it goes around the gateway. `call_tool`, `run_code` and a direct call all go through the
+same pipeline: policy, approvals, rate limits, redaction and one audit line per backend call.
+`run_code` also gets its own audit line, with the script hashed like any other arguments.
+
+The sandbox is a separate `node --permission` process. It has no file system, no child
+processes, no workers, no native addons and an **empty environment**, so none of the
+credentials the daemon holds. It is killed at `code_timeout_ms`, or when the client cancels.
+On the Node versions this project supports, the permission model does not restrict the network,
+so a script can still reach the internet, as could the client that sent it.
+
 ## Resources and prompts
 
 Both are proxied alongside tools, namespaced the same way. Prompts become `<server>__<name>`;
@@ -370,10 +411,28 @@ Queries run on a read-only connection.
 
 ## Status page
 
-`http://127.0.0.1:8420/dashboard` shows the backends, pending pinning changes, and the most recent
-refusals and errors, refreshing every five seconds. It shows only what `/healthz` and the audit
-log already show. With `listen.token` set, it asks for the token and keeps it for that browser
-tab only.
+Open `http://127.0.0.1:8420/` (the old `/dashboard` address redirects there). It refreshes every
+five seconds and is split into views, each at its own address so a reload keeps your place:
+
+| View | What it shows |
+|------|---------------|
+| **Overview** | A track diagram of the whole gateway: backends converge on the gate and leave as profiles, each line lit by its state (green up, amber connecting, red down, dashed when disabled), as thick as its traffic, with a moving dash while it is busy. Then what needs attention, and a traffic summary |
+| **Traffic** | For the last hour, 24 hours or 7 days: calls, success rate, refusals, failures, median, 95th and 99th percentile time, bytes returned, data kept out of context by result handles, scripts and sessions; a chart of calls per interval; the busiest tools, why calls were refused, clients, and each profile's numbers |
+| **Backends** | State, transport, tools, calls, failures and latency per backend, with Restart and Disable |
+| **Tools** | Every tool in a profile, grouped by backend in folding groups, with a search box and an All / Allowed / Blocked filter, each tool's decision, rule, calls and latency, and Disable / Enable |
+| **Activity** | The latest 200 audit lines, everything or only refusals and failures, filtered as you type |
+| **Config** | The config.yaml editor, and version, process and memory facts |
+
+The tabs carry counts where they help: backends down, tools, and refusals plus failures in the
+window. The Auto / Light / Dark switch in the header sets the theme; Auto follows the system, and
+the choice is remembered in that browser.
+
+It shows only what `/healthz` and the audit log already show. The charts come from
+`/audit/stats?window=1h|24h|7d`, which counts the JSONL log itself (at most its newest 32 MB per
+request); the daemon still never touches the SQLite index. With `listen.token` set, the page
+asks for the token and keeps it for that browser tab only.
+
+*The screenshots below show the previous version of the page.*
 
 <p align="center">
   <img src="assets/dashboard-backends.png" width="780" alt="Status page: gateway uptime and sessions, Reload config and Stop gateway buttons, and a backends table listing fs (14 tools) and memory (9 tools), both up, each with Restart and Disable">

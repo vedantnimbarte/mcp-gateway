@@ -69,6 +69,14 @@ profiles:
       rpm: 60
       concurrent: 4
 
+  lean:                      # every server, without filling the model's context
+    servers: ["*"]
+    context:
+      tools: lazy            # list search_tools/describe_tool/call_tool, not every schema
+      handle_bytes: 8192     # bigger results come back as a handle; query_result reads slices
+      code: true             # run_code: a sandboxed script chains calls, only its output returns
+      code_timeout_ms: 30000
+
 guard:
   pin_tools: true
   on_drift: block            # block | warn

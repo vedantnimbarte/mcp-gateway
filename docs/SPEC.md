@@ -88,6 +88,14 @@ profiles:
       rpm: 60
       concurrent: 4
 
+  lean:                      # every server, without filling the model's context (§5.1)
+    servers: ["*"]
+    context:
+      tools: lazy            # full | lazy
+      handle_bytes: 8192     # absent: results are returned whole, up to max_result_bytes
+      code: true             # adds run_code
+      code_timeout_ms: 30000
+
 guard:
   pin_tools: true
   on_drift: block            # block | warn
@@ -159,6 +167,12 @@ const Profile = z.object({
     rpm:        z.number().int().positive().default(120),
     concurrent: z.number().int().positive().default(8),
   }).default({}),
+  context: z.object({                        // §5.1
+    tools:           z.enum(["full", "lazy"]).default("full"),
+    handle_bytes:    z.number().int().positive().optional(),
+    code:            z.boolean().default(false),
+    code_timeout_ms: z.number().int().positive().default(30000),
+  }).default({}),
 });
 
 const Config = z.object({
@@ -206,6 +220,8 @@ const Config = z.object({
   - `profiles.*.rename` targets a tool not in the profile's post-filter set
   - two renames in one profile collide, or an alias collides with an unrenamed exposed tool
   - an alias fails `^[a-zA-Z0-9_-]{1,128}$`
+  - an alias is one of the gateway's own tool names (§5.1): `search_tools`, `describe_tool`,
+    `call_tool`, `query_result`, `run_code`
   - a `redact` pattern is not a valid regex
   - **`listen.host` is not loopback and `listen.token` is unset** (NFR-2)
 - `mcpgw validate` runs exactly these checks and exits non-zero on failure.
@@ -277,7 +293,7 @@ negotiates independently with each backend.
 | `notifications/initialized` | Consumed |
 | `ping` | Answered locally, never forwarded |
 | `tools/list` | Served from the catalog; policy-filtered; renames applied. One page by default. With `listen.page_size` every list (`tools`, `prompts`, `resources`, `resources/templates`) is paged; a cursor names an offset and a digest of the listing it came from, and a stale or malformed one is `-32602` |
-| `tools/call` | §5 pipeline |
+| `tools/call` | §5 pipeline. In a profile with `context` set, the gateway's own tools are answered first (§5.1) |
 | `resources/list`, `resources/templates/list` | Merged, namespaced, filtered by profile server membership |
 | `resources/read` | URI de-namespaced, routed to owning backend |
 | `resources/subscribe` / `unsubscribe` | Forwarded; `notifications/resources/updated` fanned back to subscribing sessions only |
@@ -337,7 +353,9 @@ paths above; leaks here are how a gateway grows a memory leak and a cross-talk b
 5. dispatch  backend.call(originalTool, args, timeout)             [timeout -> -32002]
 6. guard-out redact patterns; if bytes > max_result_bytes, truncate the last text content
              block and append "\n\n[truncated by mcp-gateway: N bytes omitted]"; a cacheable,
-             non-error result is stored as it leaves this step
+             non-error result is stored as it leaves this step. A caller that keeps the
+             result out of the model's context (§5.1) cuts at 8 MiB instead; the cache still
+             stores the max_result_bytes cut, so no other caller ever receives more
 7. audit     exactly one line, whatever happened
 8. release   semaphores, always, in a finally
 ```
@@ -346,6 +364,65 @@ Steps 2 and 3 are ordered deliberately: a denied call must not consume rate-limi
 cache comes after both policy and validation, so a cached answer can never bypass either; its key
 includes the tool's hash, so a drifted tool never answers from its old self. Cache hits do spend
 rate budget.
+
+### 5.1 Context economy (`profiles.*.context`)
+
+Three independent switches. Each one only reshapes what reaches the model. Every backend call
+they make is a §5 pipeline call under the session's own profile, so policy, approval, limits,
+redaction and audit apply unchanged.
+
+**`tools: lazy`.** `tools/list` returns the gateway's own tools instead of the profile's:
+
+| Tool | Arguments | Returns |
+|------|-----------|---------|
+| `search_tools` | `query?`, `limit?` (default 20, max 200) | One line per match, `name — first sentence of description`, highest score first. A term in the name scores 3 and one in the description scores 1; an empty query lists every tool |
+| `describe_tool` | `names[]` | `{ tools: [{ name, description, inputSchema, outputSchema? }], missing? }` |
+| `call_tool` | `name`, `arguments?` (absent = `{}`) | The tool's result, through §5 |
+
+Both list only ALLOW tools (§3.3), under their exposed names. A tool may still be called by its
+own name in a lazy profile.
+
+**`handle_bytes`.** A result whose serialized size exceeds it is kept in the session and replaced
+by a text summary: the handle id (`r1`, `r2`, …), its bytes and token estimate (bytes / 4), a
+shape sketch, up to three preview items, and how to query it. Error results are kept too, and
+the summary keeps `isError`. What is kept is the result's value: `structuredContent` if
+present, else the joined text parsed as JSON, else that text, else the content blocks. The
+store holds 64 handles and 64 MiB per session, evicting the oldest, and goes with the session.
+A tool with an `outputSchema` called by its own name is exempt and is capped as usual, since
+its client expects the structured content.
+
+`query_result(handle, path?, where?, contains?, fields?, offset?, limit?)`:
+
+```
+1. path      dot path into the value ("data.items", "items.0.owner"); missing -> -32602
+2. text      a string becomes its list of lines
+3. non-list  returned, projected by `fields`; if over handle_bytes, its shape instead
+4. where     keep items whose value at each key path equals the given JSON value
+5. contains  keep items whose JSON (or line) contains the string, case-insensitively
+6. page      offset (default 0), limit (default 20, max 200), then `fields` projection
+7. fit       drop items from the end until the reply is ≤ handle_bytes
+-> { total, offset, returned, items, next_offset? }
+```
+
+An unknown or evicted handle is `-32602`.
+
+**`code: true`.** `run_code(code)` runs `code` as the body of an async function in a child
+process started with `node --permission`, no `--allow-*` flags and an empty environment. That
+means no file system, no child processes, no workers, no addons, and none of the daemon's
+credentials. The script receives `tools`:
+
+- `await tools.call(name, args)` is a §5 call over IPC. It returns `structuredContent`, else
+  the text parsed as JSON, else the text. An error result throws.
+- `await tools.search(query)` returns `[{ name, description }]` as `search_tools` would.
+
+The reply is the script's console output (at most 1 MiB; later lines are counted, not kept),
+then `returned: <JSON>` if it returned something. A throw is an `isError` reply carrying the
+output and the error. The child is killed at `code_timeout_ms` (an `isError` "timed out"), on
+client cancellation, or when it finishes. The reply then goes through `handle_bytes` like any
+result, or without handles is cut at `max_result_bytes`. Inside the sandbox, results are cut
+at 8 MiB rather than `max_result_bytes`.
+
+The permission model on Node 22–24 does not restrict the network.
 
 ## 6. Tool pinning
 
@@ -446,7 +523,10 @@ append-only.
 | `cached` | `true` when a `tools/call` was answered from the response cache |
 | `error` | `{ code, message }` on failure, redacted |
 
-Also logged, with `method` set accordingly: `initialize` (session open), `session_close`,
+Also logged, with `method` set accordingly: `handle` (a result kept out of context, with its
+`handle` id and `result_bytes`), `run_code` (one per script, `args_hash` of the code
+under the usual `log_args` rule, `status` ok|error|timeout; each tool it calls has its own
+`tools/call` line), `initialize` (session open), `session_close`,
 `backend_up`, `backend_down`, `drift`, `pinned`, `suspicious`, `tree_unlisted` (closing a backend could not list its child processes, so one may have leaked), and `manage` for every reload,
 restart, stop or config change requested over HTTP — `{ action, status: ok|error, remote, server?, profile?, tool?, problems? }`, where `action` is `reload`, `restart`, `stop`, `disable_server`, `enable_server`, `disable_tool`, `enable_tool` or `edit_config`. A refusal is a request too: a
 resource URI that is malformed or outside the profile gets its line like a denied tool call.
@@ -498,8 +578,8 @@ not swallowed: original `code`/`message` land in `error.data.upstream`.
 
 | Aspect | Behaviour |
 |--------|-----------|
-| Path | `POST`/`GET`/`DELETE` `/mcp/<profile>`. Unknown profile → `404`. `POST /reload` re-reads the config; `POST /restart/<server>` reconnects one backend. `POST /stop` answers `202` and then drains and exits like `SIGTERM`; it needs `listen.token` to be set (else `403`) as well as the token itself. So do `POST /servers/<name>/disable|enable` (sets `disabled: true|false`), `GET /profiles/<p>/tools` (each tool's decision, rule and `toggle`: `disable`, `enable` or `null`) and `POST /profiles/<p>/tools/<server>__<tool>/disable|enable` (adds or removes that exact entry in the profile's `deny`). Those two write `config.yaml` and reload: the edit is spliced into the text so comments and layout survive, re-parsed and checked to mean exactly the intended change, validated like a load, and written via a temp file and rename with the previous file kept as `config.yaml.bak`. Invalid result → `400` with `problems`; a layout the splice cannot change safely → `409`; either way the file is untouched. Config changes and reloads run one at a time. The raw editor is `GET /config` (`{ path, text, hash }`, the file as written), `POST /config/validate` with `{ text }` (`200 { status: valid, restart_needed }` or `400 { problems }`) and `PUT /config` with `{ text, base_hash }`: the text is validated like a load and written the same way, and a `base_hash` that no longer matches the file on disk is `409` so a change made elsewhere is never overwritten. These three answer only requests whose socket address is loopback, on top of the token (else `403`), since writing `command:` runs a program as the daemon's user. A save answers `{ hash, restart_needed }`; `restart_needed` means the `listen` block changed, which is saved but applies only when the daemon is started again. `GET /audit/recent?n=&denied=1` returns the newest audit lines (token-gated, `n` ≤ 1000, tail of the newest file only) |
-| Status page | `GET /dashboard` and `/dashboard.js`: static, no data, no token needed, `Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'`. The page fetches `/healthz` and `/audit/recent` with a token the viewer types in, kept in `sessionStorage`. When the authorized `/healthz` reports `manage: true` (a token is set), it offers reload, per-backend restart, disable and enable, per-profile tool toggles, stop, and — when `/healthz` also reports `editor: true` (the request came from this machine) — the YAML editor, calling the routes above |
+| Path | `POST`/`GET`/`DELETE` `/mcp/<profile>`. Unknown profile → `404`. `POST /reload` re-reads the config; `POST /restart/<server>` reconnects one backend. `POST /stop` answers `202` and then drains and exits like `SIGTERM`; it needs `listen.token` to be set (else `403`) as well as the token itself. So do `POST /servers/<name>/disable|enable` (sets `disabled: true|false`) and `POST /profiles/<p>/tools/<server>__<tool>/disable|enable` (adds or removes that exact entry in the profile's `deny`). Those two write `config.yaml` and reload: the edit is spliced into the text so comments and layout survive, re-parsed and checked to mean exactly the intended change, validated like a load, and written via a temp file and rename with the previous file kept as `config.yaml.bak`. Invalid result → `400` with `problems`; a layout the splice cannot change safely → `409`; either way the file is untouched. Config changes and reloads run one at a time. The raw editor is `GET /config` (`{ path, text, hash }`, the file as written), `POST /config/validate` with `{ text }` (`200 { status: valid, restart_needed }` or `400 { problems }`) and `PUT /config` with `{ text, base_hash }`: the text is validated like a load and written the same way, and a `base_hash` that no longer matches the file on disk is `409` so a change made elsewhere is never overwritten. These three answer only requests whose socket address is loopback, on top of the token (else `403`), since writing `command:` runs a program as the daemon's user. A save answers `{ hash, restart_needed }`; `restart_needed` means the `listen` block changed, which is saved but applies only when the daemon is started again. `GET /profiles/<p>/tools` returns each tool's decision, rule and `toggle` (`disable`, `enable` or `null`); it is detail like `/healthz`, so it needs the token only when one is set. `GET /audit/recent?n=&denied=1` returns the newest audit lines (token-gated, `n` ≤ 1000, tail of the newest file only) |
+| Status page | `GET /` and `/dashboard.js`: static, no data, no token needed. Six views, each at its own fragment (`#/overview`, `#/traffic`, `#/backends`, `#/tools`, `#/activity`, `#/config`), each fetching only what it shows, `Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'`. `GET /dashboard` answers `308` to `/`. The page fetches `/healthz`, `/audit/stats` and `/audit/recent` with a token the viewer types in, kept in `sessionStorage`. `GET /audit/stats?window=1h\|24h\|7d` (token-gated, default `24h`, anything else `400`) counts the JSONL log over the window: `totals` (calls, ok, refused, errors, timeouts, cached, approved, bytes, sessions, run_code, handles, kept_bytes), `latency` p50/p95/p99 of successful calls, a `series` of 12, 24 or 28 buckets, the top `tools`, every `servers` and `profiles` row (calls, errors, refused, p95, bytes), `clients`, refusal `reasons`, and `live` calls per server in the last minute. It reads at most the newest 32 MB of log (`partial: true` when it stopped there), and the answer is reused for 4 s. The authorized `/healthz` also reports `version`, `node`, `pid`, `memory_mb`, `listen`, each backend's `transport`, and `profile_detail` (servers, visible tools, sessions, and `context` when set). When the authorized `/healthz` reports `manage: true` (a token is set), it offers reload, per-backend restart, disable and enable, per-profile tool toggles, stop, and — when `/healthz` also reports `editor: true` (the request came from this machine) — the YAML editor, calling the routes above |
 | TLS | With `listen.tls: { cert, key }` (PEM paths, `~` expanded) the listener is HTTPS. Binding beyond loopback without it logs `insecure_lan` at startup — allowed, since the token is required, but the token then crosses the network in the clear |
 | `/healthz` | `200 {status}` always; the `{uptime_s, sessions, pending_drift, backends}` detail only when the request is authorized, since it names backends and pids |
 | Session | `Mcp-Session-Id` response header on initialize; required on subsequent requests. Unknown/expired → `404`, client re-initializes |
@@ -572,6 +652,10 @@ Pure units, `node:test`, no framework:
 - `ratelimit.ts` — refill math over a fake clock, semaphore release on throw.
 - `session.ts` — id remap: two sessions both using `id: 1` get their own replies;
   timeout clears the entry; session close cancels in-flight.
+- `context.ts` — lazy listing; search and describe hide denied tools; a large result becomes a
+  handle under `handle_bytes` that `query_result` filters and pages without exceeding it;
+  handles are per session; `run_code` returns only its output, obeys policy, cannot read files,
+  spawn processes or see the environment, and is killed at its timeout.
 
 One integration test: a fixture stdio MCP server (~30 lines) with two tools, started by the
 suite. Asserts end-to-end call, a policy denial, and that mutating a tool description across

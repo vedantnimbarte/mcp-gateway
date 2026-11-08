@@ -33,6 +33,7 @@ import type { ReverseTarget } from "./backend.js";
 import type { AuditLog } from "./audit.js";
 import { namespaceUri } from "./catalog.js";
 import { GATEWAY_INFO, type Config } from "./config.js";
+import { ContextTools } from "./context.js";
 import type { CallContext, Pipeline } from "./pipeline.js";
 
 /** SPEC §10.1. */
@@ -174,6 +175,7 @@ function buildServer(
   profile: string,
   sessionId: () => string | undefined,
   pageSize: () => number | undefined,
+  context: ContextTools,
 ): Server {
   const server = new Server(
     { ...GATEWAY_INFO },
@@ -235,17 +237,13 @@ function buildServer(
 
   // One page unless `listen.page_size` is set: many clients never follow a cursor.
   server.setRequestHandler(ListToolsRequestSchema, (request) => {
-    const { items, nextCursor } = page(
-      pipeline.visibleTools(profile),
-      (t) => t.name,
-      pageSize(),
-      request.params?.cursor,
-    );
+    const { items, nextCursor } = page(context.list(), (t) => t.name, pageSize(), request.params?.cursor);
     return { tools: items, nextCursor };
   });
 
+  // Through ContextTools, which is the plain pipeline call unless the profile sets `context`.
   server.setRequestHandler(CallToolRequestSchema, (request, extra) =>
-    pipeline.callTool(ctx(extra), request.params.name, request.params.arguments),
+    context.call(ctx(extra), request.params.name, request.params.arguments),
   );
 
   server.setRequestHandler(ListPromptsRequestSchema, (request) => {
@@ -320,6 +318,12 @@ export class SessionManager {
     return this.#sessions.size;
   }
 
+  countFor(profile: string): number {
+    let n = 0;
+    for (const s of this.#sessions.values()) if (s.profile === profile) n++;
+    return n;
+  }
+
   get(id: string): Session | undefined {
     const session = this.#sessions.get(id);
     if (session) session.lastSeen = Date.now();
@@ -370,6 +374,10 @@ export class SessionManager {
       profile,
       () => transport.sessionId,
       () => this.config.listen.page_size,
+      new ContextTools(this.pipeline, this.audit, profile, () => ({
+        context: this.config.profiles[profile]?.context,
+        maxResultBytes: this.config.guard.max_result_bytes,
+      })),
     );
     // Fires after the handshake, which is when the client has actually named itself.
     server.oninitialized = () => {
