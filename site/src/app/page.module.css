@@ -1,0 +1,84 @@
+/* The hero sits on the mimic panel: headline, then the live diagram. */
+.hero { padding: clamp(40px, 6vw, 76px) 0 clamp(28px, 5vw, 56px); }
+.headline {
+  font-family: var(--display);
+  font-weight: 700;
+  font-size: clamp(40px, 6.4vw, 78px);
+  line-height: 1.02;
+  letter-spacing: -0.012em;
+  max-width: 15ch;
+  margin: 0 0 24px;
+  text-wrap: balance;
+}
+.lede { font-size: clamp(18px, 1.6vw, 20.5px); line-height: 1.55; color: var(--muted); max-width: 60ch; margin: 0 0 30px; }
+.actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.install { flex: 0 1 470px; min-width: 0; }
+.install :global(.code) { margin: 0; background: var(--sheet); }
+.install :global(.code pre) { padding: 11px 70px 11px 16px; }
+/* On a phone the command wraps rather than scrolling under the Copy button. */
+@media (max-width: 560px) {
+  .install { flex-basis: 100%; }
+  .install :global(.code pre) { white-space: pre-wrap; word-break: break-all; }
+}
+.diagram { margin-top: clamp(28px, 4vw, 44px); }
+
+/* Everything below is read on paper. */
+.sheet { background: var(--sheet); border-radius: 20px 20px 0 0; box-shadow: 0 -1px 0 var(--rule); }
+.h2 {
+  font-family: var(--display);
+  font-weight: 700;
+  font-size: clamp(30px, 3.6vw, 44px);
+  line-height: 1.08;
+  letter-spacing: -0.008em;
+  margin: 0 0 18px;
+  max-width: 22ch;
+  text-wrap: balance;
+}
+.h3 { font-family: var(--display); font-weight: 700; font-size: clamp(23px, 2.2vw, 28px); line-height: 1.15; margin: 0 0 12px; text-wrap: balance; }
+.more { display: inline-block; margin-top: 4px; font-family: var(--display); font-weight: 600; color: var(--slate); text-underline-offset: 4px; }
+
+.why { padding-top: clamp(56px, 8vw, 96px); padding-bottom: 24px; display: grid; gap: 28px 64px; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); align-items: start; }
+.whyText p { color: var(--muted); max-width: 52ch; margin: 0; }
+.compare { width: 100%; border-collapse: collapse; font-size: 16px; }
+.compare th, .compare td { text-align: left; padding: 13px 18px 13px 0; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+.compare thead th { font-family: var(--display); font-weight: 600; font-size: 15px; color: var(--muted); border-bottom-color: var(--rule); }
+.compare tbody th { font-weight: 500; }
+.compare td:last-child { color: var(--go); font-weight: 600; }
+.compare td:nth-child(2) { color: var(--muted); }
+
+/* Each feature: what it does, beside the YAML that turns it on, ruled off like track. */
+.features { padding-top: clamp(40px, 6vw, 72px); }
+.feature {
+  display: grid;
+  grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+  gap: 20px 64px;
+  padding: clamp(32px, 4vw, 48px) 0;
+  border-top: 4px solid var(--rule-soft);
+  align-items: start;
+}
+.feature p { color: var(--muted); max-width: 54ch; margin: 0 0 10px; }
+.feature :global(.code) { margin: 0; }
+
+.board { padding-top: clamp(56px, 8vw, 96px); display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 8fr); gap: 28px 56px; align-items: start; }
+.boardText p { color: var(--muted); max-width: 50ch; margin: 0 0 10px; }
+.shot { width: 100%; border-radius: 12px; border: 1px solid var(--rule); box-shadow: 0 20px 40px -24px color-mix(in srgb, var(--ink) 40%, transparent); }
+
+.start { padding-top: clamp(64px, 9vw, 112px); padding-bottom: clamp(64px, 9vw, 112px); }
+.steps { list-style: none; counter-reset: step; padding: 0; margin: 28px 0 36px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 48px; }
+.steps li { counter-increment: step; position: relative; padding: 22px 0 0 54px; border-top: 1px solid var(--rule-soft); }
+.steps li::before {
+  content: counter(step);
+  position: absolute; left: 0; top: 20px;
+  width: 36px; height: 36px; border-radius: 50%;
+  display: grid; place-items: center;
+  background: var(--slate); color: var(--on-slate);
+  font-family: var(--display); font-weight: 700; font-size: 18px;
+}
+.stepTitle { font-family: var(--display); font-weight: 700; font-size: 22px; margin: 4px 0 4px; }
+.steps p { color: var(--muted); margin: 0; }
+.steps :global(.code) { margin: 14px 0 20px; }
+
+@media (max-width: 900px) {
+  .why, .feature, .board { grid-template-columns: minmax(0, 1fr); }
+  .steps { grid-template-columns: minmax(0, 1fr); }
+}

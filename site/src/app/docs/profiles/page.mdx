@@ -1,0 +1,120 @@
+export const metadata = { title: "Profiles and tools" }
+
+# Profiles and tools
+
+A profile is the set of tools one kind of client sees. Each profile is served at its own address, `/mcp/<profile>`, so your editor, your chat app and an automated agent can each get exactly what they should.
+
+## Making a profile
+
+A profile picks servers, then filters their tools:
+
+```yaml title="config.yaml"
+profiles:
+  default:
+    servers: ["*"]            # every server, every tool
+
+  readonly:
+    servers: [github, linear]
+    allow: ["github__get_*", "github__list_*", "linear__list_*"]
+
+  coding:
+    servers: [github, fs]
+    deny: ["github__delete_*", "github__merge_pull_request"]
+```
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `servers` | `["*"]` | Which backends this profile can reach. `"*"` means all of them. |
+| `allow` | none | If present, only tools matching one of these globs are exposed. |
+| `deny` | `[]` | Tools matching any of these are hidden and refused. |
+| `rename` | `{}` | Show a tool under another name: `canonical: alias`. |
+| `approve` | `[]` | Tools that wait for a person's yes before they run. |
+| `limits` | `{ rpm: 120, concurrent: 8 }` | Calls per minute, and calls at once, for the whole profile. |
+| `context` | off | Ways to keep the model's context small. See [Keeping context small](/docs/context). |
+
+## Adding a tool to a profile
+
+Tools come from servers, so adding a tool means two things:
+
+1. **The server is in the profile.** Add the server under `servers` in the config if it is new (see [Adding servers](/docs/servers)), and include its name in the profile's `servers`, or use `"*"`.
+2. **The tool passes the filters.** With no `allow` list, every tool not denied is exposed. With an `allow` list, add a glob that matches the tool's name.
+
+For example, to give the `readonly` profile GitHub's search tools:
+
+```yaml
+profiles:
+  readonly:
+    servers: [github, linear]
+    allow: ["github__get_*", "github__list_*", "github__search_*", "linear__list_*"]
+```
+
+Then apply it to the running gateway and check the result:
+
+```bash
+mcpgw reload
+mcpgw list --profile readonly
+```
+
+`list` prints every tool, whether this profile exposes it, and the exact rule behind the decision. It is the first thing to run when a tool isn't showing up. Connected clients receive the new list straight away; they don't need to reconnect.
+
+You can also switch individual tools off and on from the [status page](/docs/dashboard), which adds or removes an exact entry in the profile's `deny` list for you.
+
+## How the rules combine
+
+Tools are named `<server>__<tool>`. For each one, in this order:
+
+1. The tool's server is not in the profile: **hidden**.
+2. A `deny` glob matches: **hidden**. Deny always beats allow.
+3. There is an `allow` list and nothing in it matches: **hidden**.
+4. The tool changed since it was pinned, under `on_drift: block`: **hidden** until you accept it.
+5. Its description was flagged as suspicious, under `on_suspicious: block`: **hidden**.
+6. Its server is down: **hidden** until it comes back.
+7. Otherwise: **exposed**.
+
+The same rules apply when a tool is called, so a tool the model never saw is still refused if it guesses the name, with error `-32004` and the reason.
+
+### Glob syntax
+
+`*` matches any run of characters, including `__`. `?` matches one character. Nothing else is special: no `**`, braces or character classes. Matching is case-sensitive and always against the canonical name, never an alias.
+
+## Renaming tools
+
+Give a tool a name that reads more clearly to the model:
+
+```yaml
+profiles:
+  coding:
+    servers: [github, fs]
+    rename:
+      github__create_issue: file_bug
+      fs__read_text_file: read_file
+```
+
+Rules always match the canonical name, so a rename can never be used to slip past a `deny`. Two renames may not produce the same name, and an alias may not shadow a tool the profile still exposes under its own name; `mcpgw validate` catches both.
+
+## Approvals
+
+Some tools you want reachable, but not unattended. List them under `approve` and each call waits for a yes in the client that made it:
+
+```yaml
+profiles:
+  coding:
+    servers: [github, fs]
+    approve: ["github__create_pull_request", "fs__write_file"]
+```
+
+The gateway asks through the client's own prompt (MCP elicitation), showing the tool and its arguments with secrets redacted. A decline, a dismissal, or no answer within `guard.approval_timeout_ms` refuses the call. So does a client that cannot ask at all: an approval that cannot be requested is never assumed.
+
+## Rate limits
+
+```yaml
+profiles:
+  coding:
+    limits: { rpm: 60, concurrent: 4 }
+```
+
+`rpm` is a budget per minute, refilled continuously, covering every request that makes a backend do work. `concurrent` caps calls in flight. A refused call returns `-32005` with how long to wait. Servers can have their own limits on top; see [Adding servers](/docs/servers#limits-per-server).
+
+## Prompts and resources
+
+Backends' prompts are filtered exactly like tools and named the same way. Resources are filtered by server only: a profile that reaches a server can read its resources, under `mcpgw://<server>/<original-uri>`. If that is too broad, leave the server out of the profile.

@@ -1,0 +1,50 @@
+import Image from "next/image"
+
+export const metadata = { title: "The status page" }
+
+# The status page
+
+Open `http://127.0.0.1:8420/` in a browser for a live view of the gateway. It refreshes every five seconds and shows only what `/healthz` and the audit log already hold.
+
+<Image
+  src="/dashboard.png"
+  alt="The status page's overview in dark mode: github and filesystem lit green and linear red on a track diagram converging on the gateway, leaving as three profiles with one client each, above a needs-attention list and the last 24 hours of traffic."
+  width={2560}
+  height={1664}
+  sizes="(max-width: 820px) 100vw, 74ch"
+  style={{ borderRadius: 12, border: "1px solid var(--rule)", margin: "24px 0" }}
+/>
+
+## The views
+
+| View | What it shows |
+|------|---------------|
+| **Overview** | A track diagram of the whole gateway: backends converge on the gate and leave as profiles. Each line is lit by its state (green up, amber connecting, red down, dashed when disabled), drawn as thick as its traffic, with a moving dash while it is busy. Below it, what needs attention and a traffic summary. |
+| **Traffic** | For the last hour, 24 hours or 7 days: calls, success rate, refusals, failures, median and 95th and 99th percentile time, bytes returned, data kept out of context, scripts and sessions. A chart of calls over time, the busiest tools, why calls were refused, which clients made them, and each profile's numbers. |
+| **Backends** | Each backend's state, transport, tools, calls, failures and latency, with Restart and Disable. |
+| **Tools** | Every tool in a profile, grouped by backend, with a search box and an All, Allowed or Blocked filter. Each shows its decision, the rule behind it, its calls and latency, and Disable or Enable. |
+| **Activity** | The latest 200 audit lines, everything or only refusals and failures, filtered as you type. |
+| **Config** | The `config.yaml` editor, and the gateway's version, process and memory. |
+
+Each view has its own address, such as `/#/tools`, so a reload keeps your place. The tabs show counts where they help: backends down, tools, and refusals plus failures in the window. The Auto, Light and Dark switch in the header sets the theme.
+
+The old address, `/dashboard`, redirects to `/`.
+
+## Managing the gateway from the page
+
+With `listen.token` set, the page asks for the token (kept for that browser tab only) and offers controls:
+
+- **Reload config**, **Restart** a backend, and **Stop gateway**. Nothing on the page can start a stopped gateway; that is `mcpgw start`.
+- **Disable** and **Enable** a backend. This writes `disabled: true` or `false` to `config.yaml`, so a later reload keeps it.
+- **Disable** and **Enable** a tool in a profile. This adds or removes that exact tool in the profile's `deny` list. A tool covered by a deny glob or missing from an allow list has no button; change those in the YAML.
+- **The config editor**: the file as written, with **Validate** and **Save & reload**.
+
+Each change is spliced into the file where it belongs, so your comments and layout stay as they were, and the previous file is kept as `config.yaml.bak`. A change that would make the config invalid is refused and the file is left alone. Every action leaves a `manage` line in the audit log.
+
+The editor is shown only when you open the page on the machine running the gateway. From anywhere else it is refused even with the token, because editing a server's `command` means running a program as you. A save is refused if the file changed on disk since the editor loaded it.
+
+Without a token, the page is read-only.
+
+## Where the numbers come from
+
+The charts come from `GET /audit/stats?window=1h|24h|7d`, which counts the JSONL audit log over the window. It reads at most the newest 32 MB of log per request; a busier window is counted from its most recent part and marked as partial. Results are reused for four seconds, however many tabs are open.

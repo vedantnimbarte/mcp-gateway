@@ -1,0 +1,58 @@
+export const metadata = { title: "Installation" }
+
+# Installation
+
+mcp-gateway needs Node 22.13 or newer, and nothing else: no database, no Redis, no external services.
+
+## Install from GitHub
+
+It is not published to npm yet. Install it straight from GitHub; npm clones the repository and builds it during install:
+
+```bash
+npm install -g github:vedantnimbarte/mcp-gateway
+```
+
+That puts two commands on your `PATH`:
+
+| Command | What it is |
+|---------|------------|
+| `mcpgw` | The gateway: start the daemon, validate the config, list tools, read the audit log. See [Command line](/docs/cli). |
+| `mcpgw-bridge` | A small stdio shim for clients that cannot speak HTTP, such as Claude Desktop. See [Connecting clients](/docs/clients). |
+
+Check it worked:
+
+```bash
+mcpgw --help
+```
+
+## Install from source
+
+Clone it if you want to change it, or pin it to a commit:
+
+```bash
+git clone https://github.com/vedantnimbarte/mcp-gateway.git
+cd mcp-gateway
+npm install
+```
+
+`npm install` also builds, producing `dist/src/cli.js` (`mcpgw`) and `dist/src/bridge.js` (`mcpgw-bridge`). After editing the source, rebuild with `npm run build`, and run `npm link` if you want the bare command names on your `PATH`.
+
+Run the test suite with:
+
+```bash
+npm test
+```
+
+## Where the bridge lives
+
+Client configs that launch the bridge need its absolute path. For a global install it is:
+
+```bash
+echo "$(npm root -g)/mcp-gateway/dist/src/bridge.js"
+```
+
+## Updating
+
+Run the same install command again; npm fetches the latest `main` and rebuilds. Then restart the daemon. Your `config.yaml`, `tools.lock.json`, `tokens.json` and audit log live beside your config, not in the package, so they are untouched.
+
+Next: [Quick start](/docs/quick-start).

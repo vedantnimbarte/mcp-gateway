@@ -1,0 +1,75 @@
+export const metadata = { title: "Quick start" }
+
+# Quick start
+
+From nothing to a client using the gateway, in about five minutes. You need Node 22.13 or newer and an MCP client such as Claude Code.
+
+## 1. Install
+
+```bash
+npm install -g github:vedantnimbarte/mcp-gateway
+```
+
+## 2. Write a config
+
+Make a folder for the gateway's files and create `config.yaml` in it. This one serves the official filesystem server to every client, through one profile. Replace the path with a folder you want the model to read:
+
+```yaml title="config.yaml"
+version: 1
+
+servers:
+  fs:
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/Users/you/code"]
+
+profiles:
+  default:
+    servers: ["*"]
+```
+
+Check it before you start anything:
+
+```bash
+mcpgw validate
+```
+
+`validate` reports every problem at once and exits non-zero if there are any: a missing environment variable, a profile naming a server that does not exist, a rename that collides.
+
+## 3. Start the gateway
+
+```bash
+mcpgw start
+```
+
+It listens on `http://127.0.0.1:8420`, starts the filesystem server once, and serves the `default` profile at `/mcp/default`. Leave it running. In another terminal:
+
+```bash
+mcpgw status
+```
+
+shows each backend, whether it is up, and how many tools it offers.
+
+## 4. Point a client at it
+
+Claude Code speaks HTTP, so it connects straight to the profile. In `~/.claude.json`:
+
+```json title="~/.claude.json"
+{ "mcpServers": { "gateway": { "type": "http", "url": "http://127.0.0.1:8420/mcp/default" } } }
+```
+
+Remove the client's own entry for the filesystem server: from now on, only the gateway should start backends. For Claude Desktop, Cursor and other clients, see [Connecting clients](/docs/clients).
+
+## 5. See it work
+
+Ask the client to list a directory. Then open `http://127.0.0.1:8420/` for the status page, or follow the audit log as calls arrive:
+
+```bash
+mcpgw tail --follow
+```
+
+## Next steps
+
+- [Add more servers](/docs/servers), including remote ones that sign in with OAuth.
+- [Make profiles](/docs/profiles) so each client sees only the tools it should, and risky tools need your approval.
+- [Keep the model's context small](/docs/context) when a profile has many tools or large results.

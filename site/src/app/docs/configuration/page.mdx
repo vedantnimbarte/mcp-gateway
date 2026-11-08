@@ -1,0 +1,112 @@
+export const metadata = { title: "The config file" }
+
+# The config file
+
+Everything the gateway does comes from one YAML file. This page covers where it lives, how secrets get into it, and every top-level block with its defaults.
+
+## Where it lives
+
+The gateway looks for its config in this order:
+
+1. `--config PATH` on the command line
+2. the `MCPGW_CONFIG` environment variable
+3. `config.yaml` in the current folder
+
+Everything the gateway writes lives beside that file: `tools.lock.json` (tool pins), `tokens.json` (OAuth tokens, mode 0600), the rate-limit state, and `audit/` unless you move it. Commit `config.yaml` and `tools.lock.json`; keep `tokens.json` and `audit/` out of git.
+
+## Secrets come from the environment
+
+Write `${NAME}` anywhere a string goes and the gateway substitutes the environment variable when it loads the file. A variable that is not set is an error that names it, never an empty string. Credentials never need to live in the file.
+
+```yaml
+servers:
+  github:
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN}
+```
+
+## The blocks
+
+```yaml title="config.yaml"
+version: 1     # always 1
+
+listen:        # where the gateway answers
+defaults:      # timeouts for every backend
+servers:       # the MCP servers it connects to
+profiles:      # which tools each client sees
+guard:         # pinning, scanning, redaction, size caps
+audit:         # the log of every call
+```
+
+Only `version`, `servers` and `profiles` are required. Every other block has defaults.
+
+### listen
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `host` | `127.0.0.1` | Address to bind. Anything but loopback requires `token`. |
+| `port` | `8420` | Port for clients, the bridge and the status page. |
+| `token` | none | When set, every request must send `Authorization: Bearer <token>`. Also turns on management from the status page. |
+| `tls` | none | `{ cert, key }` PEM paths. Serves HTTPS, for use beyond this machine. |
+| `page_size` | none | Paginate tool, prompt and resource listings. Absent means one page. |
+| `oauth_callback_port` | `8419` | Where `mcpgw auth` catches an OAuth redirect. |
+
+### defaults
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `call_timeout_ms` | `30000` | How long a call may go without progress from the backend. |
+| `connect_timeout_ms` | `10000` | How long a backend may take to start and answer. |
+| `max_call_ms` | `600000` | The ceiling for a call that keeps reporting progress. Must be at least `call_timeout_ms`. |
+
+### servers
+
+One entry per MCP server, keyed by a short name (letters, digits and dashes; no `__`). Covered in full in [Adding servers](/docs/servers).
+
+### profiles
+
+Named views onto the servers, each served at `/mcp/<name>`. Covered in [Profiles and tools](/docs/profiles) and [Keeping context small](/docs/context).
+
+### guard
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `pin_tools` | `true` | Pin each tool's description and schema on first sight. |
+| `on_drift` | `block` | `block` hides a tool that changed until you accept it; `warn` lists it flagged. |
+| `on_suspicious` | `warn` | For descriptions that read like injected instructions: `off`, `warn` or `block`. |
+| `scan_patterns` | `[]` | Your own regexes, added to the built-in scan. |
+| `max_result_bytes` | `262144` | Results larger than this are cut, with a marker saying so. |
+| `redact` | `[]` | Regexes replaced in results, logs and approval prompts. Start one with `(?i)` for case-insensitive. |
+| `approval_timeout_ms` | `120000` | How long an approval waits for your answer before refusing. |
+
+See [Guarding your tools](/docs/security).
+
+### audit
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `dir` | `./audit` | Folder for the daily `YYYY-MM-DD.jsonl` files. |
+| `log_args` | `hashed` | `full`, `hashed` or `none`. Redaction applies either way. |
+| `log_results` | `none` | `full`, `truncated` or `none`. |
+| `durable` | `false` | `true` fsyncs every line: survives a crash, costs a write per request. |
+
+See [The audit log](/docs/audit).
+
+## Checking and applying changes
+
+Validate any edit before it reaches a running gateway:
+
+```bash
+mcpgw validate
+```
+
+Then apply it without dropping connected clients:
+
+```bash
+mcpgw reload
+```
+
+A reload restarts only the servers whose definitions changed, and a new allow list applies to live sessions at once. A bad edit is rejected and the previous config keeps serving. On macOS and Linux, `SIGHUP` does the same. A change to `listen` needs a full restart.

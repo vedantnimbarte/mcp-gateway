@@ -1,0 +1,155 @@
+export const metadata = { title: "Adding servers" }
+
+# Adding servers
+
+A backend is any MCP server: one the gateway starts as a local process, or a remote one it reaches over HTTP. Add it once under `servers`, and every profile that includes it can use its tools.
+
+## A local server (stdio)
+
+Most MCP servers are commands you run. The gateway starts each one once and talks to it over stdin and stdout.
+
+```yaml title="config.yaml"
+servers:
+  github:
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN}
+    cwd: ~/
+```
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `command` | required | The program to run. |
+| `args` | `[]` | Its arguments. |
+| `env` | `{}` | Extra environment variables. Use `${NAME}` for secrets. |
+| `cwd` | the gateway's | Working folder. A leading `~` is your home folder. |
+| `restart` | `{ max_retries: 5, backoff_ms: 1000 }` | Restarts after a crash. The wait doubles each attempt, up to 30 seconds. |
+
+## A remote server (HTTP)
+
+For a server that is already running somewhere, use Streamable HTTP and pass any static headers it needs:
+
+```yaml title="config.yaml"
+servers:
+  linear:
+    transport: http
+    url: https://mcp.linear.app/mcp
+    headers:
+      Authorization: Bearer ${LINEAR_KEY}
+```
+
+`transport: sse` connects to servers that still use the older SSE transport.
+
+## A remote server that signs in with OAuth
+
+A server that answers `401` with a `WWW-Authenticate` header wants an OAuth token, not a static header. Mark it and authorize it once:
+
+```yaml title="config.yaml"
+servers:
+  figma:
+    transport: http
+    url: https://mcp.figma.com/mcp
+    auth: oauth
+    scope: "mcp:connect"
+```
+
+```bash
+mcpgw auth figma
+```
+
+That opens a browser, completes the sign-in with PKCE, and stores the tokens in `tokens.json` beside your config. Then bring the backend up in the running gateway:
+
+```bash
+mcpgw restart figma
+```
+
+From then on the gateway refreshes the token on its own. You only run `mcpgw auth` again if the refresh token is revoked. The daemon never opens a browser by itself: a backend that needs signing in stays down with `needs authorization: run mcpgw auth figma`.
+
+### Servers that refuse automatic registration
+
+Many commercial servers expect an OAuth app you create by hand. Create one with the redirect URI `http://127.0.0.1:8419/callback` (or your `listen.oauth_callback_port`), then give the gateway its credentials:
+
+```yaml
+servers:
+  figma:
+    transport: http
+    url: https://mcp.figma.com/mcp
+    auth: oauth
+    scope: "mcp:connect"
+    client_id: ${FIGMA_CLIENT_ID}
+    client_secret: ${FIGMA_CLIENT_SECRET}
+```
+
+### Machine-to-machine servers
+
+A server that issues tokens to a client ID and secret, with no person signing in, needs no browser at all:
+
+```yaml
+servers:
+  internal:
+    transport: http
+    url: https://mcp.internal.example/mcp
+    auth: oauth
+    oauth_grant: client_credentials
+    client_id: ${INTERNAL_CLIENT_ID}
+    client_secret: ${INTERNAL_CLIENT_SECRET}
+```
+
+## Limits per server
+
+Give a busy server its own limits, so it cannot starve the others. They apply on top of each profile's own:
+
+```yaml
+servers:
+  fs:
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/Users/you/code"]
+    limits: { rpm: 300, concurrent: 2 }
+```
+
+## Caching repeatable tools
+
+The gateway cannot know which tools are safe to repeat, so caching is opt-in. Name them with globs on the server's own tool names:
+
+```yaml
+servers:
+  fs:
+    cache:
+      tools: ["read_*", "list_*"]
+      ttl_ms: 30000
+      max_entries: 500
+```
+
+A cached answer still passes policy and argument checks, and is logged with `cached: true`. A tool whose description changes is never answered from its old self.
+
+## Switching a server off
+
+`disabled: true` keeps a server in the file but never starts it; its tools disappear from every profile. The status page's Disable button writes exactly this.
+
+```yaml
+servers:
+  slack:
+    disabled: true
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-slack"]
+```
+
+## Seeing what you added
+
+Once the gateway is running:
+
+```bash
+mcpgw status
+```
+
+shows each backend's state, tool count and restarts. To see which of its tools a profile exposes, and the rule behind each decision:
+
+```bash
+mcpgw list --profile default
+```
+
+Tools are named `<server>__<tool>`, so `github`'s `create_issue` becomes `github__create_issue`, and two servers can both have a `search`. Next, decide who sees what: [Profiles and tools](/docs/profiles).

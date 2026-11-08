@@ -1,0 +1,51 @@
+export const metadata = { title: "Command line" }
+
+# Command line
+
+Every command takes `--config PATH`. Without it, the gateway uses `$MCPGW_CONFIG`, then `./config.yaml`.
+
+## Commands
+
+| Command | What it does |
+|---------|--------------|
+| `mcpgw start` | Run the gateway. `--port N` overrides `listen.port`; `--verbose` (`-v`) also prints each request. |
+| `mcpgw validate` | Check the config without starting anything. Exits non-zero on any problem. |
+| `mcpgw status` | Each backend's state, tools and restarts, the gateway's uptime and sessions, and pending tool changes. `--json` for scripts. |
+| `mcpgw list` | Every tool a profile exposes, plus the rule behind each decision. `--profile P` for one profile. |
+| `mcpgw pin` | Show tool changes waiting for review. `--yes` accepts them; `--server NAME` limits it to one backend. |
+| `mcpgw auth SERVER` | Sign in to an OAuth backend in a browser, once. `--reset` forgets its stored tokens and signs in afresh; `--print-url` prints the sign-in address without opening a browser. |
+| `mcpgw reload` | Re-read the config in the running gateway, restarting only the servers that changed. |
+| `mcpgw restart SERVER` | Reconnect one backend in the running gateway. |
+| `mcpgw tail` | Print the audit log. `--follow` (`-f`) keeps going; `--denied-only` and `--profile P` filter it. |
+| `mcpgw query SQL` | SQL over the audit log, in the table `audit`. `--json` for scripts. |
+
+## reload or restart?
+
+`reload` deliberately skips any server whose definition has not changed. So when a backend has given up, because it used up its retries or is waiting for `mcpgw auth`, `reload` cannot help: use `mcpgw restart SERVER`.
+
+## Signals
+
+| Signal | Effect |
+|--------|--------|
+| `SIGHUP` | Reload the config, as `mcpgw reload` does. macOS and Linux only; on Windows use `mcpgw reload`. |
+| `SIGTERM`, `SIGINT` | Stop taking new work, give calls in flight up to 5 seconds, then shut the backends down. |
+
+## mcpgw-bridge
+
+```bash
+mcpgw-bridge --url http://127.0.0.1:8420/mcp/<profile> [--token TOKEN]
+```
+
+Passes stdin and stdout between a stdio-only client and a gateway profile. It starts no backends. If the gateway is not running, it exits at once with a readable message. See [Connecting clients](/docs/clients).
+
+## Error codes
+
+Besides the standard JSON-RPC codes, the gateway returns:
+
+| Code | Meaning |
+|------|---------|
+| `-32002` | The call timed out. |
+| `-32003` | The backend is down. |
+| `-32004` | Refused by policy, or by an approval. The error data says why. |
+| `-32005` | Over a rate limit. The error data says how long to wait. |
+| `-32006` | A backend asked the client something, and the gateway could not tell which session it belonged to. |

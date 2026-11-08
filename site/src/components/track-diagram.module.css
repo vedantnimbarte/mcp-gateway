@@ -1,0 +1,56 @@
+.frame { width: 100%; }
+.panel { display: block; width: 100%; height: auto; overflow: visible; }
+.compact { display: none; }
+@media (max-width: 760px) {
+  .wide { display: none; }
+  .compact { display: block; }
+}
+
+.name { font-family: var(--display); font-weight: 600; font-size: 21px; fill: var(--ink); }
+.compact .name { font-size: 22px; }
+.sub { font-family: var(--display); font-size: 15.5px; fill: var(--muted); }
+.compact .sub { font-size: 16px; }
+.subStop { fill: var(--stop); }
+
+.gate { fill: var(--slate); }
+.gateName { font-family: var(--display); font-weight: 600; font-size: 22px; fill: var(--on-slate); }
+.compact .gateName { font-size: 21px; }
+.gateSub { font-family: var(--display); font-size: 15px; fill: var(--on-slate); opacity: 0.78; }
+
+.lamp { fill: var(--faint); }
+.halo { fill: none; stroke-width: 7; opacity: 0.22; }
+.lamp.up { fill: var(--go); } .halo.up { stroke: var(--go); }
+.lamp.stop { fill: var(--stop); } .halo.stop { stroke: var(--stop); }
+
+.track { fill: none; stroke: var(--track); stroke-width: 6; stroke-linecap: round; }
+.buffer { stroke: var(--stop); stroke-width: 6; stroke-linecap: round; }
+/* One dash and a gap longer than the path, so it never wraps; the offset walks it start to end. */
+.train { fill: none; stroke: var(--go); stroke-width: 6; stroke-linecap: round; stroke-dasharray: 0.06 2; stroke-dashoffset: 0.06; opacity: 0; }
+.stopped { stroke: var(--caution); }
+
+/*
+ * The one orchestrated moment: each route sets in turn, the gate lights, then traffic runs.
+ * Trains loop; the refused one runs to the buffer stop and goes no further.
+ */
+@media (prefers-reduced-motion: no-preference) {
+  .track { stroke-dasharray: 1; stroke-dashoffset: 1; animation: set 0.55s cubic-bezier(0.3, 0.7, 0.3, 1) forwards; animation-delay: calc(var(--i) * 90ms + 150ms); }
+  .gateGroup { opacity: 0; animation: lit 0.4s ease-out 0.5s forwards; }
+  .lamp { opacity: 0; animation: lamp 0.3s ease-out 1.1s forwards; }
+  .halo { opacity: 0; animation: halo 0.3s ease-out 1.1s forwards; }
+  .train { animation: run var(--dur) linear 1.4s infinite; }
+  .stopped { animation-name: refuse; }
+}
+
+@keyframes set { to { stroke-dashoffset: 0; } }
+@keyframes lit { to { opacity: 1; } }
+@keyframes lamp { to { opacity: 1; } }
+@keyframes halo { to { opacity: 0.22; } }
+@keyframes run {
+  0% { stroke-dashoffset: 0.06; opacity: 1; }
+  100% { stroke-dashoffset: -1; opacity: 1; }
+}
+@keyframes refuse {
+  0% { stroke-dashoffset: 0.06; opacity: 1; }
+  70% { stroke-dashoffset: -0.94; opacity: 1; }
+  100% { stroke-dashoffset: -0.94; opacity: 0; }
+}

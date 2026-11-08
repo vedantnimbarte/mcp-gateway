@@ -1,0 +1,110 @@
+/*
+ * mcp-gateway, the public site. The same signal-box identity as the gateway's status page: the
+ * green-grey of a mimic panel for the ground, paper for reading, slate from the logo, and signal
+ * colours that only ever mean a state. Barlow (DIN-like signage) for everything but code.
+ */
+:root {
+  color-scheme: light dark;
+  --ground: #dce3de;
+  --sheet: #f5f7f5;
+  --ink: #22343a;
+  --muted: #566a6e;
+  --faint: #8a9b9c;
+  --rule: #c3cdc8;
+  --rule-soft: #e2e8e4;
+  --slate: #34494d;
+  --on-slate: #eef3f1;
+  --track: #8fa29f;
+  --go: #1f8a4c;
+  --caution: #c98200;
+  --stop: #c23b22;
+  --code-bg: #e9eeeb;
+
+  --gutter: clamp(18px, 5vw, 56px);
+  --max: 1200px;
+  --font: var(--font-barlow), "Segoe UI", system-ui, sans-serif;
+  --display: var(--font-barlow-semi), var(--font-barlow), "Segoe UI", system-ui, sans-serif;
+  --mono: var(--font-plex-mono), ui-monospace, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground: #142125;
+    --sheet: #1b2a2f;
+    --ink: #e1eae7;
+    --muted: #97aaac;
+    --faint: #6c8084;
+    --rule: #32464b;
+    --rule-soft: #24363b;
+    --slate: #b4cacc;
+    --on-slate: #142125;
+    --track: #4d676c;
+    --go: #43c07c;
+    --caution: #e6a72b;
+    --stop: #f06b52;
+    --code-bg: #15232a;
+  }
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-padding-top: 88px; }
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font: 17px/1.6 var(--font);
+  font-feature-settings: "tnum" 0;
+  text-rendering: optimizeLegibility;
+}
+a { color: inherit; }
+img { max-width: 100%; height: auto; display: block; }
+:focus-visible { outline: 2px solid var(--slate); outline-offset: 3px; border-radius: 2px; }
+.wrap { width: 100%; max-width: var(--max); margin: 0 auto; padding-left: var(--gutter); padding-right: var(--gutter); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* Header: the panel's top rail. */
+.site-header { position: sticky; top: 0; z-index: 20; background: color-mix(in srgb, var(--ground) 92%, transparent);
+  backdrop-filter: blur(8px); border-bottom: 1px solid var(--rule); }
+.site-header .wrap { display: flex; align-items: center; gap: 28px; height: 64px; }
+.brand { display: inline-flex; align-items: center; gap: 10px; text-decoration: none; font-family: var(--display);
+  font-weight: 600; font-size: 20px; letter-spacing: 0.005em; }
+.brand svg { width: 32px; height: 24px; color: var(--slate); }
+.site-nav { display: flex; gap: 24px; margin-left: auto; font-family: var(--display); font-size: 16.5px; font-weight: 500; }
+.site-nav a { text-decoration: none; color: var(--muted); padding: 6px 0; }
+.site-nav a:hover, .site-nav a[aria-current="page"] { color: var(--ink); }
+
+/* Buttons: slate is the one filled action per screen. */
+.button { display: inline-flex; align-items: center; gap: 8px; padding: 11px 20px; border-radius: 8px; font-family: var(--display);
+  font-weight: 600; font-size: 17px; text-decoration: none; border: 1px solid var(--rule); background: var(--sheet); color: var(--ink); }
+.button:hover { border-color: var(--slate); }
+.button.primary { background: var(--slate); color: var(--on-slate); border-color: var(--slate); }
+.button.primary:hover { background: color-mix(in srgb, var(--slate) 88%, var(--ink)); }
+
+/* Code. */
+code, pre, kbd { font-family: var(--mono); }
+:not(pre) > code { font-size: 0.86em; background: var(--code-bg); padding: 0.12em 0.38em; border-radius: 4px; overflow-wrap: anywhere; }
+.code { position: relative; margin: 20px 0 26px; border-radius: 10px; background: var(--code-bg); border: 1px solid var(--rule-soft); }
+.code pre { margin: 0; padding: 16px 18px; overflow-x: auto; font-size: 14px; line-height: 1.6; }
+.code pre code { background: none; padding: 0; display: grid; }
+.code[data-title] { padding-top: 0; }
+.code-title { font-family: var(--display); font-size: 14px; color: var(--muted); padding: 8px 18px; border-bottom: 1px solid var(--rule-soft); }
+.copy { position: absolute; top: 8px; right: 8px; font: 500 13px var(--display); color: var(--muted); background: var(--sheet);
+  border: 1px solid var(--rule); border-radius: 6px; padding: 3px 10px; cursor: pointer; opacity: 0; transition: opacity 0.12s; }
+.code:hover .copy, .copy:focus-visible, .copy[data-copied] { opacity: 1; }
+@media (hover: none) { .copy { opacity: 1; } }
+[data-rehype-pretty-code-figure] { margin: 0; }
+code[data-theme*=" "] span { color: var(--shiki-light); }
+@media (prefers-color-scheme: dark) { code[data-theme*=" "] span { color: var(--shiki-dark); } }
+
+/* Footer. */
+.site-footer { border-top: 1px solid var(--rule); padding: 32px 0 44px; color: var(--muted); font-size: 15px; }
+.site-footer .wrap { display: flex; flex-wrap: wrap; gap: 10px 28px; align-items: baseline; }
+.site-footer a { color: var(--muted); }
+.site-footer a:hover { color: var(--ink); }
+.site-footer .spacer { margin-left: auto; }
+
+@media (max-width: 640px) {
+  .site-header .wrap { gap: 16px; }
+  .site-nav { gap: 16px; font-size: 15.5px; }
+  .brand span { display: none; }
+}

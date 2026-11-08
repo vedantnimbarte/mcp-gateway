@@ -1,0 +1,98 @@
+export const metadata = { title: "Connecting clients" }
+
+# Connecting clients
+
+Each client points at one profile. Every entry below replaces that client's own server entries: once a client uses the gateway, only the gateway should be starting backends.
+
+## Clients that speak HTTP
+
+Point them straight at the profile's address.
+
+### Claude Code
+
+In `~/.claude.json`:
+
+```json title="~/.claude.json"
+{ "mcpServers": { "gateway": { "type": "http", "url": "http://127.0.0.1:8420/mcp/coding" } } }
+```
+
+With `listen.token` set, add the header:
+
+```json
+{
+  "mcpServers": {
+    "gateway": {
+      "type": "http",
+      "url": "http://127.0.0.1:8420/mcp/coding",
+      "headers": { "Authorization": "Bearer YOUR_TOKEN" }
+    }
+  }
+}
+```
+
+### Your own agent
+
+Any MCP client library that speaks Streamable HTTP works the same way: connect to `http://127.0.0.1:8420/mcp/<profile>`, and send `Authorization: Bearer <token>` if one is set.
+
+## Clients that only speak stdio
+
+Claude Desktop, Cursor and others launch servers as processes. Give them the bridge: a small shim that passes stdin and stdout to the gateway and starts no backends of its own.
+
+### Claude Desktop
+
+In `%APPDATA%\Claude\claude_desktop_config.json` on Windows, or `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS:
+
+```json title="claude_desktop_config.json"
+{
+  "mcpServers": {
+    "gateway": {
+      "command": "node",
+      "args": ["/abs/path/to/mcp-gateway/dist/src/bridge.js",
+               "--url", "http://127.0.0.1:8420/mcp/readonly"]
+    }
+  }
+}
+```
+
+### Cursor
+
+In `~/.cursor/mcp.json`, usually on a different profile:
+
+```json title="~/.cursor/mcp.json"
+{
+  "mcpServers": {
+    "gateway": {
+      "command": "node",
+      "args": ["/abs/path/to/mcp-gateway/dist/src/bridge.js",
+               "--url", "http://127.0.0.1:8420/mcp/coding"]
+    }
+  }
+}
+```
+
+For a global install, the bridge's path is `$(npm root -g)/mcp-gateway/dist/src/bridge.js`. With `listen.token` set, add `"--token", "YOUR_TOKEN"` to the arguments.
+
+If the gateway is not running, the bridge exits at once with a readable message instead of hanging on the first call.
+
+## Which profile for which client
+
+Give each client the narrowest profile that does its job:
+
+| Client | A sensible profile |
+|--------|--------------------|
+| Your editor or coding agent | `coding`: the repositories and files it works on, destructive tools denied, writes approved |
+| A chat app | `readonly`: lookups and searches only |
+| An agent working across many servers | a `lean` profile with [lazy tools and handles](/docs/context) |
+
+## Reaching the gateway from another machine
+
+By default the gateway only listens on loopback. To serve other machines, set a token, a non-loopback host and TLS:
+
+```yaml
+listen:
+  host: 0.0.0.0
+  token: ${MCPGW_TOKEN}
+  tls: { cert: ~/certs/gateway.pem, key: ~/certs/gateway-key.pem }
+```
+
+The gateway refuses to bind anything but loopback without a token. Reaching the port means using every credential the gateway holds, so this is enforced at startup. Without `tls` it still starts, and logs `insecure_lan`. A client that must trust a self-signed certificate, such as the bridge, can be pointed at it with `NODE_EXTRA_CA_CERTS`.

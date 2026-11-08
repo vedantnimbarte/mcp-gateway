@@ -1,0 +1,45 @@
+export const metadata = { title: "Introduction" }
+
+# Introduction
+
+mcp-gateway is a local daemon that sits between your MCP clients and your MCP servers. It connects to each server once, and gives every client the tools you chose for it.
+
+## The problem it solves
+
+Every MCP client keeps its own list of servers, its own copy of your credentials, and its own subprocesses. Open Claude Code, Claude Desktop and Cursor with the same four servers and you are running twelve server processes, keeping three configs in step, and putting every tool from every server into the model's context, with no record of which one ran or with what arguments.
+
+## How it works
+
+```
+  github ──┐
+  linear ──┼──► mcp-gateway ──► Claude Code · Claude Desktop · Cursor
+  fs ──────┤     127.0.0.1:8420
+  slack ───┘     policy · limits · audit
+```
+
+1. You declare your MCP servers once, in `config.yaml`. These are the **backends**.
+2. You group their tools into **profiles**: which servers a client can reach, which tools are allowed or denied, and what they are called.
+3. The gateway runs as one process on your machine. It starts each backend once and serves every profile at its own address, `http://127.0.0.1:8420/mcp/<profile>`.
+4. Each client points at a profile instead of spawning servers itself. Clients that only speak stdio use a small bridge.
+
+Every call passes the same checks, in order: the policy for that profile, the rate limits, the arguments against the tool's own schema, an approval if the tool needs one, then the backend. The result is redacted and size-capped on the way back, and one line goes to the audit log, whatever happened.
+
+## What you get
+
+- **One config, not one per client.** Add a server once and every client sees it.
+- **One process per backend.** Three connected clients still means one GitHub server.
+- **Fewer, better tools.** A profile exposes the dozen tools a client needs, renamed if you like.
+- **Rules that hold.** A denied tool is hidden and refused, even when a model guesses its name. Risky tools can wait for your approval.
+- **A small context.** Profiles can load tool schemas on demand, keep large results out of the context, and let a script chain calls in a sandbox. See [Keeping context small](/docs/context).
+- **Tools that can't change under you.** Tool descriptions are pinned; a server that rewrites one is blocked until you review the diff.
+- **Everything on record.** One line of JSON per call, queryable with `jq` or SQL, and a live [status page](/docs/dashboard).
+
+## What it is not
+
+- **Not a hosted service.** It runs on your machine, binds to loopback by default, and needs no database or external service. Its only runtime dependencies are the MCP SDK, `yaml` and `zod`.
+- **Not an MCP server you write tools in.** It proxies the tools of servers you already use. To add a tool, add the server that provides it; see [Adding servers](/docs/servers).
+
+## Where to go next
+
+- [Install it](/docs/installation), then follow the [quick start](/docs/quick-start) to have a client using the gateway in about five minutes.
+- Read [The config file](/docs/configuration) for every option, with its default.

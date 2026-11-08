@@ -1,0 +1,92 @@
+export const metadata = { title: "Keeping context small" }
+
+# Keeping context small
+
+Every tool schema a client lists, and every result a tool returns, lands in the model's context. With many servers that adds up fast. A profile's `context` block has three switches that keep most of it out.
+
+```yaml title="config.yaml"
+profiles:
+  lean:
+    servers: ["*"]
+    context:
+      tools: lazy          # full (default) or lazy
+      handle_bytes: 8192   # absent: results come back whole
+      code: true           # adds run_code
+      code_timeout_ms: 30000
+```
+
+Each switch works on its own. None of them goes around the gateway: every backend call they make passes the same policy, approvals, limits, redaction and audit as a direct call.
+
+## Load tools on demand
+
+With `tools: lazy`, the profile lists three small tools instead of every schema:
+
+| Tool | Arguments | Returns |
+|------|-----------|---------|
+| `search_tools` | `query`, `limit` | One line per matching tool: its name and the first sentence of its description. An empty query lists every tool. |
+| `describe_tool` | `names` | The full description and input schema of each named tool. |
+| `call_tool` | `name`, `arguments` | The tool's result, as if it had been called directly. |
+
+The model searches, loads the schemas it actually needs, then calls. Search and describe only ever show tools the profile allows. A tool can still be called by its own name in a lazy profile.
+
+## Keep large results out of the context
+
+With `handle_bytes` set, a result bigger than that stays in the gateway. The model gets a short summary instead:
+
+```
+Result too large to return whole (173,486 bytes, ~43,372 tokens), kept as handle "r1".
+Shape: array[2000] of {id: number, name: string, status: string, owner: {login: string}}
+Preview:
+{"id":0,"name":"item 0","status":"open","owner":{"login":"ana"}}
+...
+Read what you need with query_result({"handle": "r1", ...}) — path, where, contains, fields, offset, limit.
+```
+
+Then it reads just the part it needs with `query_result`:
+
+| Argument | What it does |
+|----------|--------------|
+| `handle` | Which kept result, such as `r1`. |
+| `path` | Walks into the value: `data.items`, `items.0.owner`. |
+| `where` | Keeps list items whose fields equal the given values: `{"status": "open", "owner.login": "ana"}`. |
+| `contains` | Keeps items that mention a string, ignoring case. |
+| `fields` | Keeps only these fields of each item. |
+| `offset`, `limit` | Pages through what is left. `limit` defaults to 20, at most 200. |
+
+A JSON result is queried as JSON, and any other text as a list of lines. A reply from `query_result` is never larger than `handle_bytes`; it returns fewer items and a `next_offset` instead. Handles belong to the session that made them, are kept in memory (up to 64 per session), and go when the session ends.
+
+A tool with an output schema called by its own name is left alone, because its client expects the structured result. Through `call_tool` it gets a handle like any other.
+
+## Chain calls in a sandbox
+
+With `code: true`, the profile gains `run_code`. The model sends the body of an async function:
+
+```js
+const issues = await tools.call("github__list_issues", { repo: "acme/api" });
+const stale = issues.filter((i) => i.state === "open" && i.comments === 0);
+console.log(stale.length, "open issues with no comments");
+return stale.slice(0, 5).map((i) => i.title);
+```
+
+| In the script | What it does |
+|---------------|--------------|
+| `await tools.call(name, args)` | Calls a tool under the same rules as `call_tool`. Returns the parsed result: JSON when the result is JSON, otherwise its text. A tool error throws. |
+| `await tools.search(query)` | Returns matching tools as `[{ name, description }]`. |
+| `console.log(...)` | Output that comes back to the model. |
+| `return value` | Also comes back, after the output. |
+
+Everything in between stays in the sandbox, so a script can read a large result, filter it and hand back one number.
+
+The sandbox is a separate Node process started with `--permission` and no permissions granted: no file system, no child processes, no workers, no native add-ons, and an empty environment, so none of the credentials the gateway holds. It is killed at `code_timeout_ms` or when the client cancels. Each script gets its own audit line, and each tool it calls gets one too.
+
+> On the Node versions mcp-gateway supports, the permission model does not restrict the network, so a script can still reach the internet, as the client that sent it could.
+
+## Which to turn on
+
+| If | Turn on |
+|----|---------|
+| A profile spans many servers and the tool list itself is large | `tools: lazy` |
+| Tools return big lists, logs or documents | `handle_bytes` |
+| The model chains several calls or filters results | `code: true` |
+
+The status page shows how much stayed out of context in each window, under Traffic.
