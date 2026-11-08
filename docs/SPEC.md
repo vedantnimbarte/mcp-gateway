@@ -163,6 +163,13 @@ const Profile = z.object({
   deny:    z.array(z.string()).default([]),
   rename:  z.record(z.string()).default({}), // canonical -> alias
   approve: z.array(z.string()).default([]),  // globs on the canonical name (§5 step 4¼)
+  arguments: z.array(z.object({              // §5 step 4⅛
+    tools: z.array(z.string()).min(1),       // globs on the canonical name
+    name:  z.string(),                       // dot path into the arguments
+    allow: z.array(z.string()).optional(),
+    deny:  z.array(z.string()).default([]),
+    as:    z.enum(["text", "path"]).default("text"),
+  })).default([]),
   limits:  z.object({
     rpm:        z.number().int().positive().default(120),
     concurrent: z.number().int().positive().default(8),
@@ -184,6 +191,11 @@ const Config = z.object({
     tls:   z.object({ cert: z.string(), key: z.string() }).optional(),
     page_size: z.number().int().positive().optional(),
     oauth_callback_port: z.number().int().min(1).max(65535).default(8419),
+    clients: z.array(z.object({              // §10.1: a token per client
+      name:     z.string(),                  // ^[a-zA-Z0-9_-]{1,64}$, unique
+      token:    z.string().min(16),          // unique, and not listen.token
+      profiles: z.array(z.string()).min(1),  // existing profiles, or "*"
+    })).default([]),
   }).default({}),
   defaults: z.object({
     call_timeout_ms:    z.number().int().positive().default(30000),
@@ -212,6 +224,8 @@ const Config = z.object({
 
 ### 1.4 Interpolation and validation rules
 
+- `.env` beside the config, when present, is read first (Node's `util.parseEnv`); a variable
+  already in the environment is never overridden by it.
 - `${VAR}` is substituted from `process.env` in **string values only**, before zod parsing.
   A missing variable is a **fatal** startup error naming the key — never silently empty.
 - `~` at the start of `cwd` expands to the home directory.
@@ -343,11 +357,18 @@ paths above; leaks here are how a gateway grows a memory leak and a cross-talk b
 3. limit     profile bucket + semaphore, then the server's (§8)    [reject -> -32005]
 4. guard-in  hash check (already in policy step 5) + validate args against inputSchema
                                                                    [invalid -> -32602]
-4¼. approve  if an approve glob matches the canonical name, ask the calling client with
-             `elicitation/create` (redacted arguments, ≤ 2 KB) and wait up to
-             `approval_timeout_ms`. Only `accept` with `approve: true` continues, and the
-             audit line then carries `approved: true`   [no/timeout -> -32004 approval_denied]
-                                    [client cannot elicit -> -32004 approval_unavailable]
+4⅛. args     every `arguments` rule whose tools glob matches: each value of its argument (each
+             element of an array; `as: path` first turns `\` into `/` and collapses `.`/`..`)
+             must match no deny glob and, if there is an allow list, one allow glob
+                                              [refused -> -32004 argument_denied]
+4¼. approve  if an approve glob matches the canonical name, ask a person in two places and take
+             the first answer: the calling client, with `elicitation/create`, and, when
+             `listen.token` is set, the status page (`GET /approvals`, answered by
+             `POST /approvals/<id>/approve|deny`). Redacted arguments, ≤ 2 KB. Waits up to
+             `approval_timeout_ms`. A yes continues, and the audit line carries
+             `approved: true` and `approved_via: client|status_page`
+                                    [no/timeout/cancelled -> -32004 approval_denied]
+                      [client cannot elicit, no token -> -32004 approval_unavailable]
 4½. cache    a server that caches this tool answers a repeat from its cache: audited with
              `cached: true`, then straight to step 8
 5. dispatch  backend.call(originalTool, args, timeout)             [timeout -> -32002]
@@ -515,8 +536,9 @@ append-only.
 
 | Field | Notes |
 |-------|-------|
-| `decision` | `allow` \| `denied_by_policy` \| `not_allowed` \| `server_not_in_profile` \| `unknown_profile` \| `drift_blocked` \| `suspicious_blocked` \| `approval_denied` \| `approval_unavailable` \| `server_unavailable` \| `rate_limited` \| `unroutable` |
-| `approved` | `true` when a human approved the call before it ran |
+| `decision` | `allow` \| `denied_by_policy` \| `not_allowed` \| `server_not_in_profile` \| `unknown_profile` \| `drift_blocked` \| `suspicious_blocked` \| `argument_denied` \| `approval_denied` \| `approval_unavailable` \| `server_unavailable` \| `rate_limited` \| `unroutable` |
+| `approved` | `true` when a human approved the call before it ran; `approved_via` says where: `client` or `status_page` |
+| `client_key` | The `listen.clients` key the session was opened with, if any |
 | `status` | `ok` \| `error` \| `timeout` \| `denied` |
 | `args` | Present only when `log_args: full`, post-redaction |
 | `args_hash` | Present when `log_args: hashed` — sha256 of canonical JSON |
@@ -578,6 +600,8 @@ not swallowed: original `code`/`message` land in `error.data.upstream`.
 
 | Aspect | Behaviour |
 |--------|-----------|
+| Client keys | Each `listen.clients` entry's token opens `/mcp/<profile>` for its own `profiles` only (another profile → `403`, audited as `forbidden`) and nothing else: not `/healthz` detail, the status page's data, or any management route. `listen.token` still opens every profile. With any client key configured, `/mcp/` requires a token even on loopback. A session is bound to the key that opened it; a request on it with another key is `404`. Keys are read per request, so a reload applies them |
+| Approvals | `GET /approvals` (detail) lists calls waiting for a person: `{ approvals: [{ id, profile, tool, canonical, rule, args, client, client_key, session, since, until }], can_answer }`. `POST /approvals/<id>/approve\|deny` is gated like `/stop`: it needs `listen.token` set and presented, so a model's own HTTP tool cannot approve its call. A call no longer waiting is `404`. Each answer leaves a `manage` line (`approve_call`, `deny_call`) |
 | Path | `POST`/`GET`/`DELETE` `/mcp/<profile>`. Unknown profile → `404`. `POST /reload` re-reads the config; `POST /restart/<server>` reconnects one backend. `POST /stop` answers `202` and then drains and exits like `SIGTERM`; it needs `listen.token` to be set (else `403`) as well as the token itself. So do `POST /servers/<name>/disable|enable` (sets `disabled: true|false`) and `POST /profiles/<p>/tools/<server>__<tool>/disable|enable` (adds or removes that exact entry in the profile's `deny`). Those two write `config.yaml` and reload: the edit is spliced into the text so comments and layout survive, re-parsed and checked to mean exactly the intended change, validated like a load, and written via a temp file and rename with the previous file kept as `config.yaml.bak`. Invalid result → `400` with `problems`; a layout the splice cannot change safely → `409`; either way the file is untouched. Config changes and reloads run one at a time. The raw editor is `GET /config` (`{ path, text, hash }`, the file as written), `POST /config/validate` with `{ text }` (`200 { status: valid, restart_needed }` or `400 { problems }`) and `PUT /config` with `{ text, base_hash }`: the text is validated like a load and written the same way, and a `base_hash` that no longer matches the file on disk is `409` so a change made elsewhere is never overwritten. These three answer only requests whose socket address is loopback, on top of the token (else `403`), since writing `command:` runs a program as the daemon's user. A save answers `{ hash, restart_needed }`; `restart_needed` means the `listen` block changed, which is saved but applies only when the daemon is started again. `GET /profiles/<p>/tools` returns each tool's decision, rule and `toggle` (`disable`, `enable` or `null`); it is detail like `/healthz`, so it needs the token only when one is set. `GET /audit/recent?n=&denied=1` returns the newest audit lines (token-gated, `n` ≤ 1000, tail of the newest file only) |
 | Status page | `GET /` and `/dashboard.js`: static, no data, no token needed. Six views, each at its own fragment (`#/overview`, `#/traffic`, `#/backends`, `#/tools`, `#/activity`, `#/config`), each fetching only what it shows, `Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'`. `GET /dashboard` answers `308` to `/`. The page fetches `/healthz`, `/audit/stats` and `/audit/recent` with a token the viewer types in, kept in `sessionStorage`. `GET /audit/stats?window=1h\|24h\|7d` (token-gated, default `24h`, anything else `400`) counts the JSONL log over the window: `totals` (calls, ok, refused, errors, timeouts, cached, approved, bytes, sessions, run_code, handles, kept_bytes), `latency` p50/p95/p99 of successful calls, a `series` of 12, 24 or 28 buckets, the top `tools`, every `servers` and `profiles` row (calls, errors, refused, p95, bytes), `clients`, refusal `reasons`, and `live` calls per server in the last minute. It reads at most the newest 32 MB of log (`partial: true` when it stopped there), and the answer is reused for 4 s. The authorized `/healthz` also reports `version`, `node`, `pid`, `memory_mb`, `listen`, each backend's `transport`, and `profile_detail` (servers, visible tools, sessions, and `context` when set). When the authorized `/healthz` reports `manage: true` (a token is set), it offers reload, per-backend restart, disable and enable, per-profile tool toggles, stop, and — when `/healthz` also reports `editor: true` (the request came from this machine) — the YAML editor, calling the routes above |
 | TLS | With `listen.tls: { cert, key }` (PEM paths, `~` expanded) the listener is HTTPS. Binding beyond loopback without it logs `insecure_lan` at startup — allowed, since the token is required, but the token then crosses the network in the clear |
@@ -616,7 +640,33 @@ mcpgw list      [--profile P]           # effective exposed tools after policy
 mcpgw reload                            # re-read the config in the running daemon
 mcpgw restart   SERVER                  # reconnect one backend in the running daemon
 mcpgw auth      SERVER [--reset] [--print-url]
+mcpgw init      [--profile P] [--clients] [--yes]   # import client configs; dry run without --yes
+mcpgw service   install|uninstall|status [--name N] [--dry-run]
 ```
+
+`mcpgw start --log FILE` appends its output to a file, for a service with no terminal.
+
+`mcpgw init` reads the user-wide `mcpServers` of Claude Desktop, Cursor, Claude Code
+(`~/.claude.json`) and Windsurf. Each entry with a `command` becomes a `stdio` server, and each
+with a `url` (or `serverUrl`) becomes `http`, or `sse` when its `type` says so. Entries that are
+disabled, have neither, or already point at this gateway are skipped. The same server (same
+command and args, or URL) found twice is imported once, under the first client's name made safe
+(`My Files` → `my-files`), suffixed `-2` on a clash. Every `env` and header value that is not
+already a `${VAR}` moves into `.env` beside the config, named after its own key (a header is
+prefixed with its server); a clash with a different value takes the server's name in front. An
+existing config is merged with the YAML document API, so comments survive, and only gains servers
+and a missing profile. The merged config is validated before anything is written; writes go
+`.env`, then `config.yaml` (previous kept as `.bak`), then with `--clients` each client file
+(previous kept as `.mcpgw-backup`), whose imported entries are replaced by one entry for the
+gateway: `{ type: "http", url }` for Claude Code, the bridge for the others. With `listen.token`
+or client keys configured, client files are left alone rather than given a token.
+
+`mcpgw service install` writes, then starts: a launchd agent (`~/Library/LaunchAgents/dev.mcpgw.<name>.plist`,
+`launchctl bootstrap gui/<uid>`) on macOS, a systemd user unit (`~/.config/systemd/user/<name>.service`,
+`enable --now`) on Linux, and on Windows a `<name>.vbs` in the user's Startup folder that runs
+`node cli.js start` hidden. Each runs `start --config <path> --log <dir>/mcpgw.log`. No step needs
+administrator rights. `uninstall` stops it (`bootout`, `disable --now`, or on Windows `POST /stop`
+then the pid `/healthz` reports) and removes the file.
 
 `mcpgw restart` is the only way back for a backend that exhausted its retries or that was DOWN
 awaiting `mcpgw auth`: `reload` deliberately skips any server whose definition has not changed,

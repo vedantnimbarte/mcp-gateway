@@ -1,16 +1,20 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
-import { createReadStream, existsSync, readdirSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { stat } from "node:fs/promises";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { applyInit, clientFiles, describePlan, planInit } from "./init.js";
+import { servicePlan } from "./service.js";
 import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { AuditLine } from "./audit.js";
-import { ConfigError, isLoopback, loadConfig, type Config } from "./config.js";
+import { ConfigError, isLoopback, loadConfig, resolveConfigPath, type Config } from "./config.js";
 import { BackendAuth, CALLBACK_PATH, redirectUri, TokenStore } from "./oauth.js";
 import { assemble, startGateway } from "./server.js";
 
@@ -31,6 +35,14 @@ Usage:
   mcpgw restart  SERVER [--config PATH]                  reconnect one backend in the running daemon
   mcpgw tail     [--config PATH] [--profile P] [--denied-only] [--follow]
   mcpgw query    SQL [--config PATH] [--json]            SQL over the audit log (table: audit)
+  mcpgw init     [--config PATH] [--profile P] [--clients] [--yes]
+                                                         import servers from Claude Desktop, Cursor,
+                                                         Claude Code and Windsurf; --clients points
+                                                         them at the gateway; nothing written without --yes
+  mcpgw service  install|uninstall|status [--config PATH] [--name N] [--dry-run]
+                                                         start the gateway at login (no admin rights)
+
+  start also takes --log FILE, to append its output to a file instead of the terminal.
 
 Signals: SIGHUP reloads the config (POSIX only; on Windows use 'mcpgw reload').
          SIGTERM/SIGINT drain in-flight calls for up to 5 s, then exit.
@@ -420,6 +432,136 @@ async function runQuery(config: Config, sql: string | undefined, asJson?: boolea
 }
 
 /** Where the running daemon listens, and the header every control route needs. */
+/** This package's own files, wherever npm put it: what client configs and services must launch. */
+const HERE = dirname(fileURLToPath(import.meta.url));
+const BRIDGE = join(HERE, "bridge.js");
+const CLI = join(HERE, "cli.js");
+
+/** `mcpgw init`: plan, print, and write only with --yes. */
+async function init(configPath: string, opts: { profile: string; clients?: boolean; yes?: boolean }): Promise<number> {
+  const plan = planInit({
+    configPath,
+    files: clientFiles(homedir(), process.platform, process.env.APPDATA),
+    profile: opts.profile,
+    rewriteClients: Boolean(opts.clients),
+    node: process.execPath,
+    bridge: BRIDGE,
+  });
+  if (!opts.yes || plan.clients.length === 0) {
+    console.log(describePlan(plan));
+    return 0;
+  }
+  try {
+    const { written, problems } = applyInit(plan);
+    for (const file of written) console.log(`wrote ${file}`);
+    for (const p of problems) console.error(`  ! ${p}`);
+    console.log(`\nNext: mcpgw validate --config "${configPath}", then mcpgw start --config "${configPath}".`);
+    if (plan.rewrite.length) console.log("Restart each client you pointed at the gateway so it picks up the change.");
+    return problems.length ? 1 : 0;
+  } catch (e) {
+    const problems = e instanceof ConfigError ? e.problems : [(e as Error).message];
+    console.error("nothing written; the merged config would not be valid:");
+    for (const p of problems) console.error(`  - ${p}`);
+    return 1;
+  }
+}
+
+/** `mcpgw service`: start this config's gateway at login, stop doing so, or say which it is. */
+async function service(
+  config: Config,
+  configPath: string,
+  action: string | undefined,
+  opts: { name?: string; dryRun?: boolean },
+): Promise<number> {
+  if (!["install", "uninstall", "status"].includes(action ?? "")) {
+    console.error("usage: mcpgw service install|uninstall|status [--config PATH] [--name N] [--dry-run]");
+    return 1;
+  }
+  const plan = servicePlan({
+    platform: process.platform,
+    home: homedir(),
+    appData: process.env.APPDATA,
+    uid: process.getuid?.(),
+    node: process.execPath,
+    cli: CLI,
+    config: configPath,
+    log: join(dirname(configPath), "mcpgw.log"),
+    name: opts.name ?? "mcp-gateway",
+  });
+  const run = (cmd: string[]) => {
+    if (opts.dryRun) {
+      console.log(`would run: ${cmd.join(" ")}`);
+      return true;
+    }
+    const r = spawnSync(cmd[0]!, cmd.slice(1), { stdio: "inherit" });
+    return r.status === 0;
+  };
+
+  if (action === "status") {
+    const installed = existsSync(plan.file);
+    const { base, headers } = daemon(config);
+    const up = await fetch(`${base}/healthz`, { headers, signal: AbortSignal.timeout(2000) }).then((r) => r.ok, () => false);
+    console.log(`${installed ? "installed" : "not installed"}  (${plan.kind}: ${plan.file})`);
+    console.log(`${up ? "running" : "not answering"}  at ${base}`);
+    console.log(`log: ${plan.log}`);
+    return installed ? 0 : 1;
+  }
+
+  if (action === "install") {
+    if (opts.dryRun) {
+      console.log(`would write ${plan.file}:\n\n${plan.content}`);
+    } else {
+      mkdirSync(dirname(plan.file), { recursive: true });
+      writeFileSync(plan.file, plan.content);
+      console.log(`wrote ${plan.file}`);
+    }
+    const ok = plan.install.every(run);
+    if (!opts.dryRun) {
+      console.log(ok ? `installed: starts at every login; running now, logging to ${plan.log}` : "written, but starting it now failed; it will start at the next login");
+      console.log("Secrets come from the environment it starts with, which is not your shell's: keep them in .env beside the config.");
+    }
+    return ok ? 0 : 1;
+  }
+
+  // uninstall: stop it, then remove what starts it.
+  plan.uninstall.forEach(run);
+  if (plan.kind === "startup-folder" && !opts.dryRun) await stopRunning(config);
+  if (opts.dryRun) {
+    console.log(`would delete ${plan.file}`);
+  } else if (existsSync(plan.file)) {
+    rmSync(plan.file);
+    console.log(`removed ${plan.file}; it will no longer start at login`);
+  } else {
+    console.log(`not installed (${plan.file} does not exist)`);
+  }
+  if (plan.kind === "systemd") run(["systemctl", "--user", "daemon-reload"]);
+  return 0;
+}
+
+/**
+ * Windows has no service manager to stop it: ask the gateway, which needs the token, or end its
+ * process by the pid its own health check reports.
+ */
+async function stopRunning(config: Config): Promise<void> {
+  const { base, headers } = daemon(config);
+  const stopped = await fetch(`${base}/stop`, { method: "POST", headers, signal: AbortSignal.timeout(3000) }).then(
+    (r) => r.status === 202,
+    () => false,
+  );
+  if (stopped) return console.log("stopped the running gateway");
+  const health = (await fetch(`${base}/healthz`, { headers, signal: AbortSignal.timeout(2000) })
+    .then((r) => r.json())
+    .catch(() => undefined)) as { pid?: number } | undefined;
+  if (health?.pid) {
+    try {
+      process.kill(health.pid);
+      console.log(`stopped the running gateway (pid ${health.pid})`);
+    } catch {
+      console.log(`could not stop pid ${health.pid}; it stops at logout`);
+    }
+  }
+}
+
 function daemon(config: Config): { base: string; headers: Record<string, string> } {
   const { host, port, token, tls } = config.listen;
   return {
@@ -598,12 +740,17 @@ async function main(argv: string[]): Promise<number> {
       "denied-only": { type: "boolean" },
       verbose: { type: "boolean", short: "v" },
       help: { type: "boolean", short: "h" },
+      clients: { type: "boolean" },
+      "dry-run": { type: "boolean" },
+      log: { type: "string" },
+      name: { type: "string" },
     },
   });
 
   const command = positionals[0];
   const known = [
     "start", "validate", "list", "pin", "tail", "query", "status", "reload", "restart", "auth",
+    "init", "service",
   ];
 
   if (values.help || !command) {
@@ -613,6 +760,27 @@ async function main(argv: string[]): Promise<number> {
   if (!known.includes(command)) {
     console.error(`mcpgw: unknown command "${command}"\n\n${USAGE}`);
     return 1;
+  }
+
+  // `init` makes the config, so it cannot start by loading one.
+  if (command === "init") {
+    return init(resolveConfigPath(values.config), {
+      profile: values.profile ?? "default",
+      clients: values.clients,
+      yes: values.yes,
+    });
+  }
+
+  // A service starts whatever --log says; the terminal it was started from is long gone.
+  if (command === "start" && values.log) {
+    mkdirSync(dirname(values.log), { recursive: true });
+    const out = createWriteStream(values.log, { flags: "a" });
+    const write = (chunk: string | Uint8Array, ...rest: unknown[]) => {
+      const done = rest.find((r) => typeof r === "function") as (() => void) | undefined;
+      return out.write(chunk, done);
+    };
+    process.stdout.write = write as typeof process.stdout.write;
+    process.stderr.write = write as typeof process.stderr.write;
   }
 
   let config: Config;
@@ -650,6 +818,8 @@ async function main(argv: string[]): Promise<number> {
       });
     case "query":
       return runQuery(config, positionals[1], values.json);
+    case "service":
+      return service(config, path, positionals[1], { name: values.name, dryRun: values["dry-run"] });
     case "tail":
       return tail(config, {
         profile: values.profile,

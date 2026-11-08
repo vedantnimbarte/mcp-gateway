@@ -30,6 +30,14 @@ Each view has its own address, such as `/#/tools`, so a reload keeps your place.
 
 The old address, `/dashboard`, redirects to `/`.
 
+## Approving calls
+
+When a tool on a profile's `approve` list is called, the call waits, and the Overview shows it under **Waiting for your approval**: the tool, the client and profile, the rule, how long until it is refused, and its arguments with secrets redacted. **Allow** runs it; **Deny** refuses it. The Overview tab shows how many are waiting, from any view, and the page checks more often while something waits.
+
+The client that made the call is asked too, if it can ask; whichever answer comes first decides. This is how approvals work with clients that have no prompt of their own.
+
+The buttons need `listen.token`. Without it the page still lists waiting calls, but cannot answer them: otherwise any program on your machine, a model's own web-fetch tool included, could approve a call. See [Approvals](/docs/profiles#approvals).
+
 ## Managing the gateway from the page
 
 With `listen.token` set, the page asks for the token (kept for that browser tab only) and offers controls:

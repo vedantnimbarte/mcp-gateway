@@ -12,6 +12,24 @@ npm install -g github:vedantnimbarte/mcp-gateway
 
 ## 2. Write a config
 
+### Already using MCP servers in your clients?
+
+Let the gateway import them. In the folder you want the gateway's files in:
+
+```bash
+mcpgw init
+```
+
+It lists the servers it found in Claude Desktop, Cursor, Claude Code and Windsurf, and what it would write, without writing anything. When it looks right:
+
+```bash
+mcpgw init --clients --yes
+```
+
+That writes `config.yaml` with every server once, moves their secrets into `.env` beside it, and points each client at the gateway, backing up every file it changes. Skip to step 3.
+
+### Starting from scratch
+
 Make a folder for the gateway's files and create `config.yaml` in it. This one serves the official filesystem server to every client, through one profile. Replace the path with a folder you want the model to read:
 
 ```yaml title="config.yaml"
@@ -67,6 +85,16 @@ Ask the client to list a directory. Then open `http://127.0.0.1:8420/` for the s
 ```bash
 mcpgw tail --follow
 ```
+
+## 6. Start it at login
+
+So clients never find it missing:
+
+```bash
+mcpgw service install
+```
+
+No admin rights needed. See [Command line](/docs/cli#starting-at-login).
 
 ## Next steps
 

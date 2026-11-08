@@ -1,3 +1,4 @@
+import { posix } from "node:path";
 import type { BackendState } from "./backend.js";
 import type { ProfileConfig } from "./config.js";
 import { globMatch } from "./glob.js";
@@ -43,6 +44,55 @@ const deny = (reason: DenyReason, rule: string): Decision => ({ allow: false, re
  */
 export function needsApproval(profile: ProfileConfig | undefined, canonical: string): string | undefined {
   return profile?.approve.find((glob) => globMatch(glob, canonical));
+}
+
+/**
+ * A path as the backend will resolve it: separators made `/` and `.`/`..` collapsed, so a rule
+ * allowing `/code/*` cannot be walked out of with `/code/../etc/passwd`. A relative path stays
+ * relative, and so matches no absolute allow glob.
+ *
+ * ponytail: case-sensitive and blind to symlinks. A link inside an allowed folder can still point
+ * out of it; upgrade: resolve with realpath when the gateway and backend share a file system.
+ */
+export function normalizePath(value: string): string {
+  return posix.normalize(value.replace(/\\/g, "/"));
+}
+
+function argAt(args: Record<string, unknown> | undefined, path: string): unknown {
+  let here: unknown = args;
+  for (const step of path.split(".")) {
+    if (here === null || typeof here !== "object") return undefined;
+    here = (here as Record<string, unknown>)[step];
+  }
+  return here;
+}
+
+/**
+ * `profiles.*.arguments`: what a call may be given. Every rule whose `tools` match is applied, to
+ * every value of its argument (each element, for an array): a `deny` glob refuses, and an `allow`
+ * list refuses anything matching none of it. An absent argument is the backend's schema's
+ * business, already checked. Returns why the first offending value was refused.
+ */
+export function checkArguments(
+  profile: ProfileConfig | undefined,
+  canonical: string,
+  args: Record<string, unknown> | undefined,
+): string | undefined {
+  for (const rule of profile?.arguments ?? []) {
+    if (!rule.tools.some((glob) => globMatch(glob, canonical))) continue;
+    const raw = argAt(args, rule.name);
+    if (raw === undefined) continue;
+    for (const item of Array.isArray(raw) ? raw : [raw]) {
+      const text = typeof item === "string" ? item : JSON.stringify(item);
+      const value = rule.as === "path" ? normalizePath(text) : text;
+      const denied = rule.deny.find((glob) => globMatch(glob, value));
+      if (denied) return `${rule.name} ${JSON.stringify(value)} matches deny ${JSON.stringify(denied)}`;
+      if (rule.allow && !rule.allow.some((glob) => globMatch(glob, value))) {
+        return `${rule.name} ${JSON.stringify(value)} matches none of allow ${JSON.stringify(rule.allow)}`;
+      }
+    }
+  }
+  return undefined;
 }
 
 /**

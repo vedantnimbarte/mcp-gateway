@@ -68,6 +68,8 @@ A result larger than `guard.max_result_bytes` (256 KB by default) is cut, with a
 
 Before a call reaches its backend, its arguments are validated against the schema the backend published. A call that doesn't fit is refused with `-32602` and the reason, and never reaches the server.
 
+Beyond the schema, a profile can limit the values themselves: which folders a write may touch, which repositories a tool may change, which commands are never run. See [Rules on arguments](/docs/profiles#rules-on-arguments).
+
 ## Who can reach the gateway
 
 There is no client login, by design: the trust boundary is your machine. That holds only while the gateway stays local, so:
@@ -77,7 +79,7 @@ There is no client login, by design: the trust boundary is your machine. That ho
 - `/healthz` answers an unauthorized caller with bare liveness only. Backend names, process IDs and errors need the token.
 - Every refused token is written to the audit log with the address it came from.
 
-To serve other machines, set a token and TLS; see [Connecting clients](/docs/clients#reaching-the-gateway-from-another-machine).
+To serve other machines, set a token and TLS; see [Connecting clients](/docs/clients#reaching-the-gateway-from-another-machine). To give one client less than everything, give it [its own key](/docs/clients#a-token-per-client), limited to its profiles.
 
 ## Keeping credentials apart
 

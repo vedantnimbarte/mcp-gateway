@@ -18,6 +18,8 @@ tokens.json
 
 # Runtime output
 audit/
+# ...but not the website's page about it
+!site/src/app/docs/audit/
 *.log
 logs/
 mcpgw.pid

@@ -177,6 +177,17 @@ export const DASHBOARD_HTML = String.raw`<!doctype html>
   .tally li i { grid-column: 1 / -1; display: block; height: 4px; border-radius: 2px; background: var(--caution); }
   .tally.plain li i { background: var(--bar); }
 
+  /* A call held at the signal: the one thing on the page that waits on a person. */
+  .approvals { list-style: none; margin: 0 0 8px; padding: 0; }
+  .approvals li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 20px; align-items: start;
+                  padding: 14px 16px; margin-bottom: 10px; border: 1px solid var(--caution); border-left-width: 5px;
+                  border-radius: 8px; background: color-mix(in srgb, var(--caution) 7%, var(--sheet)); }
+  .approvals .what { font-family: var(--font); font-weight: 600; font-size: 15.5px; }
+  .approvals .meta { color: var(--muted); font-family: var(--data); font-size: 13px; }
+  .approvals pre { grid-column: 1 / -1; margin: 4px 0 0; padding: 8px 10px; max-height: 12em; overflow: auto;
+                   font: 12.5px/1.45 ui-monospace, Consolas, monospace; background: var(--ground); border-radius: 6px; }
+  .approvals .answer { display: flex; gap: 8px; }
+  .approvals .allow { background: var(--slate); color: var(--on-slate); border-color: var(--slate); }
   .attention { list-style: none; margin: 0 0 8px; padding: 0; }
   .attention li { display: flex; gap: 12px; align-items: baseline; padding: 9px 0; border-bottom: 1px solid var(--rule-soft); }
   .attention li .lamp { transform: translateY(-1px); }
@@ -235,7 +246,7 @@ export const DASHBOARD_HTML = String.raw`<!doctype html>
   </form>
   <div id="message" class="wrap" role="status"></div>
   <nav class="wrap nav" id="nav" aria-label="Views" hidden>
-    <a href="#/overview" data-view="overview">Overview</a>
+    <a href="#/overview" data-view="overview">Overview <span class="count warn" id="count-approvals" hidden></span></a>
     <a href="#/traffic" data-view="traffic">Traffic</a>
     <a href="#/backends" data-view="backends">Backends <span class="count" id="count-backends"></span></a>
     <a href="#/tools" data-view="tools">Tools <span class="count" id="count-tools"></span></a>
@@ -253,6 +264,11 @@ export const DASHBOARD_HTML = String.raw`<!doctype html>
   <main class="sheet"><div class="wrap">
 
     <div data-for="overview">
+      <section class="log" id="approvals-section" hidden>
+        <h2>Waiting for your approval</h2>
+        <p class="note" id="approvals-note"></p>
+        <ul class="approvals" id="approvals"></ul>
+      </section>
       <section class="log">
         <h2>Needs attention</h2>
         <ul class="attention" id="attention"></ul>
@@ -383,7 +399,7 @@ let toolShow = prefs.get("tools-show", "all");
 /** Server groups the viewer folded on the tools view; kept across refreshes. */
 const folded = new Set();
 /** The last answers, so typing in a search box re-renders without a fetch. */
-const last = { health: null, stats: null, tools: null, recent: null };
+const last = { health: null, stats: null, tools: null, recent: null, waiting: 0 };
 
 const SVGNS = "http://www.w3.org/2000/svg";
 const nf = new Intl.NumberFormat();
@@ -405,7 +421,8 @@ const REASONS = {
   denied_by_policy: "Matched a deny rule", not_allowed: "Not on the allow list",
   server_not_in_profile: "Server not in the profile", unknown_profile: "Unknown profile",
   drift_blocked: "Changed since it was pinned", suspicious_blocked: "Flagged as suspicious",
-  approval_denied: "Approval declined", approval_unavailable: "Client cannot ask for approval",
+  approval_denied: "Approval declined", approval_unavailable: "Nobody could be asked for approval",
+  argument_denied: "Refused by an argument rule",
   server_unavailable: "Backend was down", rate_limited: "Over the rate limit", unroutable: "Could not be routed",
   refused: "Unknown tool",
 };
@@ -712,6 +729,40 @@ function chart(id, s) {
   $(id).replaceChildren(svg);
 }
 
+/** Each held call, with Allow and Deny when this page may answer. */
+async function renderApprovals(h, waiting) {
+  const section = $("approvals-section");
+  if (!waiting) { section.hidden = true; return; }
+  const r = await get("/approvals").catch(() => ({ body: null }));
+  const list = (r.body && r.body.approvals) || [];
+  section.hidden = !list.length;
+  const canAnswer = Boolean(r.body && r.body.can_answer && h.manage);
+  $("approvals-note").textContent = canAnswer
+    ? "The client that made each call is asking too. Whichever answer comes first decides it."
+    : "Set listen.token to answer here. Until then, only the client that made the call can approve it.";
+  $("approvals").replaceChildren(...list.map((p) => {
+    const li = node("li");
+    const head = node("div");
+    head.append(node("div", "what", p.tool + (p.tool === p.canonical ? "" : " (" + p.canonical + ")")));
+    const left = Math.max(0, Math.round((Date.parse(p.until) - Date.now()) / 1000));
+    head.append(node("div", "meta",
+      [p.client_key || p.client || "unknown client", "profile " + p.profile, p.rule, "refused in " + left + "s if nobody answers"].join("   ")));
+    li.append(head);
+    const answer = node("div", "answer");
+    if (canAnswer) {
+      const decide = (yes) => (b) => act(b, "/approvals/" + encodeURIComponent(p.id) + "/" + (yes ? "approve" : "deny"), (res) =>
+        res.status === 200
+          ? say((yes ? "Allowed " : "Denied ") + p.tool + ".")
+          : say("Not answered: " + ((res.body && res.body.error) || res.status), true));
+      button(answer, "Allow", decide(true));
+      answer.lastChild.className = "allow";
+      button(answer, "Deny", decide(false));
+    }
+    li.append(answer, node("pre", null, p.args));
+    return li;
+  }));
+}
+
 function renderAttention(h, s, recent) {
   const items = [];
   const item = (lamp, text, link, label) => {
@@ -938,7 +989,10 @@ function renderActivity() {
     // A tool call names its tool; anything else (a refused reverse request, say) names what it was.
     const what = line.exposed_as || (line.tool ? line.server + "__" + line.tool
       : [line.server, line.rpc_method || line.method].filter(Boolean).join(" "));
-    const client = line.client && line.client.name;
+    // A named key says who; the client's own name says with what.
+    const client = line.client_key
+      ? line.client_key + (line.client ? " (" + line.client.name + ")" : "")
+      : line.client && line.client.name;
     if (query && ![what, client, line.profile].some((v) => v && String(v).toLowerCase().includes(query))) continue;
     shown++;
     const row = audit.insertRow();
@@ -953,7 +1007,11 @@ function renderActivity() {
     const outcome = refused ? (REASONS[line.decision] || line.decision || "refused")
       : failed ? (line.status === "timeout" ? "timed out" : "failed") + (line.error ? ": " + line.error.message : "")
       : line.method === "handle" ? "kept out of context as " + line.handle
-      : line.status === "ok" ? (line.cached ? "ok, from cache" : "ok") : (line.status || "");
+      : line.status === "ok"
+        ? (line.cached ? "ok, from cache"
+          : line.approved ? "ok, approved " + (line.approved_via === "status_page" ? "on this page" : "in the client")
+          : "ok")
+      : (line.status || "");
     const o = cell(row, outcome, refused ? "warn" : failed ? "bad" : "muted");
     if (failed) o.className += " wrap";
     cell(row, line.dur_ms != null ? ms(line.dur_ms) : "", "num");
@@ -1018,6 +1076,14 @@ async function refresh() {
     $("count-activity").textContent = num(s.totals.refused + s.totals.errors);
     $("count-activity").className = "count " + (s.totals.errors ? "bad" : "warn");
   }
+
+  // Calls waiting for a person: counted on every view, listed on the overview.
+  const waiting = h.pending_approvals || 0;
+  last.waiting = waiting;
+  $("count-approvals").hidden = !waiting;
+  $("count-approvals").textContent = waiting + " waiting";
+  document.title = (waiting ? "(" + waiting + ") " : "") + document.title.replace(/^\(\d+\) /, "");
+  if (v === "overview") await renderApprovals(h, waiting);
 
   if (v === "overview") {
     renderMap(h, s);
@@ -1119,6 +1185,10 @@ $("theme").addEventListener("click", (e) => {
 pressed("theme", "data-theme-choice", themeChoice);
 
 refresh().catch(() => { $("summary").textContent = "Not answering."; });
-setInterval(() => refresh().catch(() => {}), 5000);
+// Every five seconds, or every one and a half while a call waits on a person: a held call has a
+// timeout running, and the person answering should not wait on the page.
+(function tick() {
+  setTimeout(() => refresh().catch(() => {}).finally(tick), last.waiting ? 1500 : 5000);
+})();
 }
 `;

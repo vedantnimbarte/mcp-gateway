@@ -1,6 +1,7 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { parseEnv } from "node:util";
 import YAML from "yaml";
 import { z } from "zod";
 import { globMatch } from "./glob.js";
@@ -89,6 +90,22 @@ const Profile = z.object({
       concurrent: z.number().int().positive().default(8),
     })
     .default({}),
+  /**
+   * Rules on what a call may be given, not just which tools exist: each matching rule's argument
+   * must match one `allow` glob and no `deny` glob. `as: path` collapses `..` first, so a path
+   * rule cannot be walked out of.
+   */
+  arguments: z
+    .array(
+      z.object({
+        tools: z.array(z.string()).min(1), // globs on the canonical name, like deny
+        name: z.string().min(1), // the argument, as a dot path: "path", "options.repo"
+        allow: z.array(z.string()).optional(),
+        deny: z.array(z.string()).default([]),
+        as: z.enum(["text", "path"]).default("text"),
+      }),
+    )
+    .default([]),
   /** What keeps the model's context small (context.ts). Absent: tools are listed and returned whole. */
   context: z
     .object({
@@ -119,6 +136,17 @@ const ConfigSchema = z.object({
       page_size: z.number().int().positive().optional(),
       // Where `mcpgw auth` catches the OAuth redirect (see oauth.ts).
       oauth_callback_port: z.number().int().min(1).max(65535).default(8419),
+      // One token per client, each opening only its own profiles. `token` above stays the key to
+      // everything else: the status page's detail, its controls, and every profile.
+      clients: z
+        .array(
+          z.object({
+            name: z.string(),
+            token: z.string().min(16),
+            profiles: z.array(z.string()).min(1),
+          }),
+        )
+        .default([]),
     })
     .default({}),
   defaults: z
@@ -172,6 +200,7 @@ const ENV_REF = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 const SERVER_KEY = /^[a-zA-Z0-9-]{1,48}$/; // SPEC §2
 const PROFILE_KEY = /^[a-zA-Z0-9_-]{1,64}$/; // it appears in the URL path
 const ALIAS = /^[a-zA-Z0-9_-]{1,128}$/;
+const CLIENT_KEY = /^[a-zA-Z0-9_-]{1,64}$/; // it appears in the audit log and the status page
 
 /**
  * Redact patterns are authored with a leading `(?i)` in the SPEC sample; JS has no inline
@@ -245,6 +274,28 @@ function crossCheck(cfg: Config): string[] {
       problems.push(
         `servers.${key}: client_credentials needs \`auth: oauth\`, client_id and client_secret`,
       );
+    }
+  }
+
+  const keyNames = new Set<string>();
+  const keyTokens = new Set<string>(cfg.listen.token ? [cfg.listen.token] : []);
+  for (const [i, client] of cfg.listen.clients.entries()) {
+    const where = `listen.clients[${i}]`;
+    if (!CLIENT_KEY.test(client.name)) problems.push(`${where}: name must match ${CLIENT_KEY.source}`);
+    if (keyNames.has(client.name)) problems.push(`${where}: another client is already called "${client.name}"`);
+    if (keyTokens.has(client.token)) problems.push(`${where}: token is already used by listen.token or another client`);
+    keyNames.add(client.name);
+    keyTokens.add(client.token);
+    for (const p of client.profiles) {
+      if (p !== "*" && !(p in cfg.profiles)) problems.push(`${where}.profiles: unknown profile "${p}"`);
+    }
+  }
+
+  for (const [name, profile] of Object.entries(cfg.profiles)) {
+    for (const [i, rule] of profile.arguments.entries()) {
+      if (!rule.allow && rule.deny.length === 0) {
+        problems.push(`profiles.${name}.arguments[${i}]: needs an allow or a deny list, or it checks nothing`);
+      }
     }
   }
 
@@ -323,8 +374,27 @@ export function resolveConfigPath(explicit?: string): string {
   return resolve(explicit ?? process.env.MCPGW_CONFIG ?? "config.yaml");
 }
 
+/**
+ * `.env` beside the config, for secrets the config names as `${VAR}`. A variable already set in
+ * the environment wins, as with every dotenv: the file is a fallback, not an override. It is what
+ * lets the gateway run as a login service, which inherits no shell, and where `mcpgw init` puts
+ * the secrets it lifts out of client configs.
+ */
+export function loadEnvFile(configPath: string): string[] {
+  const file = join(dirname(configPath), ".env");
+  if (!existsSync(file)) return [];
+  const added: string[] = [];
+  for (const [name, value] of Object.entries(parseEnv(readFileSync(file, "utf8")))) {
+    if (process.env[name] !== undefined) continue;
+    process.env[name] = value;
+    added.push(name);
+  }
+  return added;
+}
+
 export function loadConfig(explicit?: string): { config: Config; path: string } {
   const path = resolveConfigPath(explicit);
+  loadEnvFile(path);
 
   let raw: string;
   try {

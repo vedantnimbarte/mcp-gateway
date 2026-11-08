@@ -27,7 +27,8 @@ export type AuditDecision =
   | "approval_unavailable"
   | "server_unavailable"
   | "rate_limited"
-  | "unroutable";
+  | "unroutable"
+  | "argument_denied";
 
 export interface AuditLine {
   ts: string;

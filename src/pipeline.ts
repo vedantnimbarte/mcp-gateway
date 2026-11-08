@@ -12,13 +12,14 @@ import type {
   ResourceTemplate,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
+import { Approvals } from "./approvals.js";
 import type { AuditInput, AuditLine, AuditLog } from "./audit.js";
 import type { Backend, ReverseTarget } from "./backend.js";
 import { parseUri, type CatalogEntry, type PromptEntry } from "./catalog.js";
 import type { Config } from "./config.js";
 import { ERR, gwError } from "./errors.js";
 import type { Guard, Pinned } from "./guard.js";
-import { decide, needsApproval, reaches, type Decision } from "./policy.js";
+import { checkArguments, decide, needsApproval, reaches, type Decision } from "./policy.js";
 import type { Pool } from "./pool.js";
 import { ResponseCache } from "./cache.js";
 import { limitersFor, restoreLimiters, saveLimiters, type Limiters } from "./ratelimit.js";
@@ -38,6 +39,8 @@ export interface CallContext {
   profile: string;
   session?: string;
   client?: { name: string; version: string };
+  /** The `listen.clients` key the session was opened with, when it was opened with one. */
+  clientKey?: string;
   /** The session, as something a backend can send a reverse request to. */
   caller?: ReverseTarget;
   /** Aborted when the client cancels; carried through to the backend (SPEC 4.3). */
@@ -67,6 +70,8 @@ const APPROVAL_ARGS_CHARS = 2000;
  * in a `finally` so a throwing backend cannot leak a slot.
  */
 export class Pipeline {
+  /** Calls waiting for a yes on the status page. */
+  readonly approvals = new Approvals();
   #limiters: Limiters;
   readonly #cache: ResponseCache;
   /** alias → canonical, per profile. Renames are static between reloads, so this is built once. */
@@ -213,6 +218,7 @@ export class Pipeline {
       session: ctx.session,
       profile: ctx.profile,
       client: ctx.client,
+      client_key: ctx.clientKey,
       exposed_as: exposed,
       ...this.audit.argFields(args),
     };
@@ -266,13 +272,30 @@ export class Pipeline {
         );
       }
 
+      // 4⅛. argument rules: what this profile lets the call be given. After the schema check, so
+      //     the values are the shapes the backend declared; before approval, so nobody is asked
+      //     to approve a call that would be refused anyway.
+      const offending = checkArguments(this.config.profiles[ctx.profile], canonical, args);
+      if (offending) {
+        return fail(
+          gwError(ERR.POLICY, `"${exposed}" refused: ${offending}`, {
+            reason: "argument_denied",
+            profile: ctx.profile,
+            server: entry.server,
+            tool: entry.tool,
+          }),
+          "argument_denied",
+        );
+      }
+
       // 4¼. approval: a human says yes in the calling client, or the call does not happen. Ahead
       //     of the cache, so a cached answer never stands in for a yes.
       const rule = needsApproval(this.config.profiles[ctx.profile], canonical);
       if (rule) {
-        const refusal = await this.#approve(ctx, exposed, canonical, rule, args);
-        if (refusal) return fail(refusal.error, refusal.decision);
+        const verdict = await this.#approve(ctx, exposed, canonical, rule, args);
+        if ("error" in verdict) return fail(verdict.error, verdict.decision);
         line.approved = true;
+        line.approved_via = verdict.via;
       }
 
       // 4½. cache: after policy and validation, so a hit can never bypass either. It has spent
@@ -490,7 +513,7 @@ export class Pipeline {
   }
 
   #line(ctx: CallContext, method: string): AuditInput {
-    return { method, session: ctx.session, profile: ctx.profile, client: ctx.client };
+    return { method, session: ctx.session, profile: ctx.profile, client: ctx.client, client_key: ctx.clientKey };
   }
 
   /**
@@ -578,10 +601,14 @@ export class Pipeline {
   }
 
   /**
-   * Puts the call to the human through the client that made it (`elicitation/create`). Fails
-   * closed: a client that cannot elicit, a decline, a dismissal, a timeout and a dropped
-   * connection all refuse. This is the gateway's own request to its own session, so unlike a
-   * backend's reverse request there is nothing to correlate.
+   * Puts the call to a person, in two places at once, and takes the first answer: the client that
+   * made it (`elicitation/create`), and the status page (`Approvals`), which is what makes approval
+   * work with clients that cannot elicit. Fails closed: a decline, a dismissal, a timeout, a
+   * cancelled call, and having nowhere to ask all refuse.
+   *
+   * The status page is a place to ask only when `listen.token` is set. Without it, approving would
+   * be a POST any local process could send, a model's fetch tool included, so the call would be
+   * approving itself.
    *
    * ponytail: the wait holds the call's rate-limit slots. That is the brake working, but a human
    * who walks away holds a slot for up to `approval_timeout_ms`.
@@ -592,7 +619,10 @@ export class Pipeline {
     canonical: string,
     rule: string,
     args: Record<string, unknown> | undefined,
-  ): Promise<{ error: McpError; decision: "approval_denied" | "approval_unavailable" } | undefined> {
+  ): Promise<
+    | { error: McpError; decision: "approval_denied" | "approval_unavailable" }
+    | { via: "client" | "status_page" }
+  > {
     const refuse = (decision: "approval_denied" | "approval_unavailable", why: string) => ({
       decision,
       error: gwError(ERR.POLICY, `"${exposed}" needs approval: ${why}`, {
@@ -601,35 +631,93 @@ export class Pipeline {
         tool: canonical,
       }),
     });
-    if (!ctx.canElicit || !ctx.caller) {
-      return refuse("approval_unavailable", "this client cannot be asked (no elicitation support)");
+    const askClient = Boolean(ctx.canElicit && ctx.caller);
+    const askPage = Boolean(this.config.listen.token);
+    if (!askClient && !askPage) {
+      return refuse(
+        "approval_unavailable",
+        "this client cannot be asked (no elicitation support), and the status page can approve only with listen.token set",
+      );
     }
 
     // Redacted: the prompt is shown to a person, and may be screenshotted or logged by the client.
-    const shown = JSON.stringify(this.guard.redact(args ?? {}), null, 2);
-    const message = [
-      `Allow ${exposed}${exposed === canonical ? "" : ` (${canonical})`}?`,
-      `Profile "${ctx.profile}" requires approval for it (approve: ${rule}).`,
-      "",
-      shown.length > APPROVAL_ARGS_CHARS ? `${shown.slice(0, APPROVAL_ARGS_CHARS)}\n… (truncated)` : shown,
-    ].join("\n");
+    const redacted = JSON.stringify(this.guard.redact(args ?? {}), null, 2);
+    const shown =
+      redacted.length > APPROVAL_ARGS_CHARS ? `${redacted.slice(0, APPROVAL_ARGS_CHARS)}\n… (truncated)` : redacted;
+    const timeout = this.config.guard.approval_timeout_ms;
+
+    type Answer = { yes: true; via: "client" | "status_page" } | { yes: false; why: string };
+    const answers: Promise<Answer>[] = [];
+    const ticket = askPage
+      ? this.approvals.open(
+          {
+            profile: ctx.profile,
+            tool: exposed,
+            canonical,
+            rule,
+            args: shown,
+            client: ctx.client?.name,
+            client_key: ctx.clientKey,
+            session: ctx.session,
+          },
+          timeout,
+        )
+      : undefined;
+    if (ticket) {
+      answers.push(ticket.answer.then((yes) => (yes ? { yes, via: "status_page" } : { yes, why: "declined on the status page" })));
+    }
+
+    // Stops the client's prompt once the page has answered, and the other way round.
+    const done = new AbortController();
+    if (askClient) {
+      const message = [
+        `Allow ${exposed}${exposed === canonical ? "" : ` (${canonical})`}?`,
+        `Profile "${ctx.profile}" requires approval for it (approve: ${rule}).`,
+        "",
+        shown,
+      ].join("\n");
+      const signal = ctx.signal ? AbortSignal.any([ctx.signal, done.signal]) : done.signal;
+      answers.push(
+        ctx
+          .caller!.elicitInput(
+            {
+              message,
+              requestedSchema: {
+                type: "object",
+                properties: { approve: { type: "boolean", title: "Allow this call" } },
+                required: ["approve"],
+              },
+            },
+            { timeout, signal },
+          )
+          .then(
+            (reply): Answer => {
+              const r = reply as ElicitResult;
+              if (r.action === "accept" && r.content?.approve === true) return { yes: true, via: "client" };
+              return { yes: false, why: r.action === "accept" ? "not approved" : `${r.action}ed` };
+            },
+            // A client that failed to ask has not said no: with the page also asking, keep waiting.
+            (e: Error): Promise<Answer> | Answer =>
+              ticket ? new Promise<Answer>(() => {}) : { yes: false, why: `no answer: ${e.message}` },
+          ),
+      );
+    }
+
+    let timer: NodeJS.Timeout | undefined;
+    answers.push(new Promise((resolve) => (timer = setTimeout(() => resolve({ yes: false, why: "no answer in time" }), timeout))));
+    if (ctx.signal) {
+      answers.push(
+        new Promise((resolve) => ctx.signal!.addEventListener("abort", () => resolve({ yes: false, why: "the call was cancelled" }), { once: true })),
+      );
+    }
 
     try {
-      const reply = (await ctx.caller.elicitInput(
-        {
-          message,
-          requestedSchema: {
-            type: "object",
-            properties: { approve: { type: "boolean", title: "Allow this call" } },
-            required: ["approve"],
-          },
-        },
-        { timeout: this.config.guard.approval_timeout_ms, signal: ctx.signal },
-      )) as ElicitResult;
-      if (reply.action === "accept" && reply.content?.approve === true) return undefined;
-      return refuse("approval_denied", reply.action === "accept" ? "not approved" : `${reply.action}ed`);
-    } catch (e) {
-      return refuse("approval_denied", `no answer: ${(e as Error).message}`);
+      const answer = await Promise.race(answers);
+      return answer.yes ? { via: answer.via } : refuse("approval_denied", answer.why);
+    } finally {
+      clearTimeout(timer);
+      done.abort();
+      ticket?.close();
     }
   }
 

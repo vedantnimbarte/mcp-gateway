@@ -139,6 +139,40 @@ Then start it:
 mcpgw start
 ```
 
+### Starting from the servers you already have
+
+If your clients already run MCP servers, `mcpgw init` reads Claude Desktop, Cursor, Claude Code
+and Windsurf, and merges their servers into `config.yaml`:
+
+```bash
+mcpgw init              # show what it would do; writes nothing
+mcpgw init --yes        # write config.yaml, and .env for the secrets
+mcpgw init --clients --yes   # also point each client at the gateway
+```
+
+The same server found in two clients is imported once. Every `env` and header value moves into
+`.env` beside the config, referenced as `${NAME}`, so no secret lands in `config.yaml`. With an
+existing config, new servers are merged in and your comments stay. Every file it changes is backed
+up first (`config.yaml.bak`, `<client file>.mcpgw-backup`). It will not copy a gateway token into
+client files: with `listen.token` set, add the header yourself.
+
+`.env` beside the config is read on every start, for any `${NAME}`. A variable already in the
+environment wins.
+
+### Starting at login
+
+```bash
+mcpgw service install     # start now, and at every login
+mcpgw service status
+mcpgw service uninstall
+```
+
+Per user and without admin rights: a launchd agent on macOS, a systemd user unit on Linux, and a
+hidden launcher in the Startup folder on Windows. Output goes to `mcpgw.log` beside the config. A
+login service does not see your shell's environment, so keep secrets in `.env`. Add `--dry-run`
+to see the files and commands without changing anything, and `--name` to give a second gateway its
+own service.
+
 ## Connect your clients
 
 Give each client the profile that fits it — `coding` for your editor, `readonly` for anything
@@ -198,6 +232,8 @@ hanging on the first tool call.
 | `mcpgw restart <server>` | Reconnect one backend without touching the others or the daemon |
 | `mcpgw tail --denied-only` | Stream the audit log |
 | `mcpgw query "<SQL>"` | SQL over the audit log, for what one line of `jq` cannot answer |
+| `mcpgw init` | Import servers from Claude Desktop, Cursor, Claude Code and Windsurf; `--clients` repoints them; `--yes` writes |
+| `mcpgw service install` | Start the gateway at every login; also `uninstall` and `status` |
 
 `mcpgw list` is the one to reach for when a tool isn't showing up — it prints the decision and
 the exact rule that produced it.
@@ -295,9 +331,38 @@ profiles:
     approve: ["github__create_pull_request", "fs__write_file"]
 ```
 
-The gateway asks through MCP elicitation, showing the tool and its (redacted) arguments. A
-decline, a dismissal, or no answer within `guard.approval_timeout_ms` refuses the call. So does
-a client that cannot elicit at all — an approval that cannot be asked for is never assumed.
+The gateway asks in two places at once and takes the first answer: in the client that made the
+call (MCP elicitation), and on the status page, which lists each waiting call with **Allow** and
+**Deny**. That is what makes approvals work with clients that cannot ask. Both show the tool and
+its redacted arguments. A decline, a dismissal, or no answer within `guard.approval_timeout_ms`
+refuses the call.
+
+The status page can answer only when `listen.token` is set. Without one, approving would be a
+POST any local process could send, a model's own fetch tool included, so a call could approve
+itself. With no token and a client that cannot ask, the call is refused: an approval that cannot
+be asked for is never assumed.
+
+Rules can also look at what a call is given, not just which tool it is:
+
+```yaml
+profiles:
+  coding:
+    arguments:
+      - tools: ["fs__write_file", "fs__edit_file"]
+        name: path
+        allow: ["/Users/ana/code/*"]
+        as: path              # collapse .. first, so /code/../etc cannot slip through
+      - tools: ["github__*"]
+        name: repo
+        allow: ["acme/*"]
+      - tools: ["shell__run"]
+        name: command
+        deny: ["*rm -rf*", "*curl*|*sh*"]
+```
+
+Every rule whose `tools` glob matches is applied to its argument (a dot path, like `options.repo`;
+each element, for an array): a `deny` glob refuses, and an `allow` list refuses anything matching
+none of it. Refusals are `-32004` with `reason: argument_denied`, and logged.
 
 ## Keeping the model's context small
 
@@ -550,6 +615,24 @@ listen:
 Without `tls` the daemon still starts, and logs `insecure_lan` to say so. Every refused token is
 written to the audit log with the address it came from. A client that must trust a self-signed
 certificate — the bridge, or `mcpgw status` — can be pointed at it with `NODE_EXTRA_CA_CERTS`.
+
+**A token per client.** `listen.token` opens everything. To give a client less, give it its own
+key, limited to the profiles it should use:
+
+```yaml
+listen:
+  token: ${MCPGW_TOKEN}            # you: every profile, the status page's detail and controls
+  clients:
+    - name: agent
+      token: ${MCPGW_AGENT_TOKEN}  # at least 16 characters
+      profiles: [readonly]
+```
+
+A client key opens its own profiles' `/mcp/` routes and nothing else: not other profiles (`403`),
+not the status page's detail or controls. Its calls carry `client_key` in the audit log, so you can
+see who did what, and a session it opened cannot be carried on with another key. With `clients`
+set, every MCP request needs a token, even on loopback. A reload applies changed keys without a
+restart.
 
 ## Running several daemons
 

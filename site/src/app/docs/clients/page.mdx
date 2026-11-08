@@ -4,6 +4,10 @@ export const metadata = { title: "Connecting clients" }
 
 Each client points at one profile. Every entry below replaces that client's own server entries: once a client uses the gateway, only the gateway should be starting backends.
 
+## Let init do it
+
+`mcpgw init --clients --yes` rewrites Claude Desktop, Cursor, Claude Code and Windsurf for you: the servers it imported are replaced by one entry for the gateway, each file is backed up as `<file>.mcpgw-backup` first, and anything it did not import stays. Restart each client afterwards. It points them at the `default` profile, or `--profile NAME`. With a token configured it leaves client files alone, so it never copies a token into them; add the header yourself as below.
+
 ## Clients that speak HTTP
 
 Point them straight at the profile's address.
@@ -83,6 +87,30 @@ Give each client the narrowest profile that does its job:
 | Your editor or coding agent | `coding`: the repositories and files it works on, destructive tools denied, writes approved |
 | A chat app | `readonly`: lookups and searches only |
 | An agent working across many servers | a `lean` profile with [lazy tools and handles](/docs/context) |
+
+## A token per client
+
+`listen.token` opens everything. To give a client less, give it its own key, limited to the profiles it should use:
+
+```yaml title="config.yaml"
+listen:
+  token: ${MCPGW_TOKEN}            # you: every profile, and the status page
+  clients:
+    - name: agent
+      token: ${MCPGW_AGENT_TOKEN}  # at least 16 characters
+      profiles: [readonly]
+    - name: editor
+      token: ${MCPGW_EDITOR_TOKEN}
+      profiles: [coding]
+```
+
+The client sends its key as `Authorization: Bearer <token>`, or `--token` for the bridge. A key opens its own profiles and nothing else:
+
+- Another profile is refused with `403`, and logged.
+- The status page's data and controls stay with `listen.token`.
+- A session opened with one key cannot be carried on with another.
+
+Every call is logged with the key's name as `client_key`, and the status page shows calls by key, so you can see which client did what. Once any client key exists, every MCP request needs a token, even on this machine. Change keys and run `mcpgw reload`; no restart needed.
 
 ## Reaching the gateway from another machine
 

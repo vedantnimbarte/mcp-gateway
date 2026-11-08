@@ -216,6 +216,25 @@ number. The sandbox cannot read the config, spawn processes, or see the daemon's
 **Exit:** every section fills from a demo gateway's traffic, and the page has no horizontal
 scroll at phone width.
 
+## Phase 14 — Moving over, staying up, finer rules · *done*
+
+- `mcpgw init`: imports servers from Claude Desktop, Cursor, Claude Code and Windsurf, once each,
+  into `config.yaml` (merged, comments kept) with secrets lifted into `.env`; `--clients` repoints
+  each client at the gateway; a dry run without `--yes`, backups of every file it changes
+- `.env` beside the config is read on every load; the environment wins over it
+- `listen.clients`: a named token per client, limited to its profiles, never the status page's
+  detail or controls; `client_key` on every audit line; sessions bound to their key
+- `profiles.*.arguments`: allow/deny globs on argument values, with `as: path` normalising first;
+  refusals are `argument_denied`
+- Approvals race the client's prompt against the status page's Allow and Deny; answering needs
+  `listen.token`, so a model's own fetch tool cannot approve its call
+- `mcpgw service install|uninstall|status`: launchd agent, systemd user unit, or a hidden
+  Startup-folder launcher on Windows; `start --log FILE`
+
+**Exit:** a client key is refused another profile; `/code/../etc` is refused by a `/code/*` rule;
+a client that cannot elicit gets its call approved from the status page; `init` run twice adds
+nothing the second time; the Windows launcher starts a gateway hidden, with secrets from `.env`.
+
 ---
 
 ## Sequencing notes
@@ -270,4 +289,6 @@ at the relevant code site so they surface later.
 | Result handles live in memory, per session | A handle dies with its session or a restart | Spill to disk beside the audit log |
 | `run_code` can reach the network | A script can call out like its client could | `--allow-net` on Node 25+, or a container |
 | `/audit/stats` re-reads the log, at most 32 MB | A very busy window is counted from its recent end, marked `partial` | Aggregate as lines are written |
+| Path argument rules are case-sensitive and do not resolve symlinks | A link inside an allowed folder can point out of it | `realpath` when gateway and backend share a file system |
+| `mcpgw init` reads user-wide client servers only | Per-project servers (`.mcp.json`, Claude Code `projects`) stay in their clients | Import those with a `--project` flag |
 | A cache hit is cut at `max_result_bytes` even for a handle | A cached large result is truncated before it is kept | Cache uncapped results for handle profiles |

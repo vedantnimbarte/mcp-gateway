@@ -29,6 +29,7 @@ profiles:
 | `deny` | `[]` | Tools matching any of these are hidden and refused. |
 | `rename` | `{}` | Show a tool under another name: `canonical: alias`. |
 | `approve` | `[]` | Tools that wait for a person's yes before they run. |
+| `arguments` | `[]` | Rules on what a call may be given, such as which folders a write may touch. |
 | `limits` | `{ rpm: 120, concurrent: 8 }` | Calls per minute, and calls at once, for the whole profile. |
 | `context` | off | Ways to keep the model's context small. See [Keeping context small](/docs/context). |
 
@@ -92,9 +93,42 @@ profiles:
 
 Rules always match the canonical name, so a rename can never be used to slip past a `deny`. Two renames may not produce the same name, and an alias may not shadow a tool the profile still exposes under its own name; `mcpgw validate` catches both.
 
+## Rules on arguments
+
+Allowing a tool allows every call to it. To limit what a call may be given, add rules on its arguments:
+
+```yaml title="config.yaml"
+profiles:
+  coding:
+    servers: [github, fs]
+    arguments:
+      - tools: ["fs__write_file", "fs__edit_file"]
+        name: path
+        allow: ["/Users/you/code/*"]
+        as: path
+      - tools: ["github__*"]
+        name: repo
+        allow: ["acme/*"]
+      - tools: ["shell__run"]
+        name: command
+        deny: ["*rm -rf*"]
+```
+
+| Key | Meaning |
+|-----|---------|
+| `tools` | Globs on the canonical tool name, like `deny`. |
+| `name` | The argument to check. A dot path reaches into objects: `options.repo`. |
+| `allow` | The value must match one of these globs. |
+| `deny` | The value must match none of these. |
+| `as` | `path` turns `\` into `/` and collapses `.` and `..` before matching, so `/code/../etc/passwd` is checked as `/etc/passwd`. Default `text`. |
+
+Every matching rule applies. For an array argument, every element is checked. An argument the call leaves out is not checked here; the tool's own schema decides whether it is required. A refused call returns `-32004` with `reason: argument_denied` and the value that broke the rule, and is logged.
+
+Matching is case-sensitive, and `as: path` does not follow symlinks: a link inside an allowed folder can still point outside it.
+
 ## Approvals
 
-Some tools you want reachable, but not unattended. List them under `approve` and each call waits for a yes in the client that made it:
+Some tools you want reachable, but not unattended. List them under `approve` and each call waits for a person's yes:
 
 ```yaml
 profiles:
@@ -103,7 +137,14 @@ profiles:
     approve: ["github__create_pull_request", "fs__write_file"]
 ```
 
-The gateway asks through the client's own prompt (MCP elicitation), showing the tool and its arguments with secrets redacted. A decline, a dismissal, or no answer within `guard.approval_timeout_ms` refuses the call. So does a client that cannot ask at all: an approval that cannot be requested is never assumed.
+The gateway asks in two places at once and takes the first answer:
+
+- **In the client** that made the call, through its own prompt (MCP elicitation).
+- **On the [status page](/docs/dashboard#approving-calls)**, which lists each waiting call with Allow and Deny. This is what makes approvals work with clients that cannot ask.
+
+Both show the tool and its arguments with secrets redacted. A decline, a dismissal, or no answer within `guard.approval_timeout_ms` refuses the call.
+
+The status page can answer only when `listen.token` is set. Without a token, approving would be a request any program on your machine could send, including a model's own web-fetch tool, so a call could approve itself. With no token and a client that cannot ask, the call is refused: an approval that cannot be requested is never assumed.
 
 ## Rate limits
 

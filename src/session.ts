@@ -119,6 +119,8 @@ export class RecentEvents implements EventStore {
 export interface Session {
   id: string;
   profile: string;
+  /** The `listen.clients` key that opened it; every later request must present the same one. */
+  clientKey?: string;
   transport: StreamableHTTPServerTransport;
   server: Server;
   lastSeen: number;
@@ -176,6 +178,7 @@ function buildServer(
   sessionId: () => string | undefined,
   pageSize: () => number | undefined,
   context: ContextTools,
+  clientKey: string | undefined,
 ): Server {
   const server = new Server(
     { ...GATEWAY_INFO },
@@ -216,6 +219,7 @@ function buildServer(
       profile,
       session: sessionId(),
       client: server.getClientVersion(),
+      clientKey,
       caller,
       canElicit: server.getClientCapabilities()?.elicitation !== undefined,
       signal: extra?.signal,
@@ -352,7 +356,7 @@ export class SessionManager {
    * Builds a session transport. The id only exists once the client's `initialize` has been
    * handled, so registration happens in the transport's own callback.
    */
-  async create(profile: string): Promise<StreamableHTTPServerTransport> {
+  async create(profile: string, clientKey?: string): Promise<StreamableHTTPServerTransport> {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: randomUUID,
       eventStore: new RecentEvents(),
@@ -360,6 +364,7 @@ export class SessionManager {
         this.#sessions.set(id, {
           id,
           profile,
+          clientKey,
           transport,
           server,
           lastSeen: Date.now(),
@@ -378,6 +383,7 @@ export class SessionManager {
         context: this.config.profiles[profile]?.context,
         maxResultBytes: this.config.guard.max_result_bytes,
       })),
+      clientKey,
     );
     // Fires after the handshake, which is when the client has actually named itself.
     server.oninitialized = () => {
@@ -386,6 +392,7 @@ export class SessionManager {
         session: transport.sessionId,
         profile,
         client: server.getClientVersion(),
+        client_key: clientKey,
       });
     };
     transport.onclose = () => {

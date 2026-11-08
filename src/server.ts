@@ -114,6 +114,13 @@ function tokenOk(expected: string, header: string | undefined): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+/** The named client whose token this is, if any. Every key is compared, so timing says nothing. */
+function clientKey(clients: Config["listen"]["clients"], header: string | undefined) {
+  let found: Config["listen"]["clients"][number] | undefined;
+  for (const client of clients) if (tokenOk(client.token, header)) found = client;
+  return found;
+}
+
 /**
  * Blocks DNS-rebinding from a browser tab (SPEC §10.1). `self` is the request's own `Host`, passed
  * only when a token is set: the status page served over a LAN name POSTs with that name as its
@@ -240,8 +247,14 @@ export async function startGateway(
     });
   }
 
-  /** The port is bound once: a changed `listen` block is saved, but only a daemon restart applies it. */
-  const listenChanged = (next: Config) => canonicalJson(next.listen) !== canonicalJson(current.listen);
+  /**
+   * The port is bound once: a changed `listen` block is saved, but only a daemon restart applies it.
+   * Client keys are the exception: they are read on every request, so a reload applies them.
+   */
+  const listenChanged = (next: Config) => {
+    const bound = (c: Config) => canonicalJson({ ...c.listen, clients: undefined });
+    return bound(next) !== bound(current);
+  };
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://localhost");
@@ -452,6 +465,26 @@ export async function startGateway(
       return;
     }
 
+    // A person's answer to a call waiting for approval. Gated like stop: without a token, any
+    // local process could POST here, a model's own fetch tool included, and approve itself.
+    const approval = /^\/approvals\/([^/]+)\/(approve|deny)$/.exec(path);
+    if (approval) {
+      if (!gated("POST")) return;
+      const yes = approval[2] === "approve";
+      const id = decodeURIComponent(approval[1]!);
+      const waiting = pipeline.approvals.list().find((p) => p.id === id);
+      if (!pipeline.approvals.decide(id, yes)) {
+        send(res, 404, { error: "that call is no longer waiting: answered, timed out or cancelled" });
+        return;
+      }
+      manage(req, yes ? "approve_call" : "deny_call", "ok", {
+        profile: waiting?.profile,
+        tool: waiting?.canonical,
+      });
+      send(res, 200, { status: yes ? "approved" : "denied" });
+      return;
+    }
+
     // The raw YAML editor: the file as written, a dry run, and a save guarded by the hash the
     // editor loaded. Loopback only, on top of the token (see fromThisMachine).
     if (path === "/config" || path === "/config/validate") {
@@ -501,7 +534,10 @@ export async function startGateway(
       return;
     }
 
-    if (!authorized) {
+    // A client token opens its own profiles' MCP routes and nothing else, so the general check
+    // waits for the MCP route to apply its own.
+    const mcp = path.startsWith("/mcp/");
+    if (!authorized && !mcp) {
       unauthorized(req, res, path);
       return;
     }
@@ -511,6 +547,12 @@ export async function startGateway(
       const n = Math.min(Math.max(Number(url.searchParams.get("n")) || 100, 1), 1000);
       const deniedOnly = url.searchParams.get("denied") === "1";
       send(res, 200, { lines: recentLines(audit.dir, n, deniedOnly) });
+      return;
+    }
+
+    // Calls waiting for a person. Seeing them is detail; answering is the gated route above.
+    if (path === "/approvals") {
+      send(res, 200, { approvals: pipeline.approvals.list(), can_answer: Boolean(token) });
       return;
     }
 
@@ -526,11 +568,26 @@ export async function startGateway(
       return;
     }
 
-    const profile = path.startsWith("/mcp/") ? path.slice(5) : undefined;
+    const profile = mcp ? path.slice(5) : undefined;
     if (!profile || !sessions.hasProfile(profile)) {
       send(res, 404, { error: `unknown profile "${profile ?? ""}"` });
       return;
     }
+
+    // Who is calling: a named client key, limited to its profiles, or the gateway token (or, with
+    // no tokens configured at all, loopback alone), which reaches every profile.
+    const key = clientKey(current.listen.clients, req.headers.authorization);
+    if (key) {
+      if (!key.profiles.includes("*") && !key.profiles.includes(profile)) {
+        audit.write({ method: "forbidden", path, client_key: key.name, remote: req.socket.remoteAddress });
+        send(res, 403, { error: `client "${key.name}" may not use profile "${profile}"` });
+        return;
+      }
+    } else if (token ? !authorized : current.listen.clients.length > 0) {
+      unauthorized(req, res, path);
+      return;
+    }
+    const keyName = key?.name;
 
     let body: unknown;
     if (req.method === "POST") {
@@ -550,8 +607,9 @@ export async function startGateway(
     const id = req.headers["mcp-session-id"];
     if (typeof id === "string") {
       const session = sessions.get(id);
-      // A session belongs to the profile it was opened against; it may not be reused elsewhere.
-      if (!session || session.profile !== profile) {
+      // A session belongs to the profile and the key it was opened with; it may not be reused
+      // elsewhere, nor carried on by a caller holding a different key.
+      if (!session || session.profile !== profile || session.clientKey !== keyName) {
         send(res, 404, { error: "unknown session" });
         return;
       }
@@ -568,7 +626,7 @@ export async function startGateway(
       return;
     }
 
-    const transport = await sessions.create(profile);
+    const transport = await sessions.create(profile, keyName);
     await transport.handleRequest(req, res, body);
   }
 
@@ -595,6 +653,7 @@ export async function startGateway(
       listen: `${tls ? "https" : "http"}://${host}:${port}`,
       sessions: sessions.size,
       pending_drift: parts.guard.pending().length,
+      pending_approvals: pipeline.approvals.list().length,
       profiles: Object.keys(current.profiles),
       // What each profile exposes and to how many clients: the right-hand side of the diagram.
       profile_detail: Object.fromEntries(
@@ -611,6 +670,8 @@ export async function startGateway(
         ]),
       ),
       disabled: current.disabled ?? [],
+      // Names and reach only; the tokens themselves never leave the config.
+      clients: current.listen.clients.map((c) => ({ name: c.name, profiles: c.profiles })),
       backends: Object.fromEntries(
         [...pool.backends].map(([name, b]) => [
           name,

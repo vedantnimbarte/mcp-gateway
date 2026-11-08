@@ -1,0 +1,81 @@
+export const metadata = { title: "The audit log" }
+
+# The audit log
+
+Every call, whether allowed, refused or failed, is one line of JSON. So is every session, backend change, tool change and management action.
+
+## Where it is
+
+One file per day, in UTC, under `audit.dir` (default `./audit`, beside your config):
+
+```
+audit/2026-11-08.jsonl
+```
+
+A tool call looks like this:
+
+```json
+{"ts":"2026-08-31T10:12:44.812Z","session":"s_7f3a91","profile":"coding",
+ "client":{"name":"claude-code","version":"2.1.0"},"method":"tools/call",
+ "server":"github","tool":"create_issue","exposed_as":"file_bug",
+ "decision":"allow","args_hash":"sha256:7ab1…","dur_ms":412,"status":"ok"}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `decision` | `allow`, or why not: `denied_by_policy`, `not_allowed`, `server_not_in_profile`, `drift_blocked`, `suspicious_blocked`, `argument_denied`, `approval_denied`, `approval_unavailable`, `server_unavailable`, `rate_limited`, `unroutable` |
+| `status` | `ok`, `error`, `timeout` or `denied` |
+| `client_key` | Which [client key](/docs/clients#a-token-per-client) made the call, when it used one |
+| `args` / `args_hash` | The arguments, or their hash, depending on `log_args` |
+| `cached` | Answered from the response cache |
+| `approved` | A person approved the call before it ran; `approved_via` says where: `client` or `status_page` |
+| `error` | `{ code, message }` when something failed, redacted |
+
+Other lines set `method` to what happened: `initialize` and `session_close`, `backend_up` and `backend_down`, `drift`, `pinned` and `suspicious`, `handle` (a result kept out of context), `run_code` (one per script), `manage` (each reload, restart, stop, config change or approval answered on the status page), `unauthorized` (a refused token, with the address it came from), and `forbidden` (a client key used on a profile it may not open).
+
+## What gets recorded
+
+```yaml
+audit:
+  dir: ./audit
+  log_args: hashed       # full | hashed | none
+  log_results: none      # full | truncated | none
+  durable: false
+```
+
+Arguments are hashed by default, so you can tell two calls apart without storing what was in them. With `full`, they are recorded after redaction. Writes never hold up a call; set `durable: true` to fsync every line, at the cost of a synchronous write per request.
+
+## Reading it
+
+Follow it live:
+
+```bash
+mcpgw tail --follow
+mcpgw tail --denied-only --profile coding
+```
+
+Or use `jq`, since it is plain JSON lines:
+
+```bash
+jq 'select(.decision != "allow")' audit/*.jsonl
+```
+
+## Asking harder questions in SQL
+
+When a question outgrows one line of `jq`, ask it in SQL:
+
+```bash
+mcpgw query "select tool, count(*) as refused from audit where decision != 'allow' group by tool"
+```
+
+```bash
+mcpgw query "select server, count(*) as calls, max(dur_ms) as slowest from audit
+             where method = 'tools/call' and ts >= date('now', '-7 days') group by server"
+```
+
+```bash
+mcpgw query "select json_extract(line, '$.error.message') as error, count(*) from audit
+             where status = 'error' group by error" --json
+```
+
+The table is `audit`, with the common fields as columns and the whole original line in `line`. Queries run on a read-only connection against `audit/index.sqlite`, an index built with Node's own SQLite and caught up from the JSONL on every query. The JSONL files stay the record: delete the index and the next query rebuilds it.

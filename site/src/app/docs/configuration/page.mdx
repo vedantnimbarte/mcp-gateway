@@ -28,6 +28,17 @@ servers:
       GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN}
 ```
 
+### Keeping secrets in .env
+
+If a `.env` file sits beside the config, the gateway reads it on every start and reload:
+
+```bash title=".env"
+GITHUB_TOKEN=ghp_...
+LINEAR_KEY='lin_api_...'
+```
+
+A variable already in the environment wins over the file. This is what a gateway started at login uses, since it does not inherit your shell, and it is where `mcpgw init` puts the secrets it lifts out of client configs. Keep `.env` out of git.
+
 ## The blocks
 
 ```yaml title="config.yaml"
@@ -53,6 +64,7 @@ Only `version`, `servers` and `profiles` are required. Every other block has def
 | `tls` | none | `{ cert, key }` PEM paths. Serves HTTPS, for use beyond this machine. |
 | `page_size` | none | Paginate tool, prompt and resource listings. Absent means one page. |
 | `oauth_callback_port` | `8419` | Where `mcpgw auth` catches an OAuth redirect. |
+| `clients` | `[]` | A token per client, each opening only its own profiles. See [Connecting clients](/docs/clients#a-token-per-client). |
 
 ### defaults
 

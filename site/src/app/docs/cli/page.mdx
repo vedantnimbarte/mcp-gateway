@@ -18,6 +18,44 @@ Every command takes `--config PATH`. Without it, the gateway uses `$MCPGW_CONFIG
 | `mcpgw restart SERVER` | Reconnect one backend in the running gateway. |
 | `mcpgw tail` | Print the audit log. `--follow` (`-f`) keeps going; `--denied-only` and `--profile P` filter it. |
 | `mcpgw query SQL` | SQL over the audit log, in the table `audit`. `--json` for scripts. |
+| `mcpgw init` | Import the servers your clients already run. Writes nothing without `--yes`; `--clients` also points those clients at the gateway; `--profile P` picks the profile they use. |
+| `mcpgw service install` | Start the gateway at every login. Also `uninstall` and `status`; `--dry-run` shows the files and commands; `--name N` for a second gateway. |
+
+`mcpgw start --log FILE` appends the gateway's output to a file instead of the terminal.
+
+## Importing your clients' servers
+
+```bash
+mcpgw init                    # show what it found and would write
+mcpgw init --yes              # write config.yaml and .env
+mcpgw init --clients --yes    # and point each client at the gateway
+```
+
+It reads the user-wide servers of Claude Desktop, Cursor, Claude Code (`~/.claude.json`) and Windsurf:
+
+- **The same server in two clients** is imported once.
+- **Secrets move out:** every `env` and header value goes into `.env` beside the config, referenced as `${NAME}`, so none lands in `config.yaml`.
+- **An existing config** gains the new servers and keeps its comments.
+- **Already pointing at the gateway:** entries that do are left out, so running it twice adds nothing.
+- **Validated first, backed up always:** the merged config is checked before anything is written, and every file it changes is backed up first (`config.yaml.bak`, `<client file>.mcpgw-backup`).
+
+Per-project servers (`.mcp.json`, and Claude Code's per-project entries) stay in their clients.
+
+## Starting at login
+
+```bash
+mcpgw service install
+mcpgw service status
+mcpgw service uninstall
+```
+
+| Platform | What it installs |
+|----------|------------------|
+| macOS | A launchd agent in `~/Library/LaunchAgents`, restarted if it crashes |
+| Linux | A systemd user unit in `~/.config/systemd/user`, restarted on failure |
+| Windows | A launcher in your Startup folder that runs the gateway without a window |
+
+None needs administrator rights. It runs `mcpgw start` with your config and logs to `mcpgw.log` beside it. A gateway started at login does not see your shell's environment variables, so keep secrets in `.env` beside the config.
 
 ## reload or restart?
 

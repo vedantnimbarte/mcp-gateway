@@ -169,7 +169,8 @@ export function computeStats(lines: AuditLine[], window: Window, now: number, pa
     bump(groups.tools, tool, l, outcome);
     if (l.server) bump(groups.servers, l.server, l, outcome);
     if (l.profile) bump(groups.profiles, l.profile, l, outcome);
-    const client = l.client?.name ?? "unknown";
+    // A named key (listen.clients) is who called; without one, the client's own name stands in.
+    const client = typeof l.client_key === "string" ? l.client_key : (l.client?.name ?? "unknown");
     clients.set(client, (clients.get(client) ?? 0) + 1);
     if (l.server && now - t <= 60_000) live[l.server] = (live[l.server] ?? 0) + 1;
   }

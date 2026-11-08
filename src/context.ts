@@ -403,7 +403,7 @@ export class ContextTools {
     const handle = this.#handles.put(data, bytes);
     const shown = preview(data);
     // What stayed out of the model's context: the status page totals it.
-    this.audit.write({ method: "handle", session: ctx.session, profile: ctx.profile, client: ctx.client, handle, result_bytes: bytes });
+    this.audit.write({ method: "handle", session: ctx.session, profile: ctx.profile, client: ctx.client, client_key: ctx.clientKey, handle, result_bytes: bytes });
     return text(
       [
         `Result too large to return whole (${bytes.toLocaleString("en-US")} bytes, ` +
@@ -534,6 +534,7 @@ export class ContextTools {
       session: ctx.session,
       profile: ctx.profile,
       client: ctx.client,
+      client_key: ctx.clientKey,
       ...this.audit.argFields({ code }),
       decision: "allow",
       status: outcome.status,

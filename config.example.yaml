@@ -4,6 +4,10 @@ listen:
   host: 127.0.0.1        # non-loopback requires `token`
   port: 8420
   # token: ${MCPGW_TOKEN}   # sent as `Authorization: Bearer <token>`
+  # clients:                # a token per client, limited to its profiles
+  #   - name: agent
+  #     token: ${MCPGW_AGENT_TOKEN}
+  #     profiles: [readonly]
 
 defaults:
   call_timeout_ms: 30000     # restarted by each progress note from the backend...
@@ -62,9 +66,14 @@ profiles:
     rename:
       github__create_issue: file_bug
       fs__read_text_file: read_file
-    approve:                 # these wait for a human's yes in the calling client
+    approve:                 # these wait for a person's yes, in the client or on the status page
       - "github__create_pull_request"
       - "fs__write_file"
+    arguments:               # what calls may be given, not just which tools exist
+      - tools: ["fs__write_file", "fs__edit_file"]
+        name: path
+        allow: ["/Users/vedant/code/*"]
+        as: path             # collapses .. first
     limits:
       rpm: 60
       concurrent: 4
